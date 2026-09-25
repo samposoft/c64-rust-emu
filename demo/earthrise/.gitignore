@@ -1,0 +1,4 @@
+# The source picture is not ours: it and everything converted from it
+# (build/) stay out of the repository.
+source.*
+build/

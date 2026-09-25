@@ -20,7 +20,8 @@ several files the first is loaded, `swap` moves to the next ones), `--version`, 
 `--sid 6581|8580|8580d` (SID model, default 6581; `8580d` is the 8580 with
 digiboost), `--sid2 ADDR` (second SID, e.g. `d420` or `de00`), `--tape-sound` (tape sound),
 `--tape-azimuth CYCLES` (Datasette azimuth error), `--port1 DEV`/`--port2 DEV`
-(control port devices: `joystick`, `paddles`, `mouse`, `joymouse`), `--remote`
+(control port devices: `joystick`, `paddles`, `mouse`, `joymouse`), `--blend`
+(frame blending, see `blend`), `--remote`
 and `--remote-socket PATH` (commands also from the [remote monitor](#remote-monitor)).
 ROMs are looked up in `roms/` next to the executable or in a directory above
 it (from `target/release`, the project's), then in `./roms`.
@@ -61,6 +62,7 @@ decimal.
 | `vic`, `sprites`, `cia1`, `cia2`, `sid` | decoded registers; `sid` also model, OSC3, ENV3, value on the data bus and audio |
 | `sid 6581\|8580\|8580d` | changes the SID model (`8580d`: with digiboost) |
 | `sid2 [addr\|off]` | second SID: state; with an address (`$D420`-`$D7E0`, `$DE00`-`$DFE0`, in steps of `$20`) it attaches it, as just powered on; `off` removes it |
+| `blend [on\|off]` | frame blending: the framebuffer (window and screenshots) becomes the average, in linear light, of the last two frames, as the eye sees a 50 Hz CRT; for pictures that alternate two frames (interlace, IFLI). Off by default, `--blend` turns it on |
 | `screenshot file.png [bar]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316). With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
 | `info` | frames, instructions, cycles, PRG waiting to be injected (`prg_pending`), keys still to type (`typing`), state of file/break/watch/trace |
 

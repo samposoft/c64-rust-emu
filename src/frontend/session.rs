@@ -44,12 +44,14 @@ pub struct MachineOptions {
     pub ports: [Device; 2],
     /// Socket of the remote monitor (`--remote`, `--remote-socket`).
     pub remote: Option<PathBuf>,
+    /// Frame blending (`--blend`, `C64::set_blend`).
+    pub blend: bool,
 }
 
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
+        "[--version] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
@@ -65,6 +67,8 @@ impl MachineOptions {
   --port1 DEV, --port2 DEV  device in control port 1 or 2: joystick (default),
                paddles (follow the pointer), mouse (1351, captured with a click) or
                joymouse (1351 in joystick mode, as the 1350), in the window only
+  --blend      show every frame mixed with the previous one, as the eye sees a 50 Hz
+               CRT: for pictures that alternate two frames (interlace, IFLI)
   --remote     remote monitor: debugger commands from other programs (c64mcp, the
                MCP server for Claude) on a Unix socket, macOS and Linux only
   --remote-socket PATH  remote monitor on the socket PATH instead of the default one
@@ -99,6 +103,7 @@ impl MachineOptions {
                 std::process::exit(0);
             }
             "--tape-sound" => self.tape_sound = true,
+            "--blend" => self.blend = true,
             "--remote" => self.remote = Some(super::remote::default_path()),
             "--remote-socket" => match rest.next() {
                 Some(path) => self.remote = Some(PathBuf::from(path)),
@@ -142,6 +147,7 @@ impl MachineOptions {
             c64.set_sid_model(model, digiboost);
         }
         c64.set_sid2(self.sid2)?;
+        c64.set_blend(self.blend);
         if self.tape_sound {
             c64.bus.tape.set_sound(Some(crate::tape::SOUND_VOLUME_DEFAULT));
         }

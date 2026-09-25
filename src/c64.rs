@@ -43,6 +43,8 @@ pub struct C64 {
     pub framebuffer: Vec<u32>,
     /// Frame being built, line by line.
     work_fb: Vec<u32>,
+    /// Frame blending (`set_blend`): the previous frame as the VIC drew it.
+    blend: Option<Vec<u32>>,
 
     // Direct PRG (no disk)
     pending_prg: Option<Vec<u8>>,
@@ -95,6 +97,7 @@ impl C64 {
             bus: Bus::new(),
             framebuffer: vec![0xFF000000; WIDTH * HEIGHT],
             work_fb: vec![0xFF000000; WIDTH * HEIGHT],
+            blend: None,
             pending_prg: None,
             prg_kind: PrgKind::Basic,
             injected: false,
@@ -114,6 +117,19 @@ impl C64 {
             frame_count: 0,
             dbg: DebugHooks::default(),
         }
+    }
+
+    /// Frame blending: `framebuffer` becomes the average, in linear light,
+    /// of the last two frames. It shows what the eye sees on a 50 Hz CRT
+    /// when a picture alternates two frames (interlace, color mixing),
+    /// which a 60 or 120 Hz monitor would show as uneven flicker instead;
+    /// moving objects leave a half-bright trail. Off by default.
+    pub fn set_blend(&mut self, on: bool) {
+        self.blend = on.then(|| self.work_fb.clone());
+    }
+
+    pub fn blend(&self) -> bool {
+        self.blend.is_some()
     }
 
     /// Framebuffer being built: the current frame up to the VIC beam, over
@@ -706,7 +722,13 @@ impl C64 {
     fn tick_vic(&mut self) -> crate::vic::Tick {
         let t = crate::vic::cycle(&mut self.bus, &mut self.work_fb, self.cpu.pc);
         if t.frame_done {
-            self.framebuffer.copy_from_slice(&self.work_fb);
+            match &mut self.blend {
+                None => self.framebuffer.copy_from_slice(&self.work_fb),
+                Some(prev) => {
+                    blend_frames(&mut self.framebuffer, prev, &self.work_fb);
+                    prev.copy_from_slice(&self.work_fb);
+                }
+            }
             self.frame_count += 1;
         }
         if let Some(target) = self.dbg.raster_break {
@@ -1127,10 +1149,37 @@ const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
 
-// Excluded: the audio buffer (rewritten every frame) and the debugger hooks.
+/// `out` = average of the ARGB frames `a` and `b` in linear light, per
+/// channel (sRGB curve).
+fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
+    use std::sync::OnceLock;
+    // sRGB byte -> linear 0-65535; linear >> 4 (0-4095) -> sRGB byte
+    static LUT: OnceLock<([u32; 256], Vec<u8>)> = OnceLock::new();
+    let (to_lin, to_srgb) = LUT.get_or_init(|| {
+        let lin = |c: f64| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        let srgb = |l: f64| if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
+        let to_lin = std::array::from_fn(|i| (lin(i as f64 / 255.0) * 65535.0).round() as u32);
+        let to_srgb = (0..4096).map(|i| (srgb((i as f64 + 0.5) / 4096.0) * 255.0).round() as u8).collect();
+        (to_lin, to_srgb)
+    });
+    for ((o, &pa), &pb) in out.iter_mut().zip(a).zip(b) {
+        if pa == pb {
+            *o = pa;
+            continue;
+        }
+        let mix = |shift: u32| {
+            let l = (to_lin[(pa >> shift & 0xFF) as usize] + to_lin[(pb >> shift & 0xFF) as usize]) / 2;
+            (to_srgb[(l >> 4) as usize] as u32) << shift
+        };
+        *o = 0xFF00_0000 | mix(16) | mix(8) | mix(0);
+    }
+}
+
+// Excluded: the audio buffer (rewritten every frame), the debugger hooks
+// and frame blending (a display setting).
 impl_state!(C64 {
     cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
     disk, disk_path, disk_autoload, tape_path, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
     autoload_run,
     frame_elapsed, frame_count,
-} skip { audio_buf, audio_buf2, dbg });
+} skip { audio_buf, audio_buf2, dbg, blend });

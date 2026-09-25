@@ -27,6 +27,7 @@ cargo build --release
 ./target/release/c64 --port1 joymouse prg/geos.d64         # 1351 in joystick mode (GEOS 1.x)
 ./target/release/c64 --port1 paddles prg/Arkanoid.d64      # paddles in control port 1
 ./target/release/c64 --remote prg/game.d64                 # remote monitor for other programs, see DEBUGGER.md
+./target/release/c64 --blend demo/earthrise/build/ifli.prg # frames mixed as the eye sees a CRT (interlace pictures)
 ./target/release/c64mcp                                    # MCP server for Claude, see below
 ```
 
@@ -238,6 +239,17 @@ registers hold the old measurement until the next one, and a switch during a
 measurement gives a mixed value. The KERNAL keyboard scan leaves port 1
 selected. In the debugger: `port`, `mouse`, `paddle` (see DEBUGGER.md).
 
+
+### Interlace pictures: `--blend`
+
+Some pictures and demos alternate two frames (interlace, IFLI, color
+mixing): on a 50 Hz CRT the eye mixes them into colors the VIC-II does not
+have. A 60 or 120 Hz monitor shows the 50 frames per second unevenly, some
+twice and some once, so the mix flickers. `--blend` (all frontends; in the
+debugger `blend on|off`) shows every frame averaged in linear light with
+the previous one, which is what the eye sees on the CRT; screenshots are
+blended too. Moving objects leave a half-bright trail, so it is off by
+default. `demo/earthrise` is an IFLI picture made for it.
 
 ### Window title and status bar
 

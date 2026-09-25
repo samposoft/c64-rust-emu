@@ -795,6 +795,7 @@ impl Debugger {
   swap               next medium among the command-line files (tape with PLAY, disk)
   drive insert file  insert a D64/G64 without autoloading it
   drive trace on file | off   trace of the drive's instructions (PC, registers, cycle)
+  blend [on|off]     frame blending: each frame mixed with the previous one, as on a 50 Hz CRT (interlace pictures)
   screenshot file [bar]  save the framebuffer as PNG (bar: with the window's status bar; file - = the PNG on the output)
   trace on [file] [from to] | trace off
   keys text          type text on the keyboard (\\n = RETURN, {name} = a key named as for key: {f1} {clr} {left}...)
@@ -1229,6 +1230,16 @@ impl Debugger {
                     c64.prg_pending() as u8, c64.bus.keyboard.typing() as u8, c64.disk.is_some() as u8, c64.bus.cart.is_some() as u8,
                     self.breakpoints.len(), c64.bus.dbg_watch.len(),
                     self.trace.as_ref().map(|t| t.lines.to_string()).unwrap_or_else(|| "off".into())).map_err(io)?;
+            }
+
+            "blend" => {
+                match args.first().copied() {
+                    None => {}
+                    Some("on") => c64.set_blend(true),
+                    Some("off") => c64.set_blend(false),
+                    Some(_) => return Err("usage: blend [on|off]".into()),
+                }
+                writeln!(out, "frame blending {}", if c64.blend() { "on" } else { "off" }).map_err(io)?;
             }
 
             "screenshot" => {
