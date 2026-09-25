@@ -1,0 +1,32 @@
+[package]
+name = "c64"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+bitflags = "2"
+cpal = "0.18"
+winit = "0.30"
+softbuffer = "0.4"
+gilrs = { version = "0.11", optional = true }
+
+# Terminal frontend (c64term): termios, poll, POSIX shared memory
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Dock icon: on macOS winit ignores the window icon. Same
+# versions that winit 0.30 uses.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSData"] }
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage", "NSResponder"] }
+
+[features]
+default = ["gamepad"]
+# Gamepad via gilrs. On Linux it needs libudev-dev at build time:
+# `cargo build --no-default-features` to do without it.
+gamepad = ["dep:gilrs"]
+
+[dev-dependencies]
+# The Klaus Dormann 6502 functional test is loaded as a raw binary in the tests

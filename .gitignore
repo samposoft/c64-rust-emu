@@ -1,0 +1,7 @@
+/target
+roms/
+.DS_Store
+.idea/
+prg/
+*.sav
+__pycache__/
