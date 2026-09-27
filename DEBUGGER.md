@@ -13,7 +13,7 @@ printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 ./target/release/c64dbg                       # interactive: license notice, then the dbg> prompt
 ```
 
-Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.d64/.g64...]` (with
+Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.t64/.d64/.g64...]` (with
 several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--vic CHIP` (the VIC-II and its standard: 6569, 6569r1, 8565, 6567, 6567r56a, 8562, 6572; see README.md), `--c64c` (8565 or 8562, 8580, 6526A), `--cia 6526|6526a`, `--roms DIR`, `-x script`, `-e "cmd; cmd"`
 (repeatable), `--no-stdin`, `--window`, `--audio`, `--reu KB` (REU from 128 to
 16384 KB), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
@@ -82,11 +82,11 @@ decimal.
 
 | Files and state | |
 |---|---|
-| `load file` | .prg (queued, injected after boot), .d64/.g64 (autoload), .tap (autoload: LOAD, PLAY, C= after FOUND, RUN), .t64 (the first program, like a PRG), .crt |
+| `load file` | .prg (queued, injected after boot), .d64/.g64 (autoload), .tap (autoload: LOAD, PLAY, C= after FOUND, RUN), .t64 (autoload as a tape: LOAD, then RUN, or SYS for a first program that is not at `$0801`; the KERNAL tape routines read its programs in order), .crt |
 | `swap` | next medium among the command-line files, like F8 in the window: a tape is inserted rewound with PLAY pressed, a disk replaces the one in the drive after saving its changes |
-| `tape [play\|record\|stop\|ff\|rew]` | Datasette: button, motor, counter, position on the tape, pulses read; without arguments it shows the state, otherwise it presses the button (RECORD only with a tape; FF and REW move the tape with the motor on, which the KERNAL turns on when it sees a button pressed) |
-| `tape insert file\|eject\|save` | `insert` inserts a TAP without autoloading it (a missing file is a blank tape); `eject` removes it and `save` writes the recordings to the file right away (otherwise on exit or when the tape is changed) |
-| `tape rewind\|counter` | rewinds instantly, without REW / resets the counter |
+| `tape [play\|record\|stop\|ff\|rew]` | Datasette: button, motor, counter, position on the tape, pulses read (with a T64: its programs, `>` on the one found last); without arguments it shows the state, otherwise it presses the button (RECORD only with a tape; FF and REW move the tape with the motor on, which the KERNAL turns on when it sees a button pressed) |
+| `tape insert file\|eject\|save` | `insert` inserts a TAP or a T64 without autoloading it (a missing .tap is a blank tape); `eject` removes it and `save` writes the recordings to the file right away (otherwise on exit or when the tape is changed) |
+| `tape rewind\|counter` | rewinds instantly, without REW (a T64 goes back to its first program) / resets the counter |
 | `tape auto on\|off` | buttons pressed automatically when the KERNAL asks PRESS PLAY ON TAPE or PRESS RECORD & PLAY ON TAPE (default on) |
 | `tape azimuth [cycles \| off]` | azimuth error: each distance between pulses shifts randomly by up to that many cycles (0.001-10), with the remainder carried over to the next one; off by default. In VICE 3.10 `-dstapeerror` is broken (a negative error becomes +4.3 million cycles): here it keeps its sign |
 | `tape sound [on [volume] \| off]` | tape sound in PLAY: one period of square wave per pulse, mixed with the SIDs (volume 1-4096, default 1024 as in VICE); off by default. It is heard when audio is on: `--audio` at real speed (not during the `speed auto` turbo) or `audio file.wav` |

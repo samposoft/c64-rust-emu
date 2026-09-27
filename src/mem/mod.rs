@@ -6,6 +6,8 @@
 // Copyright (C) Andreas Boose, Ettore Perazzoli, Marco van den Heuvel.
 // Ported to Rust and modified by SampoSoft in 2026; see CREDITS.md.
 
+pub mod power_on;
+
 use crate::cia::CiaState;
 use crate::vic::VicState;
 use crate::keyboard::KeyMatrix;
@@ -122,11 +124,11 @@ pub struct Bus {
 impl Bus {
     pub fn new() -> Self {
         let mut b = Self {
-            ram: [0u8; 0x10000],
+            ram: *power_on::ram(),
             kernal_rom: [0u8; 0x2000],
             basic_rom: [0u8; 0x2000],
             char_rom: [0u8; 0x1000],
-            color_ram: [0x0Eu8; 0x0400],
+            color_ram: power_on::COLOR_RAM,
             cart: None,
             reu: None,
             drive: None,

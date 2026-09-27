@@ -67,7 +67,7 @@ pub struct MachineOptions {
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
+        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.t64/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
@@ -113,7 +113,8 @@ impl MachineOptions {
   --remote-socket PATH  remote monitor on the socket PATH instead of the default one
   With several files the first is loaded; the others (tapes, disks) are the next
   media, for side B or disk 2: F8 switches to the next one (in the debugger: swap).
-  A .tap that does not exist is a blank tape for SAVE, written on exit.";
+  A .tap that does not exist is a blank tape for SAVE, written on exit. A .t64 is
+  read by the KERNAL's tape routines: its programs load one after the other.";
 
     /// Parses a common argument, taking from `rest` the value of the
     /// options that have one. Anything that is not a common option is a
@@ -216,8 +217,8 @@ impl MachineOptions {
     pub fn check_media(&self) -> Result<(), String> {
         for f in self.input_files.iter().skip(1) {
             let ext = std::path::Path::new(f).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if !matches!(ext.as_str(), "tap" | "d64" | "g64") {
-                return Err(format!("{f}: after the first file only tapes (.tap) and disks (.d64, .g64) can be given"));
+            if !matches!(ext.as_str(), "tap" | "t64" | "d64" | "g64") {
+                return Err(format!("{f}: after the first file only tapes (.tap, .t64) and disks (.d64, .g64) can be given"));
             }
         }
         Ok(())

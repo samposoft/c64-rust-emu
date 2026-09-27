@@ -25,8 +25,9 @@ are compared with it cycle by cycle by regression tests.
 |---|---|---|
 | `src/vic/mod.rs` (VIC-II, cycle-exact) | `src/viciisc/vicii-cycle.c`, `vicii-fetch.c`, `vicii-draw-cycle.c`, `vicii-mem.c`, `vicii-chip-model.c` | Hannu Nuotio, Daniel Kahlin, Ettore Perazzoli, Andreas Boose |
 | `src/vic/tables.rs` (cycle tables of the 6569 and 6567R8) | `src/viciisc/vicii-chip-model.c` | Hannu Nuotio, Daniel Kahlin |
-| `src/tape.rs` (Datasette, TAP, T64) | `src/datasette/datasette.c`, `src/tape/tap.c`, `src/tape/t64.c` | Andreas Boose, Andreas Matthies, Marco van den Heuvel, David Hansel, Ettore Perazzoli, Compyx |
-| `src/tape.rs` (PCG random generator for the azimuth error) | `src/lib.c` | Andreas Boose, Marco van den Heuvel |
+| `src/tape.rs` (Datasette, TAP, T64 and its KERNAL tape traps) | `src/datasette/datasette.c`, `src/tape/tap.c`, `src/tape/t64.c`, `src/tape/tape.c` | Andreas Boose, Andreas Matthies, Marco van den Heuvel, David Hansel, Ettore Perazzoli, Compyx, Jouko Valta |
+| `src/random.rs` (PCG random generator: power-on RAM, tape azimuth error) | `src/lib.c` | Andreas Boose, Marco van den Heuvel |
+| `src/mem/power_on.rs` (RAM pattern and color RAM at power-on) | `src/ram.c`, `src/vicii-colorram.h` (color RAM measured by William McCabe) | Andreas Matthies, Marco van den Heuvel |
 | `src/drive/mod.rs` (1541 disk rotation and read/write circuit) | `src/drive/rotation.c` | Andreas Boose, Istvan Fabian, Benjamin 'BeRo' Rosseaux, Peter Rittwage |
 | `src/sid/mod.rs` (`audio_mix`, mono mix of two SIDs) | `src/sound.c` (`sound_audio_mix`) | Teemu Rantanen, Marco van den Heuvel, Ettore Perazzoli |
 

@@ -610,6 +610,17 @@ alarm, serial port output), SID 6581 and 8580 ported from reSID as VICE
 uses it (see below), 1541 drive (see below), cartridges, REU, PRG, full save
 state (restored mid-frame it continues identically).
 
+Memory at power-on as in VICE: the dynamic RAM does not start empty, every
+cell settles to 0 or 1 according to the chip's layout. The RAM holds VICE's
+default pattern for the C64, four bytes of `$00` and four of `$FF` shifted
+by two bytes and inverted every 16 KB, with one bit in a thousand flipped
+at random; VICE seeds its generator from the clock, here it always starts
+from the same state, so two runs are identical. The color RAM holds the
+values VICE took from a real C64. A reset (F11) leaves them as they are,
+as the reset button does: only a new start of the emulator switches the
+machine on again. After the boot, the RAM that the KERNAL does not touch is
+the same as in VICE (compared with its random bits off).
+
 The comparison with VICE 3.10 (x64sc) is the reference check: the boot
 matches instruction by instruction, with registers and cycle count, for
 2 million instructions and 299 IRQs; regression tests read
@@ -758,15 +769,35 @@ seconds, and the same goes for recording and fast winding. The one-second wait e
 gameplay: many games set `$01` to `$00` to read the RAM under the I/O, and
 so switch the motor on for a couple of frames (the tape really moves, as on
 a real C64). Reset stops the
-Datasette and rewinds the tape. A T64 is a file container: its first
-program is loaded, like a PRG. In the debugger the `tape` command inserts a
+Datasette and rewinds the tape. In the debugger the `tape` command inserts a
 tape, presses the buttons, shows counter and position and adjusts the
 wobble.
+
+A T64 is not a recording of a tape but a container of files made for
+emulators: as in VICE, the KERNAL's tape routines read it in place of the
+tape. The routine that reads a header block (`$F72F`) finds the programs
+one after the other, in the order of the image's directory, and after the
+last one starts again from the first; the one that reads the data
+(`$F8A1`) copies the program into memory at once. Everything else is the
+KERNAL's own code: `LOAD"NAME"` skips the programs with another name
+(printing FOUND for each of them), and a game that loads its parts by name,
+from BASIC or with its own call to `LOAD`, finds them on the "tape". A
+`VERIFY` compares the memory with the program and reports the
+differences (VICE loads the program instead). Opening a T64 loads its first
+program like a tape (`LOAD`, PLAY, C= after FOUND), then starts it with
+`RUN`, or with `SYS` at its address if it is not at `$0801`. The end
+addresses written in the image are often wrong (usually `$C3C6`): as VICE
+does, the size of each program is the distance to the next one in the
+image, and the last one stops at the end of the file. A T64 is never
+written, and reset rewinds it too. The check against VICE: a T64 whose BASIC program
+loads a second part by name, skipping another file, and whose second part
+loads a third one from machine code gives the same memory, STATUS and tape
+buffer as in VICE.
 
 For games on several tapes or sides, give all the files:
 `c64 side_a.tap side_b.tap`. The first one is loaded; when the game asks to
 turn the tape over, F8 does what a person would do: it inserts the next
-tape rewound and presses PLAY. The same goes for disks
+tape (TAP or T64) rewound and presses PLAY. The same goes for disks
 (`c64 disk1.d64 disk2.d64`): F8 changes the disk in the drive, after
 saving its changes. After the last medium it starts again from the first.
 
@@ -799,7 +830,7 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
   errors.
 - Tape: no fine speed adjustment (in VICE it is 0 by default); buttons are
   pressed automatically only on KERNAL messages (otherwise there is the
-  debugger's `tape` command); only the first file is loaded from T64s.
+  debugger's `tape` command).
 
 ## License
 

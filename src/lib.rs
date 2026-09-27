@@ -23,3 +23,4 @@ pub mod snapshot;
 pub mod notice;
 pub mod crt;
 pub mod timing;
+pub mod random;

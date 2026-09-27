@@ -113,7 +113,7 @@ impl Status {
         }
         Status {
             tape_button: tape.button(),
-            tape_present: tape.image.is_some(),
+            tape_present: tape.image.is_some() || c64.t64().is_some(),
             tape_motor: tape.motor(),
             tape_moving: tape.moving(),
             tape_counter: tape.counter(),

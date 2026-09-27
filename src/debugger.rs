@@ -745,8 +745,18 @@ impl Debugger {
         };
         let sound = t.sound().map_or("off".to_string(), |v| format!("volume {v}"));
         let extra = format!("buttons {auto}  wobble {wobble}  azimuth {azimuth}  sound {sound}");
+        if let Some(t64) = c64.t64() {
+            // The programs of the image, with the one found last
+            let mut s = format!("tape: T64 {}  {}  (read by the KERNAL tape routines, {} program(s))\n",
+                c64.tape_path(), t.button().name(), t64.files.len());
+            for (i, f) in t64.files.iter().enumerate() {
+                let mark = if t64.current() == Some(i) { '>' } else { ' ' };
+                let _ = writeln!(s, "{mark}{:3} \"{}\"  ${:04X}-${:04X}", i + 1, f.display_name(), f.start, f.end);
+            }
+            return s + &extra + "\n";
+        }
         let Some(tap) = &t.image else {
-            return format!("tape: none ('tape insert file.tap')  {extra}\n");
+            return format!("tape: none ('tape insert file.tap|file.t64')  {extra}\n");
         };
         let (pos, len) = t.position();
         let file = match c64.tape_path() {
@@ -788,8 +798,8 @@ impl Debugger {
   drive [mem a [b]]  1541 drive: CPU, track, motor, VIA, serial bus; mem = its memory
   drive g64 file     save the disk in the drive as a G64 image
   tape [play|record|stop|ff|rew]   Datasette: state and buttons
-  tape insert file|eject|save      .tap tape (missing file: blank tape); save writes the recordings
-  tape rewind|counter              rewind instantly / reset the counter
+  tape insert file|eject|save      .tap tape (missing file: blank tape) or .t64 image; save writes the recordings
+  tape rewind|counter              rewind instantly (T64: back to the first program) / reset the counter
   tape auto on|off                 buttons pressed automatically on PRESS PLAY / RECORD & PLAY ON TAPE
   tape wobble [off | % Hz]         tape speed wobble (default ±0.5% at 3 Hz, as in VICE)
   tape azimuth [cycles | off]      azimuth error: each pulse is off by a random amount up to that many cycles (0.001-10)
@@ -1135,8 +1145,10 @@ impl Debugger {
                 let clk = c64.bus.cycle;
                 match args.first().copied() {
                     Some("insert") => {
-                        let path = args.get(1).ok_or("usage: tape insert file.tap")?;
-                        if c64.insert_tape_file(path)? {
+                        let path = args.get(1).ok_or("usage: tape insert file.tap|file.t64")?;
+                        if path.to_lowercase().ends_with(".t64") {
+                            c64.insert_t64_file(path)?;
+                        } else if c64.insert_tape_file(path)? {
                             writeln!(out, "blank tape: {path} will be created on the first save").map_err(io)?;
                         }
                     }
@@ -1150,7 +1162,7 @@ impl Debugger {
                     Some("stop") => c64.bus.tape.press(Button::Stop, clk),
                     Some("ff") => c64.bus.tape.press(Button::Forward, clk),
                     Some("rew") => c64.bus.tape.press(Button::Rewind, clk),
-                    Some("rewind") => c64.bus.tape.rewind(),
+                    Some("rewind") => c64.rewind_tape(),
                     Some("counter") => c64.bus.tape.reset_counter(),
                     Some("eject") => {
                         if let Some(path) = c64.eject_tape()? {

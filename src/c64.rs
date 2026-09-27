@@ -63,8 +63,12 @@ pub struct C64 {
     /// File of the mounted disk, to write back the changes made by the drive.
     disk_path: String,
     disk_autoload: bool,    // true = still have to inject the LOAD"*",8,1 + RUN command
-    /// File of the inserted tape, to write the recordings back to.
+    /// File of the inserted tape, to write the recordings back to (or of
+    /// the T64 image, which is never written).
     tape_path: String,
+    /// T64 image in place of the tape: the KERNAL tape routines read its
+    /// files (`t64_trap`).
+    t64: Option<crate::tape::T64>,
     /// Inserted tape to load: LOAD, PLAY and then RUN.
     tape_autoload: bool,
     /// Datasette keys pressed automatically when the KERNAL asks for
@@ -78,6 +82,9 @@ pub struct C64 {
     /// Frames to wait, once LOAD has been typed, before putting RUN in the
     /// KERNAL keyboard buffer (0 = nothing to do).
     autoload_run: u8,
+    /// Address to start with SYS instead of RUN after the autoload (0:
+    /// RUN), for T64 programs that are not BASIC.
+    autoload_sys: u16,
 
     /// Audio of the last frame at the rate chosen with `set_audio`: mono,
     /// or interleaved stereo (SID 1 left, SID 2 right) with the second
@@ -115,11 +122,13 @@ impl C64 {
             disk_path: String::new(),
             disk_autoload: false,
             tape_path: String::new(),
+            t64: None,
             tape_autoload: false,
             tape_auto_buttons: true,
             tape_found_wait: 0,
             tape_cbm_key: 0,
             autoload_run: 0,
+            autoload_sys: 0,
             audio_buf: Vec::new(),
             audio_buf2: Vec::new(),
             frame_elapsed: 0,
@@ -292,6 +301,9 @@ impl C64 {
         }
         // The Datasette stops and rewinds (VICE's DatasetteResetWithCPU)
         self.bus.tape.reset();
+        if let Some(t64) = &mut self.t64 {
+            t64.rewind();
+        }
         // The RES line reaches both CIAs and the SIDs; the VIC, which has no
         // reset pin, restarts from line 0 as in VICE (last, as VICE does)
         self.bus.cia1.reset();
@@ -330,6 +342,7 @@ impl C64 {
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
+        self.autoload_sys = 0;
         if ext == "tap" {
             return if self.insert_tape_file(path)? {
                 Ok(format!("Blank tape: {path} (the file is created on the first SAVE)"))
@@ -375,9 +388,17 @@ impl C64 {
                 Ok(format!("G64 disk inserted: {path} (auto-load LOAD\"*\",8,1 + RUN)"))
             }
             "t64" => {
-                let (name, prg) = crate::tape::t64_first_prg(&data).map_err(|e| format!("T64 error: {e}"))?;
-                let (lo, hi) = self.queue_prg(prg).map_err(|e| format!("T64 error: {e}"))?;
-                Ok(format!("T64: {path} — first program \"{name}\" queued, ${lo:04X}–${hi:04X}"))
+                let t64 = crate::tape::T64::from_bytes(&data).map_err(|e| format!("T64 error: {e}"))?;
+                let first = &t64.files[0];
+                // BASIC programs start with RUN, the others with SYS at
+                // their address (as a PRG)
+                self.autoload_sys = if first.start == 0x0801 { 0 } else { first.start };
+                let msg = format!("T64 inserted: {path} — {} program(s), the first \"{}\" ${:04X}–${:04X} (auto-load LOAD + PLAY + {})",
+                    t64.files.len(), first.display_name(), first.start, first.end,
+                    if self.autoload_sys == 0 { "RUN".to_string() } else { format!("SYS{}", first.start) });
+                self.insert_t64(t64, path);
+                self.tape_autoload = true;
+                Ok(msg)
             }
             _ => {
                 let (lo, hi) = self.queue_prg(data).map_err(|e| format!("PRG error: {e}"))?;
@@ -422,9 +443,15 @@ impl C64 {
         &self.disk_path
     }
 
-    /// File of the inserted tape ("" if it does not come from a file).
+    /// File of the inserted tape or T64 ("" if it does not come from a
+    /// file).
     pub fn tape_path(&self) -> &str {
         &self.tape_path
+    }
+
+    /// Inserted T64 image.
+    pub fn t64(&self) -> Option<&crate::tape::T64> {
+        self.t64.as_ref()
     }
 
     /// Changes tape after saving the recordings of the inserted one.
@@ -435,15 +462,46 @@ impl C64 {
             Err(e) => eprintln!("{e}"),
         }
         self.bus.tape.insert(tap);
+        self.t64 = None;
         self.tape_path = path;
     }
 
-    /// Ejects the tape, after saving its recordings.
+    /// Inserts a T64 image in place of the tape, rewound: the Datasette
+    /// is left empty (as in VICE) and the KERNAL tape routines read the
+    /// image's files.
+    pub fn insert_t64(&mut self, t64: crate::tape::T64, path: &str) {
+        match self.eject_tape() {
+            Ok(Some(saved)) => crate::notice!("Recordings written to {saved}"),
+            Ok(None) => {}
+            Err(e) => eprintln!("{e}"),
+        }
+        self.t64 = Some(t64);
+        self.tape_path = path.to_string();
+    }
+
+    /// Reads the T64 image `path` and inserts it (`insert_t64`).
+    pub fn insert_t64_file(&mut self, path: &str) -> Result<(), String> {
+        let data = std::fs::read(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
+        let t64 = crate::tape::T64::from_bytes(&data).map_err(|e| format!("T64 error: {e}"))?;
+        self.insert_t64(t64, path);
+        Ok(())
+    }
+
+    /// Ejects the tape or the T64, after saving the tape's recordings.
     pub fn eject_tape(&mut self) -> Result<Option<String>, String> {
         let saved = self.save_tape_changes()?;
         self.bus.tape.eject();
+        self.t64 = None;
         self.tape_path.clear();
         Ok(saved)
+    }
+
+    /// Rewinds the tape, or the T64, to the start instantly.
+    pub fn rewind_tape(&mut self) {
+        self.bus.tape.rewind();
+        if let Some(t64) = &mut self.t64 {
+            t64.rewind();
+        }
     }
 
     /// Writes what was recorded on the tape to its file, if anything.
@@ -525,6 +583,11 @@ impl C64 {
                 self.bus.tape.play(self.bus.cycle);
                 Ok(format!("Tape inserted: {path} (PLAY pressed)"))
             }
+            "t64" => {
+                self.insert_t64_file(path)?;
+                self.bus.tape.play(self.bus.cycle);
+                Ok(format!("T64 inserted: {path} (PLAY pressed)"))
+            }
             "d64" | "g64" => {
                 if let Some(saved) = self.save_disk_changes()? {
                     crate::notice!("Disk changes written to {saved}");
@@ -539,7 +602,7 @@ impl C64 {
                     Ok(format!("Disk inserted: {path}"))
                 }
             }
-            _ => Err(format!("{path}: only tapes (.tap) and disks (.d64, .g64) can be changed")),
+            _ => Err(format!("{path}: only tapes (.tap, .t64) and disks (.d64, .g64) can be changed")),
         }
     }
 
@@ -925,6 +988,9 @@ impl C64 {
         if self.cpu.pc == 0xF81E && self.tape_auto_buttons {
             self.tape_prompt();
         }
+        if self.t64.is_some() && matches!(self.cpu.pc, 0xF72F | 0xF8A1) && self.t64_trap() {
+            return StepResult { cycles: 0, elapsed: 0, frame_done: false };
+        }
 
         // One machine cycle at a time until the instruction (or the interrupt
         // sequence) is complete. In every cycle: VIC and CIA advance, the VIC
@@ -1021,8 +1087,12 @@ impl C64 {
         } else if self.autoload_run > 0 && !self.bus.keyboard.typing() {
             self.autoload_run -= 1;
             if self.autoload_run == 0 {
-                self.bus.ram[0x0277..0x027B].copy_from_slice(b"RUN\r");
-                self.bus.ram[0x00C6] = 4;
+                let cmd = match std::mem::take(&mut self.autoload_sys) {
+                    0 => "RUN\r".to_string(),
+                    a => format!("SYS{a}\r"),
+                };
+                self.bus.ram[0x0277..0x0277 + cmd.len()].copy_from_slice(cmd.as_bytes());
+                self.bus.ram[0x00C6] = cmd.len() as u8;
             }
         }
 
@@ -1057,7 +1127,7 @@ impl C64 {
     fn tape_prompt(&mut self) {
         use crate::tape::Button;
         let b = &self.bus;
-        if b.tape.image.is_none() || b.tape.button() != Button::Stop
+        if (b.tape.image.is_none() && self.t64.is_none()) || b.tape.button() != Button::Stop
             || [b.peek(0xF81C), b.peek(0xF81E), b.peek(0xF81F), b.peek(0xF820)] != [0xA0, 0x20, 0x2F, 0xF1]
         {
             return;
@@ -1094,6 +1164,31 @@ impl C64 {
             self.tape_cbm_key = 3;
             self.tape_found_wait = 0;
         }
+    }
+
+    /// T64 tape traps (VICE's c64_tape_traps): with the KERNAL ROM visible,
+    /// the JSR that reads a header block ($F72F) or the data ($F8A1) from
+    /// the tape is replaced by reading the T64 image, and the KERNAL goes
+    /// on from where the tape read would have returned. Returns true if
+    /// the trap was handled.
+    fn t64_trap(&mut self) -> bool {
+        let pc = self.cpu.pc;
+        let (check, resume) = if pc == 0xF72F { ([0x20, 0x41, 0xF8], 0xF732) } else { ([0x20, 0xBD, 0xFC], 0xFC93) };
+        if (0..3).any(|i| self.bus.peek(pc + i) != check[i as usize]) {
+            return false;
+        }
+        let Some(t64) = self.t64.as_mut() else { return false };
+        if pc == 0xF72F {
+            let stop = t64.find_header(&mut self.bus.ram);
+            self.cpu.p.set(Flags::C, stop);
+            self.cpu.p.set(Flags::Z, true);
+        } else {
+            t64.receive(&mut self.bus.ram, self.cpu.x);
+            self.cpu.p.set(Flags::C, false);
+            self.cpu.p.set(Flags::I, false);
+        }
+        self.cpu.pc = resume;
+        true
     }
 
     /// Channels of `audio_buf`: 2 with the second SID.
@@ -1260,7 +1355,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 21;
+const STATE_VERSION: u32 = 23;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
@@ -1295,7 +1390,7 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
 // frame blending and the CRT emulation (display settings).
 impl_state!(C64 {
     chip, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
-    disk, disk_path, disk_autoload, tape_path, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
-    autoload_run,
+    disk, disk_path, disk_autoload, tape_path, t64, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
+    autoload_run, autoload_sys,
     frame_elapsed, frame_count,
 } skip { audio_buf, audio_buf2, dbg, blend, hdr, crt });

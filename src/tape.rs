@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 SampoSoft - Francesco Sampoli
-// Derived from VICE 3.10 (datasette.c, tap.c, t64.c, lib.c),
+// Derived from VICE 3.10 (datasette.c, tap.c, t64.c, tape.c),
 // Copyright (C) Andreas Boose, Andreas Matthies, Marco van den Heuvel,
-// David Hansel, Ettore Perazzoli, Compyx.
+// David Hansel, Ettore Perazzoli, Compyx, Jouko Valta.
 // Ported to Rust and modified by SampoSoft in 2026; see CREDITS.md.
 
 //! Tape recorder (Datasette 1530) and tape images, as in VICE 3.10
-//! (datasette.c, tap.c, t64.c).
+//! (datasette.c, tap.c, t64.c, tape.c).
 //!
 //! Connections to the C64:
 //! - READ: every tape pulse is a falling edge on the CIA1 FLAG line (ICR
@@ -110,45 +110,162 @@ impl Tap {
     }
 }
 
-/// Extracts the first program from a T64 image (a file container): load
-/// address and data, like a PRG.
-pub fn t64_first_prg(bytes: &[u8]) -> Result<(String, Vec<u8>), String> {
-    if bytes.len() < 64 || !bytes.starts_with(b"C64") {
-        return Err("not a T64 image".into());
+/// Header type written in the tape buffer for the programs of a T64: a
+/// program loaded at its own address (VICE's default, TAPE_CAS_TYPE_PRG).
+const CAS_TYPE_PRG: u8 = 3;
+
+/// A program in a T64 image.
+#[derive(Clone, Default)]
+pub struct T64File {
+    /// Name as stored in the image (PETSCII, 16 bytes).
+    pub name: [u8; 16],
+    pub start: u16,
+    /// End address (exclusive), corrected as VICE's t64_open does.
+    pub end: u16,
+    /// Content in the image (shorter than end - start if the image is
+    /// truncated).
+    pub data: Vec<u8>,
+}
+
+impl T64File {
+    /// Name for the messages, without the padding.
+    pub fn display_name(&self) -> String {
+        let len = self.name.iter().rposition(|&c| !matches!(c, b' ' | 0 | 0xA0)).map_or(0, |i| i + 1);
+        self.name[..len].iter().map(|&c| if c.is_ascii_graphic() || c == b' ' { c as char } else { '?' }).collect()
     }
-    let max = u16::from_le_bytes([bytes[0x22], bytes[0x23]]).max(1) as usize;
-    let entries: Vec<&[u8]> = (0..max)
-        .map(|i| 0x40 + 32 * i)
-        .take_while(|&o| o + 32 <= bytes.len())
-        .map(|o| &bytes[o..o + 32])
-        .collect();
-    // Used entries (type 1: normal file), sorted by offset in the file
-    let mut files: Vec<(usize, u16, u16, String)> = entries
-        .iter()
-        .filter(|e| e[0] == 1)
-        .map(|e| {
+}
+
+/// T64 image: a file container made for emulators, not a recording of a
+/// tape. As VICE does (tape.c, t64.c), its programs are handed to the
+/// KERNAL tape routines in place of the tape blocks: the header search
+/// finds them one after the other, in the order of the directory, and
+/// starts again from the first after the last.
+#[derive(Clone, Default)]
+pub struct T64 {
+    pub files: Vec<T64File>,
+    /// File whose header was found last (None: tape rewound).
+    current: Option<usize>,
+    /// Bytes of the current file already read.
+    read: usize,
+}
+
+impl T64 {
+    /// Reads the image (VICE's t64_open). Only the normal entries (type
+    /// 1) are files; there must be at least one.
+    pub fn from_bytes(bytes: &[u8]) -> Result<T64, String> {
+        if bytes.len() < 64 || !bytes.starts_with(b"C64") {
+            return Err("not a T64 image".into());
+        }
+        // As in VICE, a directory size of 0 counts as 1
+        let max = u16::from_le_bytes([bytes[0x22], bytes[0x23]]).max(1) as usize;
+        let entries: Vec<&[u8]> = (0..max)
+            .map(|i| 0x40 + 32 * i)
+            .take_while(|&o| o + 32 <= bytes.len())
+            .map(|o| &bytes[o..o + 32])
+            .filter(|e| e[0] == 1)
+            .collect();
+        if entries.is_empty() {
+            return Err("the T64 image contains no files".into());
+        }
+        let offset = |e: &[u8]| u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+        // The end addresses are often wrong (usually $C3C6): as in VICE, the
+        // size of a file is the distance from the next one in the image,
+        // and the last one does not go past the end of the image
+        let mut by_offset: Vec<usize> = (0..entries.len()).collect();
+        by_offset.sort_by_key(|&i| offset(entries[i]));
+        let mut sizes = vec![0u16; entries.len()];
+        for (k, &i) in by_offset.iter().enumerate() {
+            let e = entries[i];
             let start = u16::from_le_bytes([e[2], e[3]]);
-            let end = u16::from_le_bytes([e[4], e[5]]);
-            let offset = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
-            let name: String = e[16..32].iter().map(|&c| c as char).collect::<String>()
-                .trim_end_matches([' ', '\0', '\u{A0}']).to_string();
-            (offset, start, end, name)
-        })
-        .collect();
-    files.sort_by_key(|f| f.0);
-    let Some(&(offset, start, end, ref name)) = files.first() else {
-        return Err("the T64 image contains no files".into());
-    };
-    if offset >= bytes.len() {
-        return Err("T64: file offset outside the image".into());
+            let reported = u16::from_le_bytes([e[4], e[5]]).wrapping_sub(start);
+            sizes[i] = match by_offset.get(k + 1) {
+                Some(&next) => offset(entries[next]).wrapping_sub(offset(e)) as u16,
+                None => reported.min(bytes.len().saturating_sub(offset(e)) as u16),
+            };
+        }
+        let files = entries.iter().zip(sizes).map(|(e, size)| {
+            let start = u16::from_le_bytes([e[2], e[3]]);
+            let from = offset(e).min(bytes.len());
+            let to = (from + size as usize).min(bytes.len());
+            T64File {
+                name: e[16..32].try_into().unwrap(),
+                start,
+                end: start.wrapping_add(size),
+                data: bytes[from..to].to_vec(),
+            }
+        }).collect();
+        Ok(T64 { files, current: None, read: 0 })
     }
-    // The end address is often wrong in T64s (usually $C3C6): the length
-    // is limited to the next file or to the end of the image
-    let limit = files.get(1).map_or(bytes.len(), |f| f.0.min(bytes.len())) - offset;
-    let len = if end > start { ((end - start) as usize).min(limit) } else { limit };
-    let mut prg = start.to_le_bytes().to_vec();
-    prg.extend_from_slice(&bytes[offset..offset + len]);
-    Ok((name.clone(), prg))
+
+    /// Back to the start: the next header found is the first file's.
+    pub fn rewind(&mut self) {
+        self.current = None;
+        self.read = 0;
+    }
+
+    /// Index of the file whose header was found last.
+    pub fn current(&self) -> Option<usize> {
+        self.current
+    }
+
+    /// In place of reading a header block from the tape (KERNAL $F72F,
+    /// VICE's tape_find_header_trap): the header of the next file goes
+    /// into the tape buffer, and STATUS and the verify flag are cleared.
+    /// Returns true if STOP is in the keyboard buffer (the KERNAL's
+    /// carry).
+    pub fn find_header(&mut self, ram: &mut [u8; 0x10000]) -> bool {
+        let n = self.current.map_or(0, |c| (c + 1) % self.files.len());
+        self.current = Some(n);
+        self.read = 0;
+        let f = &self.files[n];
+        let buf = u16::from_le_bytes([ram[0xB2], ram[0xB3]]);
+        let mut header = [CAS_TYPE_PRG; 21];
+        header[1..3].copy_from_slice(&f.start.to_le_bytes());
+        header[3..5].copy_from_slice(&f.end.to_le_bytes());
+        header[5..].copy_from_slice(&f.name);
+        for (i, &b) in header.iter().enumerate() {
+            ram[buf.wrapping_add(i as u16) as usize] = b;
+        }
+        ram[0x90] = 0;
+        ram[0x93] = 0;
+        // No IRQ vector to restore at the end of the tape operation
+        ram[0x029F] = 0;
+        ram[0x02A0] = 0;
+        ram[0x0277..0x0277 + (ram[0xC6] as usize).min(10)].contains(&0x03)
+    }
+
+    /// In place of reading the data from the tape (KERNAL $F8A1, VICE's
+    /// tape_receive_trap), with X the operation the KERNAL is doing ($0E:
+    /// read): the current file goes into memory from ($C1) to ($AE), and
+    /// STATUS gets EOF, or a read error if the file is shorter. In a
+    /// VERIFY (flag $93) memory is compared instead, and a difference is
+    /// an error as on the real tape (VICE loads it all the same).
+    pub fn receive(&mut self, ram: &mut [u8; 0x10000], x: u8) {
+        let mut st = 0x40;
+        if x == 0x0E {
+            let start = u16::from_le_bytes([ram[0xC1], ram[0xC2]]);
+            let end = u16::from_le_bytes([ram[0xAE], ram[0xAF]]);
+            let len = end.wrapping_sub(start) as usize;
+            let data = self.current.map_or(&[][..], |c| &self.files[c].data[self.read.min(self.files[c].data.len())..]);
+            let n = len.min(data.len());
+            let verify = ram[0x93] != 0;
+            for (i, &b) in data[..n].iter().enumerate() {
+                let a = start.wrapping_add(i as u16) as usize;
+                if !verify {
+                    ram[a] = b;
+                } else if ram[a] != b {
+                    st |= 0x10;
+                }
+            }
+            self.read += n;
+            if n < len {
+                st = 0x10;
+            }
+        }
+        ram[0x029F] = 0;
+        ram[0x02A0] = 0;
+        ram[0x90] |= st;
+    }
 }
 
 /// Datasette buttons.
@@ -221,7 +338,7 @@ pub struct Datasette {
     /// to the next pulse and random generator state.
     azimuth_error: u32,
     azimuth_rest: i64,
-    rng: u64,
+    rng: crate::random::Pcg,
     /// Tape sound: volume (0: off), sign of the next half-wave, level
     /// changes still to be mixed (cycle, level), level and cycle from which
     /// mixing resumes.
@@ -263,7 +380,7 @@ impl Datasette {
             wobble_rest: 0.0,
             azimuth_error: 0,
             azimuth_rest: 0,
-            rng: PCG_MULTIPLIER.wrapping_add(PCG_INCREMENT),
+            rng: crate::random::Pcg::new(),
             sound_volume: 0,
             sound_sign: 1,
             sound_edges: Vec::new(),
@@ -818,31 +935,21 @@ impl Datasette {
     /// 3.10 has a bug: the negative random value ends up in a 64-bit
     /// unsigned integer and becomes about +4.3 million cycles, so with
     /// `-dstapeerror` the tape no longer loads. Here the shift is signed, as
-    /// VICE intended. The generator is VICE's (PCG) with a fixed initial
-    /// state: same tapes, same errors.
+    /// VICE intended. The generator is VICE's (`random::Pcg`) with a fixed
+    /// initial state: same tapes, same errors.
     fn apply_azimuth_error(&mut self, gap: u64) -> u64 {
         if self.azimuth_error == 0 {
             return gap;
         }
         let e = self.azimuth_error as i64;
-        let error = (self.random() as i64 * (2 * e + 1)) >> 32;
+        let error = (self.rng.next_u32() as i64 * (2 * e + 1)) >> 32;
         let exact = gap as i64 * AZIMUTH_ERROR_ONE as i64 + (error - e) + self.azimuth_rest;
         let new_gap = (exact + AZIMUTH_ERROR_ONE as i64 / 2).div_euclid(AZIMUTH_ERROR_ONE as i64).max(1);
         self.azimuth_rest = exact - new_gap * AZIMUTH_ERROR_ONE as i64;
         new_gap as u64
     }
 
-    /// 32-bit random number (PCG-XSH-RR 32/64, VICE's rand_uint32).
-    fn random(&mut self) -> u32 {
-        let prev = self.rng;
-        self.rng = prev.wrapping_mul(PCG_MULTIPLIER).wrapping_add(PCG_INCREMENT);
-        let base = ((prev ^ (prev >> 18)) >> 27) as u32;
-        base.rotate_right((prev >> 59) as u32)
-    }
 }
-
-const PCG_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
-const PCG_INCREMENT: u64 = 1;
 
 impl Default for Datasette {
     fn default() -> Self {
@@ -855,6 +962,10 @@ impl Default for Datasette {
 use crate::snapshot::{impl_state, impl_state_enum};
 
 impl_state!(Tap { version, system, video, data, changed });
+
+impl_state!(T64File { name, start, end, data });
+
+impl_state!(T64 { files, current, read });
 
 impl_state_enum!(Button { Stop, Play, Forward, Rewind, Record });
 
@@ -1132,15 +1243,6 @@ mod tests {
     }
 
     #[test]
-    fn pcg_matches_vice() {
-        // First values of VICE's rand_uint32 (compiled lib.c) from the
-        // initial state, without a seed
-        let mut ds = Datasette::new();
-        let got: Vec<u32> = (0..4).map(|_| ds.random()).collect();
-        assert_eq!(got, [0xE4C14788, 0x379C6516, 0x5C4AB3BB, 0x601D23E0]);
-    }
-
-    #[test]
     fn sound_is_a_square_wave_per_pulse() {
         let mut ds = datasette(tap(1, &[0x40; 100]));
         ds.set_sound(Some(1000));
@@ -1172,21 +1274,94 @@ mod tests {
         assert_eq!(Tap::blank().to_bytes().len(), 24);
     }
 
-    #[test]
-    fn t64_with_wrong_end_address() {
-        let mut img = vec![0u8; 0x60 + 5];
+    /// T64 image with the entries (start, reported end, name, content),
+    /// stored in the image in reverse order.
+    fn t64_image(files: &[(u16, u16, &str, &[u8])]) -> Vec<u8> {
+        let dir = 0x40 + 32 * files.len();
+        let mut img = vec![0u8; dir];
         img[..3].copy_from_slice(b"C64");
-        img[0x22] = 1;
-        let e = &mut img[0x40..0x60];
-        e[0] = 1;
-        e[1] = 0x82;
-        e[2..4].copy_from_slice(&0x0801u16.to_le_bytes());
-        e[4..6].copy_from_slice(&0xC3C6u16.to_le_bytes());
-        e[8..12].copy_from_slice(&0x60u32.to_le_bytes());
-        e[16..20].copy_from_slice(b"GAME");
-        img[0x60..].copy_from_slice(&[1, 2, 3, 4, 5]);
-        let (name, prg) = t64_first_prg(&img).unwrap();
-        assert_eq!(name, "GAME");
-        assert_eq!(prg, [0x01, 0x08, 1, 2, 3, 4, 5]);
+        img[0x22] = files.len() as u8;
+        let mut offsets = vec![0; files.len()];
+        for (i, f) in files.iter().enumerate().rev() {
+            offsets[i] = img.len();
+            img.extend_from_slice(f.3);
+        }
+        for (i, &(start, end, name, _)) in files.iter().enumerate() {
+            let e = &mut img[0x40 + 32 * i..0x60 + 32 * i];
+            e[0] = 1;
+            e[1] = 0x82;
+            e[2..4].copy_from_slice(&start.to_le_bytes());
+            e[4..6].copy_from_slice(&end.to_le_bytes());
+            e[8..12].copy_from_slice(&(offsets[i] as u32).to_le_bytes());
+            e[16..32].fill(b' ');
+            e[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        }
+        img
+    }
+
+    #[test]
+    fn t64_sizes_from_the_offsets() {
+        // Wrong end addresses: the first file ends where the next one
+        // begins in the image, the last one at the end of the image
+        let img = t64_image(&[(0x0801, 0xC3C6, "GAME", &[1, 2, 3, 4, 5]), (0xC000, 0xC3C6, "PART2", &[6, 7])]);
+        let t = T64::from_bytes(&img).unwrap();
+        assert_eq!(t.files.len(), 2);
+        assert_eq!((t.files[0].display_name(), t.files[0].start, t.files[0].end), ("GAME".into(), 0x0801, 0x0806));
+        assert_eq!(t.files[0].data, [1, 2, 3, 4, 5]);
+        assert_eq!((t.files[1].display_name(), t.files[1].end), ("PART2".into(), 0xC002));
+        assert_eq!(t.files[1].data, [6, 7]);
+        // The last one is only shortened, as in VICE
+        let t = T64::from_bytes(&t64_image(&[(0x1000, 0x1001, "A", &[9, 9, 9])])).unwrap();
+        assert_eq!((t.files[0].end, t.files[0].data.len()), (0x1001, 1));
+        assert!(T64::from_bytes(b"C64 not really").is_err());
+    }
+
+    #[test]
+    fn t64_serves_the_kernal_tape_routines() {
+        let img = t64_image(&[(0x0801, 0x0804, "ONE", &[1, 2, 3]), (0xC000, 0xC002, "TWO", &[4, 5])]);
+        let mut t = T64::from_bytes(&img).unwrap();
+        let mut ram = Box::new([0u8; 0x10000]);
+        ram[0xB2..0xB4].copy_from_slice(&0x033Cu16.to_le_bytes());
+        ram[0x90] = 0xFF;
+        let header = |ram: &[u8; 0x10000]| ram[0x033C..0x033C + 21].to_vec();
+        // Headers in order, then back to the first
+        assert!(!t.find_header(&mut ram));
+        assert_eq!(ram[0x90], 0);
+        assert_eq!(header(&ram)[..5], [3, 0x01, 0x08, 0x04, 0x08]);
+        assert_eq!(&header(&ram)[5..8], b"ONE");
+        t.find_header(&mut ram);
+        assert_eq!(header(&ram)[..5], [3, 0x00, 0xC0, 0x02, 0xC0]);
+        // Load of the second file where the KERNAL says, with EOF
+        ram[0xC1..0xC3].copy_from_slice(&0xC000u16.to_le_bytes());
+        ram[0xAE..0xB0].copy_from_slice(&0xC002u16.to_le_bytes());
+        t.receive(&mut ram, 0x0E);
+        assert_eq!((ram[0xC000], ram[0xC001], ram[0xC002], ram[0x90]), (4, 5, 0, 0x40));
+        // VERIFY: the same bytes are fine, a different one is an error
+        t.find_header(&mut ram);
+        assert_eq!(t.current(), Some(0));
+        t.find_header(&mut ram);
+        ram[0x93] = 1;
+        t.receive(&mut ram, 0x0E);
+        assert_eq!(ram[0x90], 0x40);
+        ram[0xC001] = 0;
+        ram[0x90] = 0;
+        t.find_header(&mut ram);
+        t.find_header(&mut ram);
+        ram[0x93] = 1;
+        t.receive(&mut ram, 0x0E);
+        assert_eq!((ram[0xC001], ram[0x90]), (0, 0x50));
+        // Longer than the file: read error. STOP in the keyboard buffer
+        ram[0x93] = 0;
+        ram[0x90] = 0;
+        t.find_header(&mut ram);
+        ram[0xAE..0xB0].copy_from_slice(&0xC005u16.to_le_bytes());
+        t.receive(&mut ram, 0x0E);
+        assert_eq!(ram[0x90], 0x10);
+        ram[0x0277] = 0x03;
+        ram[0xC6] = 1;
+        assert!(t.find_header(&mut ram));
+        t.rewind();
+        t.find_header(&mut ram);
+        assert_eq!(t.current(), Some(0));
     }
 }
