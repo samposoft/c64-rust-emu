@@ -3,9 +3,11 @@
 Commodore 64 emulator in Rust: 6510 CPU with illegal opcodes, cycle-exact
 VIC-II, SID, CIA, 1541 drive, Datasette, REU, keyboard, joystick, paddles,
 1351 mouse, PRG/D64/G64/TAP/T64/CRT.
-The frontend uses only pure Rust crates (`winit`, `softbuffer`, `cpal`, `gilrs`):
-no external libraries to install, a single executable on macOS, Linux
-and Windows.
+The frontend uses only pure Rust crates (`winit`, `wgpu`, `softbuffer`,
+`cpal`, `gilrs`): no external libraries to install, a single executable on
+macOS, Linux and Windows. The window is drawn on the GPU, which also
+emulates Commodore monitors and a home TV (`--crt 1084s`, `1084s-d1`,
+`1901`, `--rf`).
 
 ## Build
 
@@ -28,6 +30,11 @@ cargo build --release
 ./target/release/c64 --port1 paddles prg/Arkanoid.d64      # paddles in control port 1
 ./target/release/c64 --remote prg/game.d64                 # remote monitor for other programs, see DEBUGGER.md
 ./target/release/c64 --blend demo/earthrise/build/ifli.prg # frames mixed as the eye sees a CRT (interlace pictures)
+./target/release/c64 --crt 1084s prg/game.d64              # as on a Commodore 1084S-P1 monitor (luma/chroma cable)
+./target/release/c64 --crt 1084s-d1 prg/game.d64           # as on the 1084S-D1 (Daewoo)
+./target/release/c64 --crt 1901 prg/game.d64               # as on the 1901 (Thomson)
+./target/release/c64 --rf prg/game.d64                     # on a home TV through the RF modulator
+./target/release/c64 --composite prg/game.d64              # the same monitor through composite video
 ./target/release/c64mcp                                    # MCP server for Claude, see below
 ```
 
@@ -61,6 +68,11 @@ Platform requirements:
   requires `libudev-dev`; with `cargo build --release --no-default-features`
   the gamepad is left out and nothing else is needed. For audio, ALSA is
   already available on any desktop.
+- **GPU**: the `gpu` feature (on by default) draws the window with `wgpu`
+  (Metal on macOS, Vulkan or OpenGL on Linux, DirectX 12 or Vulkan on
+  Windows). Without a usable GPU, or when built without the feature
+  (`--no-default-features`), the window is drawn by the CPU with
+  `softbuffer`, as before, and the CRT emulation is not available.
 
 ## In the terminal: `c64term`
 
@@ -172,8 +184,8 @@ F11, or until Claude's connection closes. `c64mcp` works on macOS and Linux
 
 | Key | Function |
 |---|---|
-| Arrows, left Ctrl / left Alt / Space | joystick (directions, fire) |
-| TAB | joystick port: 2 (default) → 1 → none |
+| Arrows, left Ctrl / left Alt / Space | joystick (directions, fire); Space is also the space key |
+| TAB | joystick port: 2 (default) → 1 → none; with none the arrows are the cursor keys |
 | Esc | RUN/STOP |
 | Right Ctrl, right Alt | Control, Commodore |
 | F1–F8 | C64 function keys |
@@ -186,6 +198,12 @@ F11, or until Claude's connection closes. `c64mcp` works on macOS and Linux
 | Pointer over the C64 screen, left/right click | with paddles in a control port: position of the knobs, fire of paddle X / Y |
 | Click on the C64 screen | with a 1351 mouse in a control port: captures the host mouse for it |
 | Cmd (Windows/Super key on Windows and Linux), middle mouse button | releases the captured mouse (so does switching to another window) |
+
+While a joystick port is active the arrows drive only the joystick, as in
+VICE: as cursor keys too they would close keys on the matrix lines the
+joystick uses, and the program would see ghost keys (joystick up with CRSR
+down held reads as RUN/STOP, which pauses Giana Sisters, as on a real C64).
+To move the cursor in BASIC, TAB twice selects no port.
 
 Letters, digits and symbols follow the layout of the operating system and
 stay pressed on the C64 for as long as the key is held, at least 3 frames,
@@ -250,6 +268,105 @@ debugger `blend on|off`) shows every frame averaged in linear light with
 the previous one, which is what the eye sees on the CRT; screenshots are
 blended too. Moving objects leave a half-bright trail, so it is off by
 default. `demo/earthrise` is an IFLI picture made for it.
+
+### Monitor and TV: `--crt`
+
+`--crt 1084s` (in the debugger `crt 1084s`, `crt off`) shows the screen as
+a real monitor does, emulating on the GPU the analog path from the VIC-II
+to the picture tube; `--rf` (`crt tv`) shows it on a home TV connected to
+the C64's antenna socket. Four sets, from their service manuals:
+
+| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `cp90` (or `tv`) |
+|---|---|---|---|---|
+| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) |
+| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna), composite (SCART) |
+| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm |
+| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed); with RF the IF filter |
+| Luma peaking | none documented | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | none documented |
+| Luma trap (composite, RF) | full | full | none | shallow: -6 dB |
+| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | band-pass, Q about 3 |
+| PAL decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | TDA3561A, 64 µs delay line |
+| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) |
+
+The monitors are connected by default through their separate luma/chroma
+inputs (the 3-RCA cable, like S-Video), the TV through RF; `--composite`
+(`crt composite`, `crt lc`, `crt rf`) chooses another input the set has.
+With the C64 the two 1084S differ little: the D1 has a slightly softer
+luma, and its smaller picture (260 × 186 mm) makes the mask a little coarser
+relative to the pixels. (It was known as the sharpest of the family with
+the Amiga's RGB input, 10-15 MHz, which the C64 does not use.) The 1901 is
+different: its peaking makes edges crisper, with a bright rim on dark to
+light steps; its narrow chroma band-pass makes colors bleed more and fades
+the color of thin details; its white is colder (bluish next to a D65
+display). Its composite input needs an internal jumper, and having no luma
+trap it keeps the subcarrier in the luma, as a fine dot pattern over the
+colored areas, which also look brighter. The TV is the softest picture: RF
+limits the luma to about 3.5 MHz, its shallow trap leaves a dot pattern in
+colored areas and color fringes on fine detail (yellow text on blue turns
+whitish), and its mask is coarser.
+
+The model is in `src/crt.rs`, the shaders in `src/frontend/crt.wgsl`; it was
+built from published measurements, schematics and service manuals, not by
+comparison with VICE:
+
+- **VIC-II**: every color is a luma level and a chroma angle (Pepto's
+  "colodore" model, the one the palette comes from). The luma output rises
+  in about 1.5 pixels with a 12% overshoot, as measured on a real C64, so
+  thin bright lines lose some brightness and edges ring slightly. The chroma
+  phase differs by 13° between even and odd raster lines (measured on the
+  6569R5: 11-16°).
+- **C64 output**: the signal is sampled at four times the PAL subcarrier
+  (the C64's crystal, 17.73 MHz: 9 samples every 4 pixels). A C64 line is
+  283.5 subcarrier cycles, so the color artifacts are the same in every frame
+  (no dot crawl). The composite and RF outputs come out of the RF modulator,
+  whose luma network (Service Manual, modulator 251696: L2 ∥ 220 pF with
+  330 pF to ground) raises the luma by about 3 dB around 2 MHz and cuts it at
+  the subcarrier; it is taken as tuned to 4.43 MHz (its coil is adjustable).
+  Luma and chroma then share one signal, and fine luma detail near the
+  subcarrier turns into color fringes (cross-color) in the set.
+- **RF**: the modulator sends both sidebands of channel 36; in the TV the IF
+  filter (a PAL B/G SAW, EPCOS K2966M: Nyquist slope at 38.9 MHz, color
+  carrier 3 dB down, sound shelf 20 dB down) keeps the low frequencies flat
+  and rolls the luma off above about 4 MHz. With correct tuning the sound
+  carrier (5.5 MHz) stays about 45 dB below the picture and the noise of a
+  short cable about 50-60 dB: neither would show, and they are not modelled.
+- **Set**: the luma goes through the IF filter (RF), the trap (composite
+  signal) and the peaking of the set, if it has them, and the luma amplifier
+  limits the bandwidth (table above). The chroma, taken out by its band-pass
+  (composite signal), is limited to about 1.3 MHz or less, so colors bleed
+  horizontally, and the 64 µs delay line averages the chroma of each line
+  with the previous one, which cancels the odd-line phase error and halves
+  the vertical color resolution. The light of the three guns is balanced to
+  the set's white point.
+- **Picture tube**: the C64 draws 312 lines without interlace, so every
+  line is a separate beam with dark gaps between the lines; the beam widens
+  with brightness (thin scanlines on dark colors, almost none on bright
+  ones). The light then goes through the slot mask, at its real size
+  relative to the picture, with a little halation in the glass. The C64
+  pixels have the PAL aspect (0.936: narrower than tall).
+
+On large areas of one color the result is the colodore palette, within one
+step out of 255 (checked by a regression test, which renders every color
+through the whole chain), so the colors do not change: only the edges, the fine
+detail and the texture do. The 1901 has them balanced to its 7500 K white;
+on the TV the subcarrier left by its shallow trap makes colored areas up to
+3 steps brighter. The width of the beam, the shape of the mask slots, the
+halation and the Q of the traps are estimates, chosen by comparing with
+photos of real 1084S monitors, and are the same for all the sets (their
+manuals say nothing about them); the 1901's mask is assumed to be a slot
+mask as well (in-line guns; the manual only gives the pitch). The mask of a
+real tube is dark between the phosphor stripes, with the stripes much
+brighter than white on average; a normal display cannot show that, so the
+mask is applied at half depth, and less on the brightest colors, which come
+out slightly darker (white is about 250 instead of 255). It shows best in
+fullscreen or at a large size: when the triads are smaller than about 3
+pixels of the display only their fine color stripes remain. The picture is
+shown whole, without the overscan of the real sets (a TV would cut part of
+the border), and flat.
+
+With `--blend` the GPU averages the light of the last two frames. The
+screenshot through the monitor is `screenshot file.png crt [height]` in the
+debugger (default 1136 pixels high). `c64term` has no CRT emulation.
 
 ### Window title and status bar
 
@@ -497,6 +614,13 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 - Freezer and utility cartridges (see above).
 - Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
   expansions; NIB/P64 images not supported.
+- Monitor: only the Commodore 1084S-P1, 1084S-D1, 1901 and the Philips
+  CP90 TV (PAL); no 1701/1702 PAL (their PAL schematics are not available),
+  no NTSC sets (the C64 here is PAL), no HDR output (it would allow the full
+  depth of the slot mask), no VIC-II "jail bars"; the peaking of the 1084S
+  and of the 1901's video output stage is not modelled (the manuals give no
+  values for it); on the TV no sound carrier, noise, fine tuning or
+  overscan.
 - Tape: no fine speed adjustment (in VICE it is 0 by default); buttons are
   pressed automatically only on KERNAL messages (otherwise there is the
   debugger's `tape` command); only the first file is loaded from T64s.

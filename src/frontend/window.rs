@@ -2,9 +2,12 @@
 // Copyright (C) 2026 SampoSoft - Francesco Sampoli
 
 //! winit-specific parts, shared by `c64` and `c64dbg --window`: physical key
-//! mapping, window attributes and icon, scaled drawing of the framebuffer
-//! with the status bar below it, capture of the host mouse for the paddles
+//! mapping, window attributes and icon, drawing of the framebuffer with the
+//! status bar below it (`Display`: GPU or CPU), capture of the host mouse for the paddles
 //! and the 1351 mouse.
+
+use std::num::NonZeroU32;
+use std::sync::Arc;
 
 use winit::dpi::LogicalSize;
 use winit::event::MouseButton;
@@ -96,50 +99,91 @@ pub fn set_app_icon(window: &Window) {
     let _ = ICON_PNG;
 }
 
-/// Position of the image in the window: corner and integer scale.
-#[derive(Clone, Copy, Default)]
+/// Area of an image in the window: top-left corner and size of one C64
+/// pixel, in physical pixels.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub sx: f64,
+    pub sy: f64,
+}
+
+impl Rect {
+    /// Window point in pixels of the image (outside it too).
+    fn to_image(&self, x: f64, y: f64) -> (i32, i32) {
+        (((x - self.x) / self.sx).floor() as i32, ((y - self.y) / self.sy).floor() as i32)
+    }
+}
+
+/// Position of the C64 screen and of the status bar in the window.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub struct Placement {
-    pub x0: usize,
-    pub y0: usize,
-    pub scale: usize,
+    pub screen: Rect,
+    pub bar: Option<Rect>,
 }
 
 impl Placement {
     /// Window point (physical pixels) in C64 pixels, from the top-left
-    /// corner of the image; None outside the image.
-    pub fn to_image(&self, x: f64, y: f64) -> Option<(usize, usize)> {
-        if self.scale == 0 || x < self.x0 as f64 || y < self.y0 as f64 {
-            return None;
-        }
-        Some(((x as usize - self.x0) / self.scale, (y as usize - self.y0) / self.scale))
-    }
-
-    /// Like `to_image`, but also outside the image (negative or beyond the
-    /// edges); None only before the first drawing.
+    /// corner of the screen, also outside it (negative or beyond the
+    /// edges); points on the status bar come after the screen lines
+    /// (y >= HEIGHT). None only before the first drawing.
     pub fn to_image_signed(&self, x: f64, y: f64) -> Option<(i32, i32)> {
-        if self.scale == 0 {
+        if self.screen.sx == 0.0 {
             return None;
         }
-        let s = self.scale as f64;
-        Some((((x - self.x0 as f64) / s).floor() as i32, ((y - self.y0 as f64) / s).floor() as i32))
+        if let Some(bar) = &self.bar {
+            let (bx, by) = bar.to_image(x, y);
+            if by >= 0 {
+                return Some((bx, HEIGHT as i32 + by));
+            }
+        }
+        Some(self.screen.to_image(x, y))
     }
 }
 
-/// Copies the `layers` images (WIDTH wide, one below the other: the VIC
-/// screen and the status bar) into `buf` (dw×dh) with integer
-/// nearest-neighbour scaling, centered, on a black background.
-pub fn blit_scaled(buf: &mut [u32], dw: usize, dh: usize, layers: &[&[u32]]) -> Placement {
-    let height: usize = layers.iter().map(|l| l.len() / WIDTH).sum();
+/// Where the screen and the bar go in a `dw`×`dh` window: the same integer
+/// scale for both, centered, one above the other. With the CRT emulation
+/// the screen pixels have the PAL aspect (narrower than tall); without the
+/// bar (fullscreen) the CRT screen then fills the window at any scale.
+pub fn layout(dw: usize, dh: usize, bar: bool, crt: bool) -> Placement {
+    let bar_h = if bar { super::status::BAR_HEIGHT } else { 0 };
+    let height = HEIGHT + bar_h;
+    let aspect = crate::crt::PIXEL_ASPECT;
+    if crt && !bar {
+        let sy = (dh as f64 / HEIGHT as f64).min(dw as f64 / (WIDTH as f64 * aspect));
+        let (w, h) = (WIDTH as f64 * aspect * sy, HEIGHT as f64 * sy);
+        let (x, y) = (((dw as f64 - w) / 2.0).floor(), ((dh as f64 - h) / 2.0).floor());
+        return Placement { screen: Rect { x, y, sx: sy * aspect, sy }, bar: None };
+    }
     let scale = (dw / WIDTH).min(dh / height).max(1);
-    let (sw, sh) = (WIDTH * scale, height * scale);
-    let x0 = dw.saturating_sub(sw) / 2;
-    let y0 = dh.saturating_sub(sh) / 2;
+    let x0 = dw.saturating_sub(WIDTH * scale) / 2;
+    let y0 = dh.saturating_sub(height * scale) / 2;
+    let s = scale as f64;
+    let screen = if crt {
+        let w = WIDTH as f64 * s * aspect;
+        Rect { x: (x0 as f64 + (WIDTH as f64 * s - w) / 2.0).floor(), y: y0 as f64, sx: s * aspect, sy: s }
+    } else {
+        Rect { x: x0 as f64, y: y0 as f64, sx: s, sy: s }
+    };
+    let bar = bar.then_some(Rect { x: x0 as f64, y: (y0 + HEIGHT * scale) as f64, sx: s, sy: s });
+    Placement { screen, bar }
+}
+
+/// Draws `screen` and, below it, `bar` (both WIDTH wide) into `buf`
+/// (dw×dh) with integer nearest-neighbour scaling, centered, on a black
+/// background: the drawing of the window without the GPU.
+pub fn blit_scaled(buf: &mut [u32], dw: usize, dh: usize, screen: &[u32], bar: Option<&[u32]>) -> Placement {
+    let placement = layout(dw, dh, bar.is_some(), false);
+    let scale = placement.screen.sx as usize;
+    let (x0, y0) = (placement.screen.x as usize, placement.screen.y as usize);
+    let sw = WIDTH * scale;
     buf.fill(0);
-    let rows = layers.iter().flat_map(|l| l.chunks_exact(WIDTH));
+    let rows = screen.chunks_exact(WIDTH).chain(bar.unwrap_or(&[]).chunks_exact(WIDTH));
     for (sy, src) in rows.enumerate() {
         for y in sy * scale..(sy + 1) * scale {
             if y0 + y >= dh {
-                return Placement { x0, y0, scale };
+                return placement;
             }
             let dst = &mut buf[(y0 + y) * dw + x0..(y0 + y) * dw + x0 + sw.min(dw - x0)];
             for (x, px) in dst.iter_mut().enumerate() {
@@ -147,7 +191,65 @@ pub fn blit_scaled(buf: &mut [u32], dw: usize, dh: usize, layers: &[&[u32]]) -> 
             }
         }
     }
-    Placement { x0, y0, scale }
+    placement
+}
+
+/// What the window shows of the C64 screen with the CRT emulation.
+#[derive(Clone, Copy, Debug)]
+pub struct CrtView {
+    pub crt: crate::crt::Crt,
+    /// Frame blending (`C64::set_blend`), done by the GPU: the screen
+    /// passed to `Display::draw` is then the last frame as the VIC drew it.
+    pub blend: bool,
+}
+
+/// Drawing surface of a window: the GPU (wgpu, needed for the CRT
+/// emulation) or, when there is none or without the `gpu` feature, the
+/// CPU (softbuffer).
+pub struct Display {
+    kind: DisplayKind,
+    /// CRT emulation asked for without the GPU: said once.
+    warned: bool,
+}
+
+enum DisplayKind {
+    #[cfg(feature = "gpu")]
+    Gpu(super::gpu::WindowRenderer),
+    Soft(softbuffer::Surface<Arc<Window>, Arc<Window>>),
+}
+
+impl Display {
+    pub fn new(window: Arc<Window>) -> Display {
+        #[cfg(feature = "gpu")]
+        match super::gpu::WindowRenderer::new(window.clone()) {
+            Ok(r) => return Display { kind: DisplayKind::Gpu(r), warned: false },
+            Err(e) => crate::notice!("WARN: no GPU ({e}): the window is drawn by the CPU, without the CRT emulation."),
+        }
+        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
+        let surface = softbuffer::Surface::new(&context, window).expect("softbuffer surface");
+        Display { kind: DisplayKind::Soft(surface), warned: false }
+    }
+
+    /// Draws the C64 screen and the bar (if any) in the window, of size
+    /// `size` (physical pixels); None if the window cannot be drawn now.
+    pub fn draw(&mut self, size: (u32, u32), screen: &[u32], bar: Option<&[u32]>, crt: Option<CrtView>) -> Option<Placement> {
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.0), NonZeroU32::new(size.1)) else { return None };
+        match &mut self.kind {
+            #[cfg(feature = "gpu")]
+            DisplayKind::Gpu(r) => r.draw(size, screen, bar, crt),
+            DisplayKind::Soft(surface) => {
+                if crt.is_some() && !self.warned {
+                    self.warned = true;
+                    crate::notice!("WARN: the CRT emulation needs the GPU.");
+                }
+                surface.resize(w, h).ok()?;
+                let mut buf = surface.buffer_mut().ok()?;
+                let placement = blit_scaled(&mut buf, size.0 as usize, size.1 as usize, screen, bar);
+                buf.present().ok()?;
+                Some(placement)
+            }
+        }
+    }
 }
 
 /// Devices in the control ports that the window drives with the host mouse.
@@ -272,12 +374,13 @@ impl MouseCapture {
     }
 
     /// Raw movement (`DeviceEvent::MouseMotion`, in logical points) with the
-    /// image drawn at `scale` physical pixels per C64 pixel.
-    pub fn motion(&mut self, dx: f64, dy: f64, window: &Window, scale: usize) {
-        if self.captured {
-            let k = window.scale_factor() / scale.max(1) as f64;
-            self.dx += dx * k;
-            self.dy += dy * k;
+    /// screen drawn as in `placement`.
+    pub fn motion(&mut self, dx: f64, dy: f64, window: &Window, placement: &Placement) {
+        let Rect { sx, sy, .. } = placement.screen;
+        if self.captured && sx > 0.0 {
+            let k = window.scale_factor();
+            self.dx += dx * k / sx;
+            self.dy += dy * k / sy;
         }
     }
 

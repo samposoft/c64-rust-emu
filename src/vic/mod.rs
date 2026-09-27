@@ -35,7 +35,7 @@ pub const DISPLAY_X: usize = 41;
 
 /// First PAL raster line mapped into the framebuffer: line 51 (start of the
 /// 25-row display) lands at fb_y = DISPLAY_Y.
-const FIRST_FB_LINE: u16 = 51 - DISPLAY_Y as u16; // 9
+pub const FIRST_FB_LINE: u16 = 51 - DISPLAY_Y as u16; // 9
 const LAST_FB_LINE: u16 = FIRST_FB_LINE + HEIGHT as u16 - 1; // 292
 
 pub const C64_PALETTE: [u32; 16] = [

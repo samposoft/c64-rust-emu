@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 SampoSoft - Francesco Sampoli
 
-//! Graphical frontend: window and input with winit, software rendering with
-//! softbuffer, audio with cpal, gamepad with gilrs (feature `gamepad`).
-//! No non-Rust libraries. Under the C64 screen is the status bar
+//! Graphical frontend: window and input with winit, drawing with wgpu
+//! (feature `gpu`, needed for the CRT emulation `--crt`) or softbuffer,
+//! audio with cpal, gamepad with gilrs (feature `gamepad`). No non-Rust
+//! libraries. Under the C64 screen is the status bar
 //! (`frontend::status`), hidden in fullscreen; the Datasette buttons and
 //! the counter can be clicked with the mouse. Paddles in a control port
 //! follow the pointer over the C64 screen; with a 1351 mouse a click on the
 //! screen captures the host mouse, the middle button or the Cmd
 //! (Windows/Super) key releases it (`frontend::window::MouseCapture`).
 
-use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
@@ -23,14 +23,14 @@ use c64::frontend::session::{save_on_exit, Hotkey, MachineOptions, Session};
 use c64::frontend;
 use c64::frontend::status::{self, Bar};
 use c64::ctrlport::Button;
-use c64::frontend::window::{MouseCapture, Placement, Pointer};
+use c64::frontend::window::{Display, MouseCapture, Placement, Pointer};
 
 // ── Application ──────────────────────────────────────────────────────────────
 
 struct App {
     session: Session,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    display: Option<Display>,
     /// Current window title (file in use, load turbo).
     title: String,
     bar: Bar,
@@ -119,23 +119,20 @@ impl App {
     }
 
     fn draw(&mut self) {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else { return };
+        let (Some(window), Some(display)) = (&self.window, &mut self.display) else { return };
         let size = window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
-        if surface.resize(w, h).is_err() { return; }
-        let Ok(mut buf) = surface.buffer_mut() else { return };
-
-        let (dw, dh) = (size.width as usize, size.height as usize);
-        let screen = self.session.screen();
-        self.placement = if window.fullscreen().is_some() {
-            frontend::window::blit_scaled(&mut buf, dw, dh, &[screen])
+        let (screen, crt) = self.session.display();
+        let bar = if window.fullscreen().is_some() {
+            None
         } else {
             let mut status = self.session.status(HELP);
             status.mouse_captured = self.capture.captured();
             self.bar.render(&status);
-            frontend::window::blit_scaled(&mut buf, dw, dh, &[screen, self.bar.pixels()])
+            Some(self.bar.pixels())
         };
-        let _ = buf.present();
+        if let Some(p) = display.draw((size.width, size.height), screen, bar, crt) {
+            self.placement = p;
+        }
     }
 
     /// Mouse button: to the paddles or the mouse while captured, otherwise
@@ -195,12 +192,10 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() { return; }
         let attrs = frontend::window::window_attributes(&self.title);
-        let window = Rc::new(event_loop.create_window(attrs).expect("window"));
+        let window = Arc::new(event_loop.create_window(attrs).expect("window"));
         frontend::window::set_app_icon(&window);
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+        self.display = Some(Display::new(window.clone()));
         self.window = Some(window);
-        self.surface = Some(surface);
         self.session.restart_clock();
     }
 
@@ -221,7 +216,7 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let (DeviceEvent::MouseMotion { delta }, Some(w)) = (event, &self.window) {
-            self.capture.motion(delta.0, delta.1, w, self.placement.scale);
+            self.capture.motion(delta.0, delta.1, w, &self.placement);
         }
     }
 
@@ -263,7 +258,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("event loop");
     let bar = Bar::new(&session.c64.bus.char_rom);
     let mut app = App {
-        title: session.title(), session, window: None, surface: None, bar,
+        title: session.title(), session, window: None, display: None, bar,
         cursor: (0.0, 0.0), placement: Placement::default(), capture: MouseCapture::default(),
     };
     event_loop.run_app(&mut app).expect("event loop");

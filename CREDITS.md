@@ -61,6 +61,35 @@ VICE 3.10 (ReSID engine with the `filter8580new` filter):
 - `src/sid/samples/*.dat`: the combined-waveform tables of reSID, unchanged;
 - the op-amp transfer tables and filter constants in `src/sid/filter.rs`.
 
+## Sources of the CRT emulation
+
+The monitor emulation (`src/crt.rs`, `src/frontend/crt.wgsl`) was written
+for this emulator; no code was copied. Its figures come from:
+
+- Philip "Pepto" Timmermann, "colodore" (2017),
+  <https://www.pepto.de/projects/colorvic/>: luma levels, chroma angles and
+  the YUV to RGB conversion of the VIC-II colors (the palette of the
+  emulator comes from it too);
+- the chroma phase of odd and even lines measured by Tobias on the 6569R5,
+  as listed in VICE's `src/vicii/vicii-color.c`;
+- the luma step response measured by Jam on Toads,
+  <https://jamontoads.net/p/lumachroma.html>;
+- the Commodore 1084S-P1, 1084S-D1 and 1901 service manuals (picture tube,
+  slot pitch, picture size, video bandwidth, PAL decoder and delay line; for
+  the 1901 also the luma peaking network, the chroma band-pass and the white
+  point, from its schematics);
+- the Philips CP90 chassis service manual (TV 15CE1510) and the Philips data
+  handbook T08 (1986) for its picture tube; the EPCOS K2966M datasheet for
+  the response of a PAL B/G IF filter; the TDA3562A datasheet's application
+  circuit for the chroma band-pass of a TV decoder;
+- the C64 Service Manual, for the luma network of the RF modulator
+  (schematics 251025 and 251696).
+
+The ways of drawing the beam (energy-conserving gaussian integrated over
+the pixel, wider when brighter) and the slot mask follow ideas described
+for the libretro shaders crt-royale and crt-guest-advanced, and by John
+Novak's articles on period-correct emulation.
+
 ## Not included
 
 The ROMs of the C64 and of the 1541 (KERNAL, BASIC, character generator, DOS)

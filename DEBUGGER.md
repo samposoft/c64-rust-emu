@@ -21,7 +21,8 @@ several files the first is loaded, `swap` moves to the next ones), `--version`, 
 digiboost), `--sid2 ADDR` (second SID, e.g. `d420` or `de00`), `--tape-sound` (tape sound),
 `--tape-azimuth CYCLES` (Datasette azimuth error), `--port1 DEV`/`--port2 DEV`
 (control port devices: `joystick`, `paddles`, `mouse`, `joymouse`), `--blend`
-(frame blending, see `blend`), `--remote`
+(frame blending, see `blend`), `--crt MONITOR`, `--composite` and `--rf`
+(monitor and TV emulation in the window, see `crt`), `--remote`
 and `--remote-socket PATH` (commands also from the [remote monitor](#remote-monitor)).
 ROMs are looked up in `roms/` next to the executable or in a directory above
 it (from `target/release`, the project's), then in `./roms`.
@@ -63,7 +64,8 @@ decimal.
 | `sid 6581\|8580\|8580d` | changes the SID model (`8580d`: with digiboost) |
 | `sid2 [addr\|off]` | second SID: state; with an address (`$D420`-`$D7E0`, `$DE00`-`$DFE0`, in steps of `$20`) it attaches it, as just powered on; `off` removes it |
 | `blend [on\|off]` | frame blending: the framebuffer (window and screenshots) becomes the average, in linear light, of the last two frames, as the eye sees a 50 Hz CRT; for pictures that alternate two frames (interlace, IFLI). Off by default, `--blend` turns it on |
-| `screenshot file.png [bar]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316). With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
+| `crt [off\|1084s-p1\|1084s-d1\|1901\|tv] [lc\|composite\|rf]` | CRT emulation of the window (`--window`, or the `c64` window through the remote monitor), on the GPU: `1084s-p1` (or `1084s`) is the Commodore 1084S-P1, `1084s-d1` the 1084S-D1, `1901` the 1901, `tv` (or `cp90`) the Philips CP90 TV; `lc` the luma/chroma input (the monitors' default), `composite` the composite one, `rf` the TV's antenna input (its default). An input turns the emulation on if it is off, a set keeps the input if it has it. Without arguments it shows the setting. See "Monitor and TV" in README.md |
+| `screenshot file.png [bar \| crt [height]]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316); with `crt` the screen through the monitor emulation (the one set with `crt`, otherwise the 1084S-P1 with luma/chroma), `height` pixels high (284-2272, default 1136) with the PAL pixel aspect; it needs a GPU. With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
 | `info` | frames, instructions, cycles, PRG waiting to be injected (`prg_pending`), keys still to type (`typing`), state of file/break/watch/trace |
 
 | Input | |

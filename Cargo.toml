@@ -10,6 +10,9 @@ cpal = "0.18"
 winit = "0.30"
 softbuffer = "0.4"
 gilrs = { version = "0.11", optional = true }
+# CRT monitor emulation on the GPU (feature `gpu`)
+wgpu = { version = "30", optional = true }
+pollster = { version = "0.4", optional = true }
 
 # Terminal frontend (c64term): termios, poll, POSIX shared memory
 [target.'cfg(unix)'.dependencies]
@@ -23,10 +26,13 @@ objc2-foundation = { version = "0.2", features = ["NSData"] }
 objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSImage", "NSResponder"] }
 
 [features]
-default = ["gamepad"]
+default = ["gamepad", "gpu"]
 # Gamepad via gilrs. On Linux it needs libudev-dev at build time:
 # `cargo build --no-default-features` to do without it.
 gamepad = ["dep:gilrs"]
+# Window drawn with wgpu (Metal, Vulkan, DirectX 12, OpenGL), needed for the CRT
+# monitor emulation; without it the window is drawn by the CPU (softbuffer).
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
 # The Klaus Dormann 6502 functional test is loaded as a raw binary in the tests

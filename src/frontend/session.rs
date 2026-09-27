@@ -46,12 +46,14 @@ pub struct MachineOptions {
     pub remote: Option<PathBuf>,
     /// Frame blending (`--blend`, `C64::set_blend`).
     pub blend: bool,
+    /// CRT monitor emulation in the window (`--crt`, `--composite`).
+    pub crt: Option<crate::crt::Crt>,
 }
 
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
+        "[--version] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt MONITOR] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
@@ -69,6 +71,13 @@ impl MachineOptions {
                joymouse (1351 in joystick mode, as the 1350), in the window only
   --blend      show every frame mixed with the previous one, as the eye sees a 50 Hz
                CRT: for pictures that alternate two frames (interlace, IFLI)
+  --crt MONITOR  show the screen as a real monitor does, on the GPU: the PAL signal of
+               the VIC-II and the picture tube of MONITOR, with the luma/chroma input:
+               1084s-p1 (or 1084s: Commodore 1084S-P1, Philips), 1084s-d1 (Daewoo),
+               1901 (Thomson), or the TV cp90 (or tv: Philips 15CE1510) through the RF
+               modulator; off by default, window only
+  --composite  connect the monitor through composite video (implies --crt 1084s)
+  --rf         connect a TV to the RF output, channel 36 (implies --crt tv)
   --remote     remote monitor: debugger commands from other programs (c64mcp, the
                MCP server for Claude) on a Unix socket, macOS and Linux only
   --remote-socket PATH  remote monitor on the socket PATH instead of the default one
@@ -104,6 +113,18 @@ impl MachineOptions {
             }
             "--tape-sound" => self.tape_sound = true,
             "--blend" => self.blend = true,
+            "--crt" | "--composite" | "--rf" => {
+                let value = match arg {
+                    "--composite" => Some("composite".to_string()),
+                    "--rf" => Some("rf".to_string()),
+                    _ => rest.next(),
+                };
+                match value.map(|v| crate::crt::Crt::apply(self.crt, &v.to_ascii_lowercase())) {
+                    Some(Ok(crt)) => self.crt = crt,
+                    Some(Err(e)) => { eprintln!("--crt: {e}"); std::process::exit(2); }
+                    None => { eprintln!("--crt needs the monitor: {} (or off)", crate::crt::Model::NAMES); std::process::exit(2); }
+                }
+            }
             "--remote" => self.remote = Some(super::remote::default_path()),
             "--remote-socket" => match rest.next() {
                 Some(path) => self.remote = Some(PathBuf::from(path)),
@@ -148,6 +169,10 @@ impl MachineOptions {
         }
         c64.set_sid2(self.sid2)?;
         c64.set_blend(self.blend);
+        if let Some(crt) = self.crt {
+            crt.check()?;
+        }
+        c64.set_crt(self.crt);
         if self.tape_sound {
             c64.bus.tape.set_sound(Some(crate::tape::SOUND_VOLUME_DEFAULT));
         }
@@ -338,6 +363,18 @@ impl Session {
     /// (up to the beam, as in `c64dbg`).
     pub fn screen(&self) -> &[u32] {
         if self.paused() { self.c64.live_framebuffer() } else { &self.c64.framebuffer }
+    }
+
+    /// Screen for the window and its CRT emulation, if on: then the frame
+    /// as the VIC drew it (the GPU does the blending).
+    pub fn display(&self) -> (&[u32], Option<super::window::CrtView>) {
+        match self.c64.crt() {
+            None => (self.screen(), None),
+            Some(crt) => {
+                let fb = if self.paused() { self.c64.live_framebuffer() } else { self.c64.last_frame() };
+                (fb, Some(super::window::CrtView { crt, blend: self.c64.blend() }))
+            }
+        }
     }
 
     /// Window title: application name, name of the medium in use (the file

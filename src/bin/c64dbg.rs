@@ -30,14 +30,12 @@ use c64::debugger::{Debugger, FrameHook};
 use c64::frontend::session::{save_on_exit, MachineOptions};
 use c64::frontend::status::{self, Bar, Click, SpeedMeter, Status};
 use c64::ctrlport::{Button, Device};
-use c64::frontend::window::{Analog, MouseCapture, Placement, Pointer};
+use c64::frontend::window::{Analog, CrtView, Display, MouseCapture, Placement, Pointer};
 use c64::frontend::remote::{self, Event, Listener};
 use c64::frontend::{self, AudioOut, Gamepad, JoyPort};
 use c64::keyboard::HostKey;
 use c64::vic::{HEIGHT, WIDTH};
 use std::io::{BufRead, IsTerminal, Write};
-use std::num::NonZeroU32;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -90,6 +88,7 @@ fn main() {
     let shared = Arc::new(Shared {
         fb: Mutex::new(vec![0; WIDTH * HEIGHT]),
         status: Mutex::new(None),
+        crt: Mutex::new(None),
         font: Mutex::new(Vec::new()),
         pause: AtomicBool::new(false),
         quit: AtomicBool::new(false),
@@ -110,7 +109,7 @@ fn main() {
     });
 
     let mut app = DbgWindow {
-        window: None, surface: None, shared: shared.clone(), input: input_tx,
+        window: None, display: None, shared: shared.clone(), input: input_tx,
         bar: None, cursor: (0.0, 0.0), placement: Placement::default(), capture: MouseCapture::default(),
     };
     event_loop.run_app(&mut app).expect("event loop");
@@ -308,6 +307,8 @@ struct Shared {
     fb: Mutex<Vec<u32>>,
     /// State for the bar, published with the frame.
     status: Mutex<Option<Status>>,
+    /// CRT emulation of the frame, if on.
+    crt: Mutex<Option<CrtView>>,
     /// Character ROM, for the bar's text.
     font: Mutex<Vec<u8>>,
     /// Pause requested by the window (F12), consumed by the debugger.
@@ -416,8 +417,16 @@ impl WindowLink {
     /// Publishes the frame (the one being built if `paused`) and the bar's
     /// state.
     fn publish(&mut self, c64: &C64, paused: bool) {
-        let fb = if paused { c64.live_framebuffer() } else { &c64.framebuffer[..] };
+        // With the CRT emulation the frame as the VIC drew it: the GPU
+        // does the blending
+        let crt = c64.crt().map(|crt| CrtView { crt, blend: c64.blend() });
+        let fb = match (paused, crt) {
+            (true, _) => c64.live_framebuffer(),
+            (false, Some(_)) => c64.last_frame(),
+            (false, None) => &c64.framebuffer[..],
+        };
         self.shared.fb.lock().unwrap().copy_from_slice(fb);
+        *self.shared.crt.lock().unwrap() = crt;
         let mut s = Status::of(c64);
         s.keyboard_port = self.joy_port;
         s.gamepad = self.gamepad.connected();
@@ -487,8 +496,8 @@ impl FrameHook for WindowLink {
 
 /// Window side: draws the latest frame and forwards input.
 struct DbgWindow {
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    display: Option<Display>,
     shared: Arc<Shared>,
     input: Sender<Input>,
     /// Status bar, created when the character ROM arrives.
@@ -501,30 +510,28 @@ struct DbgWindow {
 
 impl DbgWindow {
     fn draw(&mut self) {
-        let (Some(window), Some(surface)) = (&self.window, &mut self.surface) else { return };
+        let (Some(window), Some(display)) = (&self.window, &mut self.display) else { return };
         let size = window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else { return };
-        if surface.resize(w, h).is_err() { return; }
-        let Ok(mut buf) = surface.buffer_mut() else { return };
         if self.bar.is_none() {
             let font = self.shared.font.lock().unwrap();
             if !font.is_empty() {
                 self.bar = Some(Bar::new(&font));
             }
         }
-        let (dw, dh) = (size.width as usize, size.height as usize);
         let fb = self.shared.fb.lock().unwrap();
         let status = self.shared.status.lock().unwrap().clone();
-        self.placement = match (&mut self.bar, status) {
+        let crt = *self.shared.crt.lock().unwrap();
+        let bar = match (&mut self.bar, status) {
             (Some(bar), Some(mut s)) if window.fullscreen().is_none() => {
                 s.mouse_captured = self.capture.captured();
                 bar.render(&s);
-                frontend::window::blit_scaled(&mut buf, dw, dh, &[&fb, bar.pixels()])
+                Some(bar.pixels())
             }
-            _ => frontend::window::blit_scaled(&mut buf, dw, dh, &[&fb]),
+            _ => None,
         };
-        drop(fb);
-        let _ = buf.present();
+        if let Some(p) = display.draw((size.width, size.height), &fb, bar, crt) {
+            self.placement = p;
+        }
     }
 
     /// Paddles and mouse in the control ports, from the last published state.
@@ -633,12 +640,10 @@ impl DbgWindow {
 impl ApplicationHandler<UiEvent> for DbgWindow {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() { return; }
-        let window = Rc::new(event_loop.create_window(frontend::window::window_attributes("c64dbg")).expect("window"));
+        let window = Arc::new(event_loop.create_window(frontend::window::window_attributes("c64dbg")).expect("window"));
         frontend::window::set_app_icon(&window);
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+        self.display = Some(Display::new(window.clone()));
         self.window = Some(window);
-        self.surface = Some(surface);
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 
@@ -670,7 +675,7 @@ impl ApplicationHandler<UiEvent> for DbgWindow {
 
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         let (DeviceEvent::MouseMotion { delta }, Some(w)) = (event, &self.window) else { return };
-        self.capture.motion(delta.0, delta.1, w, self.placement.scale);
+        self.capture.motion(delta.0, delta.1, w, &self.placement);
         let (dx, dy) = self.capture.take();
         if (dx, dy) != (0, 0) {
             let _ = self.input.send(Input::MouseMove(dx, dy));

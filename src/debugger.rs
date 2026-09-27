@@ -796,7 +796,8 @@ impl Debugger {
   drive insert file  insert a D64/G64 without autoloading it
   drive trace on file | off   trace of the drive's instructions (PC, registers, cycle)
   blend [on|off]     frame blending: each frame mixed with the previous one, as on a 50 Hz CRT (interlace pictures)
-  screenshot file [bar]  save the framebuffer as PNG (bar: with the window's status bar; file - = the PNG on the output)
+  crt [off | 1084s-p1 | 1084s-d1 | 1901 | tv] [lc | composite | rf]  CRT monitor emulation in the window (GPU): Commodore 1084S-P1 (1084s), 1084S-D1, 1901, or the Philips CP90 TV (tv); luma/chroma, composite or RF input
+  screenshot file [bar | crt [height]]  save the framebuffer as PNG (bar: with the window's status bar; crt: through the CRT emulation, default 1136 pixels high; file - = the PNG on the output)
   trace on [file] [from to] | trace off
   keys text          type text on the keyboard (\\n = RETURN, {name} = a key named as for key: {f1} {clr} {left}...)
   key name down|up|press   (return space runstop f1..f8 home clr del inst left right up down lshift rshift ctrl commodore restore, or a character)
@@ -1242,8 +1243,24 @@ impl Debugger {
                 writeln!(out, "frame blending {}", if c64.blend() { "on" } else { "off" }).map_err(io)?;
             }
 
+            "crt" => {
+                let mut crt = c64.crt();
+                for a in args {
+                    crt = crate::crt::Crt::apply(crt, a)?;
+                }
+                if let Some(c) = crt {
+                    c.check()?;
+                }
+                c64.set_crt(crt);
+                match crt {
+                    Some(c) => writeln!(out, "CRT emulation: {}", c.describe()).map_err(io)?,
+                    None => writeln!(out, "CRT emulation off").map_err(io)?,
+                }
+            }
+
             "screenshot" => {
-                let path = args.first().ok_or("usage: screenshot file.png [bar]")?;
+                const USAGE: &str = "usage: screenshot file.png [bar | crt [height]]";
+                let path = args.first().ok_or(USAGE)?;
                 match args.get(1).copied() {
                     // The PNG itself on the output: for the remote monitor
                     None if *path == "-" => out.write_all(&crate::png::encode_argb(&c64.framebuffer, WIDTH, HEIGHT)).map_err(io)?,
@@ -1265,7 +1282,22 @@ impl Debugger {
                         crate::png::write_argb(path, &img, WIDTH, h).map_err(io)?;
                         writeln!(out, "screenshot saved: {path} ({WIDTH}x{h}, with the status bar)").map_err(io)?;
                     }
-                    Some(_) => return Err("usage: screenshot file.png [bar]".into()),
+                    Some("crt") => {
+                        // Through the CRT emulation, as the window shows it
+                        let height = match args.get(2) {
+                            Some(h) => h.parse().ok().filter(|h| (HEIGHT..=8 * HEIGHT).contains(h))
+                                .ok_or(format!("the height goes from {HEIGHT} to {}", 8 * HEIGHT))?,
+                            None => 4 * HEIGHT,
+                        };
+                        let (img, w, h) = crt_screenshot(c64, height)?;
+                        if *path == "-" {
+                            out.write_all(&crate::png::encode_argb(&img, w, h)).map_err(io)?;
+                        } else {
+                            crate::png::write_argb(path, &img, w, h).map_err(io)?;
+                            writeln!(out, "screenshot saved: {path} ({w}x{h}, through the CRT emulation)").map_err(io)?;
+                        }
+                    }
+                    Some(_) => return Err(USAGE.into()),
                 }
             }
             "trace" => {
@@ -1462,4 +1494,17 @@ fn parse_port(s: &str) -> Result<usize, String> {
         "2" => Ok(2),
         _ => Err(format!("control port 1 or 2, not {s}")),
     }
+}
+
+/// The last frame through the CRT emulation (the current settings, or the
+/// default monitor when it is off), `height` pixels high.
+#[cfg(feature = "gpu")]
+fn crt_screenshot(c64: &C64, height: usize) -> Result<(Vec<u32>, usize, usize), String> {
+    let crt = c64.crt().unwrap_or(crate::crt::Crt::new(crate::crt::Model::C1084SP1));
+    crate::frontend::gpu::crt_image(c64.last_frame(), crt, height)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn crt_screenshot(_: &C64, _: usize) -> Result<(Vec<u32>, usize, usize), String> {
+    Err("the CRT emulation needs the gpu feature".into())
 }

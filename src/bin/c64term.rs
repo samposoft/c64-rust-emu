@@ -105,6 +105,9 @@ mod app {
                 other => opts.parse_arg(other, &mut args),
             }
         }
+        if opts.crt.take().is_some() {
+            eprintln!("WARN: the CRT emulation (--crt, --composite) is only in the window (c64, c64dbg --window).");
+        }
 
         let session = match Session::new(&opts, turbo) {
             Ok(s) => s,

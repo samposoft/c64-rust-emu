@@ -45,6 +45,8 @@ pub struct C64 {
     work_fb: Vec<u32>,
     /// Frame blending (`set_blend`): the previous frame as the VIC drew it.
     blend: Option<Vec<u32>>,
+    /// CRT monitor emulation of the window frontends (`set_crt`).
+    crt: Option<crate::crt::Crt>,
 
     // Direct PRG (no disk)
     pending_prg: Option<Vec<u8>>,
@@ -98,6 +100,7 @@ impl C64 {
             framebuffer: vec![0xFF000000; WIDTH * HEIGHT],
             work_fb: vec![0xFF000000; WIDTH * HEIGHT],
             blend: None,
+            crt: None,
             pending_prg: None,
             prg_kind: PrgKind::Basic,
             injected: false,
@@ -130,6 +133,23 @@ impl C64 {
 
     pub fn blend(&self) -> bool {
         self.blend.is_some()
+    }
+
+    /// The last complete frame as the VIC drew it, also with frame
+    /// blending on (for the CRT emulation, which blends on its own).
+    pub fn last_frame(&self) -> &[u32] {
+        self.blend.as_deref().unwrap_or(&self.framebuffer)
+    }
+
+    /// CRT monitor emulation (`crate::crt`): a setting of the window
+    /// frontends, which draw the screen through it on the GPU. Off by
+    /// default.
+    pub fn set_crt(&mut self, crt: Option<crate::crt::Crt>) {
+        self.crt = crt;
+    }
+
+    pub fn crt(&self) -> Option<crate::crt::Crt> {
+        self.crt
     }
 
     /// Framebuffer being built: the current frame up to the VIC beam, over
@@ -1175,11 +1195,11 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
     }
 }
 
-// Excluded: the audio buffer (rewritten every frame), the debugger hooks
-// and frame blending (a display setting).
+// Excluded: the audio buffer (rewritten every frame), the debugger hooks,
+// frame blending and the CRT emulation (display settings).
 impl_state!(C64 {
     cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
     disk, disk_path, disk_autoload, tape_path, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
     autoload_run,
     frame_elapsed, frame_count,
-} skip { audio_buf, audio_buf2, dbg, blend });
+} skip { audio_buf, audio_buf2, dbg, blend, crt });

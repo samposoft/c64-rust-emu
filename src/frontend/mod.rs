@@ -7,6 +7,8 @@
 //! configuration and frame loop in [`session`], the remote monitor in [`remote`].
 
 pub mod remote;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod session;
 pub mod status;
 #[cfg(unix)]
@@ -213,14 +215,23 @@ impl JoyPort {
 }
 
 /// Applies a (non-printable) host key to the C64: joystick on the active port
-/// and keyboard matrix.
+/// and keyboard matrix. While a joystick port is active the arrows drive
+/// only the joystick, as VICE does with the keys of a joystick keyset: as
+/// cursor keys too they would close keys in column PA0 of the matrix, the
+/// line that joystick 2 up pulls low, and the program would see ghost keys
+/// (Giana Sisters pauses: RUN/STOP). With no port they are the cursor keys.
+/// Releases always reach the keyboard, for a key held while TAB changed
+/// the port.
 pub fn apply_host_key(c64: &mut C64, port: JoyPort, hk: HostKey, pressed: bool) {
     match port {
         JoyPort::Two  => joy_key(&mut c64.bus.joy2, hk, pressed),
         JoyPort::One  => joy_key(&mut c64.bus.joy1, hk, pressed),
         JoyPort::None => {}
     }
-    c64.bus.keyboard.update(hk, pressed);
+    let arrow = matches!(hk, HostKey::Up | HostKey::Down | HostKey::Left | HostKey::Right);
+    if !(arrow && pressed && port != JoyPort::None) {
+        c64.bus.keyboard.update(hk, pressed);
+    }
 }
 
 /// Changes the active joystick port, releasing both.
@@ -314,4 +325,31 @@ impl Gamepad {
     pub fn new() -> Self { Gamepad }
     pub fn poll(&mut self, _joy: &mut u8) {}
     pub fn connected(&self) -> bool { false }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arrows_are_joystick_or_cursor_keys() {
+        let mut c64 = C64::new();
+        // Joystick port 2 active: up moves the joystick, no key closes
+        apply_host_key(&mut c64, JoyPort::Two, HostKey::Up, true);
+        assert_eq!(c64.bus.joy2 & JOY_UP, 0);
+        assert!(!c64.bus.keyboard.any_pressed());
+        apply_host_key(&mut c64, JoyPort::Two, HostKey::Up, false);
+        assert_eq!(c64.bus.joy2, 0xFF);
+        // Space is fire and the space key
+        apply_host_key(&mut c64, JoyPort::Two, HostKey::Space, true);
+        assert_eq!(c64.bus.joy2 & JOY_FIRE, 0);
+        assert!(c64.bus.keyboard.any_pressed());
+        apply_host_key(&mut c64, JoyPort::Two, HostKey::Space, false);
+        // No port: the arrows are the cursor keys
+        apply_host_key(&mut c64, JoyPort::None, HostKey::Down, true);
+        assert!(c64.bus.keyboard.any_pressed());
+        // Released after TAB changed the port: the key does not stay down
+        apply_host_key(&mut c64, JoyPort::Two, HostKey::Down, false);
+        assert!(!c64.bus.keyboard.any_pressed());
+    }
 }
