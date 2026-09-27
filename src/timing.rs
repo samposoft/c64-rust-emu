@@ -1,84 +1,82 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 SampoSoft - Francesco Sampoli
 
-//! Video standard of the machine: PAL (VIC-II 6569, the default) or NTSC
-//! (6567R8), and the timings that follow from it, as in VICE's
-//! `machine_change_timing` (c64.c) and `c64.h`:
+//! Video standard of the machine, set by its VIC-II (`vic::Chip`), and the
+//! timings that follow from it, as in VICE's `machine_change_timing` (c64.c)
+//! and `c64.h`:
 //!
-//! | | PAL | NTSC |
-//! |---|---|---|
-//! | Clock | 985,248 Hz (17.734475 MHz / 18) | 1,022,730 Hz (14.31818 MHz / 14) |
-//! | Cycles per line | 63 | 65 |
-//! | Raster lines | 312 | 263 |
-//! | Frames per second | 50.12 | 59.83 |
-//! | Mains (CIA TOD input) | 50 Hz | 60 Hz |
+//! | | PAL | NTSC | Old NTSC | PAL-N |
+//! |---|---|---|---|---|
+//! | VIC-II | 6569, 8565 | 6567R8, 8562 | 6567R56A | 6572 (Drean) |
+//! | Crystal | 17.734475 MHz | 14.31818 MHz | 14.31818 MHz | 14.328225 MHz |
+//! | Clock | 985,248 Hz (/18) | 1,022,730 Hz (/14) | 1,022,730 Hz | 1,023,440 Hz (/14) |
+//! | Cycles per line | 63 | 65 | 64 | 65 |
+//! | Raster lines | 312 | 263 | 262 | 312 |
+//! | Frames per second | 50.12 | 59.83 | 60.99 | 50.47 |
+//! | Mains (CIA TOD input) | 50 Hz | 60 Hz | 60 Hz | 50 Hz |
 //!
-//! ROMs, SID, CIAs and the 1541 are the same: the KERNAL tells the two
-//! apart at boot (PAL/NTSC flag at $02A6) from the number of raster lines.
+//! ROMs, SID, CIAs and the 1541 are the same: the KERNAL tells PAL from
+//! NTSC at boot (flag at $02A6) from the number of raster lines, so the
+//! PAL-N machine counts as PAL and the old NTSC one as NTSC.
 
 use crate::vic::WIDTH;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Standard {
-    /// PAL C64: VIC-II 6569.
+    /// PAL C64: VIC-II 6569 or 8565.
     #[default]
     Pal,
-    /// NTSC C64: VIC-II 6567R8.
+    /// NTSC C64: VIC-II 6567R8 or 8562.
     Ntsc,
+    /// The first NTSC C64s (1982-83): VIC-II 6567R56A.
+    NtscOld,
+    /// PAL-N C64 (Drean, Argentina): VIC-II 6572.
+    PalN,
 }
 
 impl Standard {
-    pub fn parse(s: &str) -> Option<Standard> {
-        match s.to_ascii_lowercase().as_str() {
-            "pal" => Some(Standard::Pal),
-            "ntsc" => Some(Standard::Ntsc),
-            _ => None,
-        }
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Standard::Pal => "PAL",
             Standard::Ntsc => "NTSC",
+            Standard::NtscOld => "old NTSC",
+            Standard::PalN => "PAL-N",
         }
     }
 
-    /// Name of the VIC-II.
-    pub fn vic_name(self) -> &'static str {
-        match self {
-            Standard::Pal => "6569",
-            Standard::Ntsc => "6567R8",
-        }
+    /// NTSC color (the NTSC and old NTSC machines).
+    pub fn ntsc(self) -> bool {
+        matches!(self, Standard::Ntsc | Standard::NtscOld)
     }
 
     /// CPU clock, Hz.
     pub fn clock_hz(self) -> u64 {
         match self {
             Standard::Pal => 985_248,
-            Standard::Ntsc => 1_022_730,
+            Standard::Ntsc | Standard::NtscOld => 1_022_730,
+            Standard::PalN => 1_023_440,
         }
     }
 
     pub fn cycles_per_line(self) -> u16 {
         match self {
             Standard::Pal => 63,
-            Standard::Ntsc => 65,
+            Standard::Ntsc | Standard::PalN => 65,
+            Standard::NtscOld => 64,
         }
     }
 
     pub fn raster_lines(self) -> u16 {
         match self {
-            Standard::Pal => 312,
+            Standard::Pal | Standard::PalN => 312,
             Standard::Ntsc => 263,
+            Standard::NtscOld => 262,
         }
     }
 
     /// Mains frequency, Hz: the 50/60 Hz input of the CIAs' TOD clocks.
     pub fn mains_hz(self) -> u32 {
-        match self {
-            Standard::Pal => 50,
-            Standard::Ntsc => 60,
-        }
+        if self.ntsc() { 60 } else { 50 }
     }
 
     /// Cycles of a VIC frame.
@@ -97,23 +95,18 @@ impl Standard {
         std::time::Duration::from_nanos(1_000_000_000 * self.slice_cycles() as u64 / self.clock_hz())
     }
 
-    /// First raster line of the framebuffer. PAL: line 9 to 292, the lines
-    /// a monitor shows. NTSC: line 22 to 262 and then lines 0-11 of the
-    /// next frame, which the monitor shows below them (the vertical retrace
-    /// is in lines 12-21), as VICE's "full" border mode.
+    /// First raster line of the framebuffer. PAL and PAL-N: line 9 to 292,
+    /// the lines a monitor shows. NTSC: line 22 to the last and then the
+    /// first lines of the next frame (0-11, old NTSC 0-12), which the
+    /// monitor shows below them (the vertical retrace comes after), as
+    /// VICE's "full" border mode.
     pub fn first_fb_line(self) -> u16 {
-        match self {
-            Standard::Pal => 9,
-            Standard::Ntsc => 22,
-        }
+        if self.ntsc() { 22 } else { 9 }
     }
 
     /// Lines of the framebuffer (WIDTH pixels each).
     pub fn fb_height(self) -> usize {
-        match self {
-            Standard::Pal => 284,
-            Standard::Ntsc => 253,
-        }
+        if self.ntsc() { 253 } else { 284 }
     }
 
     /// Size of the framebuffer, pixels.
@@ -129,8 +122,8 @@ impl Standard {
     }
 
     /// Raster line at whose end the picture in the framebuffer is complete
-    /// (the VIC's frame_done): the last line of the frame (PAL), or line 11
-    /// of the next one, the last shown (NTSC).
+    /// (the VIC's frame_done): the last line of the frame (PAL), or the
+    /// last one shown of the next frame (NTSC: 11, old NTSC: 12).
     pub fn frame_end_line(self) -> u16 {
         let last = self.first_fb_line() as usize + self.fb_height() - 1;
         let lines = self.raster_lines() as usize;
@@ -152,6 +145,10 @@ mod tests {
         let fps = |s: Standard| s.clock_hz() as f64 / s.frame_cycles() as f64;
         assert!((fps(Standard::Pal) - 50.125).abs() < 0.001);
         assert!((fps(Standard::Ntsc) - 59.826).abs() < 0.001);
+        assert_eq!(Standard::NtscOld.frame_cycles(), 16768);
+        assert_eq!(Standard::PalN.frame_cycles(), 20280);
+        assert!((fps(Standard::NtscOld) - 60.993).abs() < 0.001);
+        assert!((fps(Standard::PalN) - 50.466).abs() < 0.001);
     }
 
     #[test]
@@ -174,7 +171,15 @@ mod tests {
         // The 25-row display starts at raster line 51 in both
         assert_eq!(pal.fb_row(51), Some(42));
         assert_eq!(ntsc.fb_row(51), Some(29));
+        // Old NTSC: 262 lines, one more of the next frame shown
+        let old = Standard::NtscOld;
+        assert_eq!(old.fb_row(261), Some(239));
+        assert_eq!(old.fb_row(0), Some(240));
+        assert_eq!(old.fb_row(12), Some(252));
+        assert_eq!(old.fb_row(13), None);
+        assert_eq!(old.frame_end_line(), 12);
+        assert_eq!(Standard::PalN.frame_end_line(), 311);
     }
 }
 
-crate::snapshot::impl_state_enum!(Standard { Pal, Ntsc });
+crate::snapshot::impl_state_enum!(Standard { Pal, Ntsc, NtscOld, PalN });

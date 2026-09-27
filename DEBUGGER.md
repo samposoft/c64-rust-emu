@@ -14,7 +14,7 @@ printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 ```
 
 Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.d64/.g64...]` (with
-several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--roms DIR`, `-x script`, `-e "cmd; cmd"`
+several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--vic CHIP` (the VIC-II and its standard: 6569, 6569r1, 8565, 6567, 6567r56a, 8562, 6572; see README.md), `--roms DIR`, `-x script`, `-e "cmd; cmd"`
 (repeatable), `--no-stdin`, `--window`, `--audio`, `--reu KB` (REU from 128 to
 16384 KB), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
 `--sid 6581|8580|8580d` (SID model, default 6581; `8580d` is the 8580 with
@@ -45,7 +45,7 @@ decimal.
 |---|---|
 | `break addr`, `delete addr\|all`, `breaks` | breakpoint on PC |
 | `watch a [b]`, `watchr`, `watchw`, `unwatch a\|all`, `watches` | watchpoint on CPU read/write in [a,b]; stops after the accessing instruction, reporting address, value and PC |
-| `rbreak line\|off` | stop at cycle 0 of the raster line (every frame; 0-311 PAL, 0-262 NTSC) |
+| `rbreak line\|off` | stop at cycle 0 of the raster line (every frame; 0-311 PAL and PAL-N, 0-262 NTSC, 0-261 old NTSC) |
 | `irqbreak on\|off`, `nmibreak on\|off` | stop on the first instruction of every ISR |
 | `kilbreak on\|off` | stop on a KIL/JAM opcode (default on) |
 
@@ -60,13 +60,14 @@ decimal.
 | `stack` | stack bytes and plausible return addresses (preceded by a JSR) |
 | `screen` | screen RAM as 40×25 text (uses the current VIC bank and `$D018`) |
 | `bank` | memory configuration `$01`, cartridge (type, mode, banks, registers), VIC bank, screen/charset/bitmap |
-| `vic`, `sprites`, `cia1`, `cia2`, `sid` | decoded registers; `sid` also model, OSC3, ENV3, value on the data bus and audio |
+| `vic`, `sprites`, `cia1`, `cia2`, `sid` | decoded registers; `vic` also the chip and its raster, `sid` also model, OSC3, ENV3, value on the data bus and audio |
 | `sid 6581\|8580\|8580d` | changes the SID model (`8580d`: with digiboost) |
 | `sid2 [addr\|off]` | second SID: state; with an address (`$D420`-`$D7E0`, `$DE00`-`$DFE0`, in steps of `$20`) it attaches it, as just powered on; `off` removes it |
 | `blend [on\|off]` | frame blending: the framebuffer (window and screenshots) becomes the average, in linear light, of the last two frames, as the eye sees a 50 Hz CRT; for pictures that alternate two frames (interlace, IFLI). Off by default, `--blend` turns it on |
-| `crt [off\|1084s-p1\|1084s-d1\|1901\|tv\|1702] [lc\|composite\|rf]` | CRT emulation of the window (`--window`, or the `c64` window through the remote monitor), on the GPU: `1084s-p1` (or `1084s`) is the Commodore 1084S-P1, `1084s-d1` the 1084S-D1, `1901` the 1901, `tv` (or `cp90`) the Philips CP90 TV, all PAL; `1702` the NTSC Commodore 1702 (with `--ntsc`); `lc` the luma/chroma input (the monitors' default), `composite` the composite one, `rf` the TV's antenna input (its default). An input turns the emulation on if it is off, a set keeps the input if it has it. Without arguments it shows the setting. See "Monitor and TV" in README.md |
-| `screenshot file.png [bar \| crt [height]]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316); with `crt` the screen through the monitor emulation (the one set with `crt`, otherwise the 1084S-P1 with luma/chroma, or the 1702 on NTSC), `height` pixels high (284-2272, default 1136) with the PAL pixel aspect; it needs a GPU. With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
-| `info` | frames, instructions, cycles, PRG waiting to be injected (`prg_pending`), keys still to type (`typing`), state of file/break/watch/trace, video standard (`video=PAL` or `NTSC`) |
+| `hdr [on\|off]` | HDR output of the CRT emulation in the window: on a display with headroom above white (Apple EDR; the headroom is asked of the system about once a second) the slot mask is shown at its full depth, its stripes brighter than white, instead of half depth; the picture up to white is the same. Off by default, `--hdr` turns it on; where the display has no HDR it stays SDR |
+| `crt [off\|SET\|lc\|composite\|rf\|KNOB=N\|comb=on\|off\|bars=on\|off]...` | CRT emulation of the window (`--window`, or the `c64` window through the remote monitor), on the GPU. Sets: for PAL `1084s` (or `1084s-p1`: the Commodore 1084S-P1), `1084s-d1`, `1901`, `cp90` (the Philips CP90 TV); for NTSC `1702`, `1084s` (on an NTSC machine: the NTSC 1084S-P, or `1084s-p`), `kv1311` (the Sony KV-1311CR TV); for PAL-N `cnt4442` (the Sontec CNT-4442 B TV); `tv` the TV of the machine's standard; `1900` (the green monochrome 1900 M) for all. Inputs: `lc` the luma/chroma input (the monitors' default), `composite`, `rf` the TVs' antenna input (their default). Knobs, -100 to 100 with 0 at the centre, only those the set has: `brightness`, `contrast`, `color`, `tint` (NTSC sets), `sharpness` (NTSC 1084S). Switches: `comb=off` (the NTSC 1084S's comb defeat), `bars=off` (no VIC-II jail bars). Several arguments, also comma-separated, apply in order: `crt 1702 composite tint=-20`. An input turns the emulation on if it is off, a set keeps the input and the knobs it has. Without arguments it shows the setting. See "Monitor and TV" in README.md |
+| `screenshot file.png [bar \| crt [height]]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316); with `crt` the screen through the monitor emulation (the one set with `crt`, otherwise the set of the machine's standard: the 1084S-P1 with luma/chroma, the 1702 on NTSC, the Sontec TV on PAL-N), `height` pixels high (284-2272, default 1136) with the pixel aspect of the standard, only the part on the set's screen (a TV overscans); it needs a GPU. With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
+| `info` | frames, instructions, cycles, PRG waiting to be injected (`prg_pending`), keys still to type (`typing`), state of file/break/watch/trace, video standard (`video=PAL`, `NTSC`, `old-NTSC` or `PAL-N`) and VIC-II (`vic=6569`...) |
 
 | Input | |
 |---|---|

@@ -123,6 +123,10 @@ pub struct Placement {
     pub bar: Option<Rect>,
     /// Lines of the screen: 284 PAL, 253 NTSC (`timing::Standard`).
     pub rows: usize,
+    /// With the CRT emulation, the screen of the set (x0, y0, x1, y1): the
+    /// part of the C64 screen that shows, less than all of it on a TV that
+    /// overscans.
+    pub tube: Option<[f64; 4]>,
 }
 
 impl Placement {
@@ -144,34 +148,55 @@ impl Placement {
     }
 }
 
+/// How the CRT emulation shows the screen: the aspect of its pixels
+/// (narrower than tall: 0.936 PAL, 0.75 NTSC) and the part of it on the
+/// set's screen (fractions of width and height, centred: 1 on a monitor).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CrtShape {
+    pub aspect: f64,
+    pub visible: (f64, f64),
+}
+
 /// Where the screen (`rows` lines) and the bar go in a `dw`×`dh` window: the
 /// same integer scale for both, centered, one above the other. With the CRT
-/// emulation the screen pixels have the `crt_aspect` of the standard
-/// (narrower than tall: 0.936 PAL, 0.75 NTSC); without the bar (fullscreen)
-/// the CRT screen then fills the window at any scale.
-pub fn layout(dw: usize, dh: usize, rows: usize, bar: bool, crt_aspect: Option<f64>) -> Placement {
+/// emulation (`crt`) the screen pixels have its aspect and only its visible
+/// part is placed (the rest falls outside `tube`); without the bar
+/// (fullscreen) the CRT screen then fills the window at any scale.
+pub fn layout(dw: usize, dh: usize, rows: usize, bar: bool, crt: Option<CrtShape>) -> Placement {
     let bar_h = if bar { super::status::BAR_HEIGHT } else { 0 };
-    let height = rows + bar_h;
-    let crt = crt_aspect.is_some();
-    let aspect = crt_aspect.unwrap_or(1.0);
-    if crt && !bar {
-        let sy = (dh as f64 / rows as f64).min(dw as f64 / (WIDTH as f64 * aspect));
-        let (w, h) = (WIDTH as f64 * aspect * sy, rows as f64 * sy);
-        let (x, y) = (((dw as f64 - w) / 2.0).floor(), ((dh as f64 - h) / 2.0).floor());
-        return Placement { screen: Rect { x, y, sx: sy * aspect, sy }, bar: None, rows };
-    }
-    let scale = (dw / WIDTH).min(dh / height).max(1);
-    let x0 = dw.saturating_sub(WIDTH * scale) / 2;
-    let y0 = dh.saturating_sub(height * scale) / 2;
-    let s = scale as f64;
-    let screen = if crt {
-        let w = WIDTH as f64 * s * aspect;
-        Rect { x: (x0 as f64 + (WIDTH as f64 * s - w) / 2.0).floor(), y: y0 as f64, sx: s * aspect, sy: s }
-    } else {
-        Rect { x: x0 as f64, y: y0 as f64, sx: s, sy: s }
+    let Some(shape) = crt else {
+        let scale = (dw / WIDTH).min(dh / (rows + bar_h)).max(1);
+        let x0 = dw.saturating_sub(WIDTH * scale) / 2;
+        let y0 = dh.saturating_sub((rows + bar_h) * scale) / 2;
+        let s = scale as f64;
+        let screen = Rect { x: x0 as f64, y: y0 as f64, sx: s, sy: s };
+        let bar = bar.then_some(Rect { x: x0 as f64, y: (y0 + rows * scale) as f64, sx: s, sy: s });
+        return Placement { screen, bar, rows, tube: None };
     };
-    let bar = bar.then_some(Rect { x: x0 as f64, y: (y0 + rows * scale) as f64, sx: s, sy: s });
-    Placement { screen, bar, rows }
+    // Size of the visible part in C64 pixels
+    let (vw, vh) = (WIDTH as f64 * shape.visible.0, rows as f64 * shape.visible.1);
+    let aspect = shape.aspect;
+    let (x, y, sy, bar_rect) = if bar {
+        let scale = ((dw as f64 / WIDTH as f64).min(dh as f64 / (vh + bar_h as f64)).floor()).max(1.0);
+        let (bx, h) = (((dw as f64 - WIDTH as f64 * scale) / 2.0).max(0.0).floor(), vh * scale + bar_h as f64 * scale);
+        let y = ((dh as f64 - h) / 2.0).max(0.0).floor();
+        let x = ((dw as f64 - vw * aspect * scale) / 2.0).floor();
+        (x, y, scale, Some(Rect { x: bx, y: y + (vh * scale).round(), sx: scale, sy: scale }))
+    } else {
+        let sy = (dh as f64 / vh).min(dw as f64 / (vw * aspect));
+        let (w, h) = (vw * aspect * sy, vh * sy);
+        (((dw as f64 - w) / 2.0).floor(), ((dh as f64 - h) / 2.0).floor(), sy, None)
+    };
+    let sx = sy * aspect;
+    let tube = [x, y, x + vw * sx, y + vh * sy];
+    // The whole screen, centred on the visible part
+    let screen = Rect {
+        x: x - WIDTH as f64 * (1.0 - shape.visible.0) / 2.0 * sx,
+        y: y - rows as f64 * (1.0 - shape.visible.1) / 2.0 * sy,
+        sx,
+        sy,
+    };
+    Placement { screen, bar: bar_rect, rows, tube: Some(tube) }
 }
 
 /// Draws `screen` and, below it, `bar` (both WIDTH wide, any height) into `buf`
@@ -202,12 +227,16 @@ pub fn blit_scaled(buf: &mut [u32], dw: usize, dh: usize, screen: &[u32], bar: O
 #[derive(Clone, Copy, Debug)]
 pub struct CrtView {
     pub crt: crate::crt::Crt,
+    /// The machine's VIC-II: its standard, its colors and lumas.
+    pub chip: crate::vic::Chip,
     /// Frame blending (`C64::set_blend`), done by the GPU: the screen
     /// passed to `Display::draw` is then the last frame as the VIC drew it.
     pub blend: bool,
     /// Number of the frame (`C64::frame_count`): its parity sets the phase
     /// of the NTSC subcarrier, which alternates from frame to frame.
     pub frame: u64,
+    /// HDR output (`C64::set_hdr`), where the display has it.
+    pub hdr: bool,
 }
 
 /// Drawing surface of a window: the GPU (wgpu, needed for the CRT

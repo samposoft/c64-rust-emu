@@ -98,9 +98,16 @@ impl Status {
         if c64.bus.sid2.is_some() {
             config += "x2";
         }
-        if c64.standard() == crate::timing::Standard::Ntsc {
-            config += " NTSC";
-        }
+        use crate::vic::Chip;
+        config += match c64.chip() {
+            Chip::Mos6569 => "",
+            Chip::Mos6569R1 => " 6569R1",
+            Chip::Mos8565 => " 8565",
+            Chip::Mos6567R8 => " NTSC",
+            Chip::Mos8562 => " NTSC 8562",
+            Chip::Mos6567R56A => " NTSC R56A",
+            Chip::Mos6572 => " PAL-N",
+        };
         if let Some(reu) = &c64.bus.reu {
             config += &format!(" REU{}", if reu.kb() >= 1024 { format!("{}M", reu.kb() / 1024) } else { reu.kb().to_string() });
         }

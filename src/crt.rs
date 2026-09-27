@@ -35,49 +35,116 @@
 use std::f64::consts::PI;
 
 use crate::timing::Standard;
-use crate::vic::{C64_PALETTE, WIDTH};
+use crate::vic::{Chip, WIDTH};
+
+/// Color system of a signal, and of the decoder of a color set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Color {
+    /// PAL B/G: 4.43 MHz subcarrier, 625 lines.
+    Pal,
+    /// NTSC M: 3.58 MHz subcarrier, 525 lines.
+    Ntsc,
+    /// PAL N (Argentina): PAL with a 3.58 MHz subcarrier, 625 lines.
+    PalN,
+}
+
+impl Color {
+    pub fn of(standard: Standard) -> Color {
+        match standard {
+            Standard::Pal => Color::Pal,
+            Standard::Ntsc | Standard::NtscOld => Color::Ntsc,
+            Standard::PalN => Color::PalN,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Color::Pal => "PAL",
+            Color::Ntsc => "NTSC",
+            Color::PalN => "PAL-N",
+        }
+    }
+
+    /// The usual machine standard that sends it.
+    pub fn standard(self) -> Standard {
+        match self {
+            Color::Pal => Standard::Pal,
+            Color::Ntsc => Standard::Ntsc,
+            Color::PalN => Standard::PalN,
+        }
+    }
+
+    /// 625-line system (PAL, PAL-N), else 525 (NTSC).
+    fn lines_625(self) -> bool {
+        self != Color::Ntsc
+    }
+}
 
 /// The video signal of a C64: its color subcarrier and the sampling, at 4
 /// samples per subcarrier cycle, that is at the frequency of the C64's
 /// crystal, from which the pixel clock is divided.
 ///
-/// | | PAL | NTSC |
-/// |---|---|---|
-/// | Subcarrier | 4.43361875 MHz | 3.579545 MHz |
-/// | Crystal (4 × subcarrier) | 17.734475 MHz | 14.318182 MHz |
-/// | Pixel clock | crystal × 4/9 | crystal × 4/7 |
-/// | Samples every 4 pixels | 9 | 7 |
-/// | Subcarrier cycles per line | 283.5 (504 pixels) | 227.5 (520 pixels) |
+/// | | PAL | NTSC | Old NTSC | PAL-N |
+/// |---|---|---|---|---|
+/// | Subcarrier | 4.43361875 MHz | 3.579545 MHz | 3.579545 MHz | 3.58205625 MHz |
+/// | Pixel clock | crystal × 4/9 | crystal × 4/7 | crystal × 4/7 | crystal × 4/7 |
+/// | Samples every 4 pixels | 9 | 7 | 7 | 7 |
+/// | Pixels per line | 504 | 520 | 512 | 520 |
+/// | Subcarrier cycles per line | 283.5 | 227.5 | 224 | 227.5 |
 ///
-/// In both the phase of the subcarrier flips from line to line; a PAL frame
-/// (312 lines) is a whole number of cycles, so the color artifacts stand
+/// With half a cycle more than a whole number per line the phase of the
+/// subcarrier flips from line to line, and the color artifacts of fine
+/// detail alternate and partly cancel; the 6567R56A has a whole number, so
+/// they line up in vertical stripes. A PAL or PAL-N frame (312 lines) and
+/// an old NTSC one are a whole number of cycles, so the artifacts stand
 /// still, while an NTSC frame (263 lines) ends half a cycle off, so they
 /// alternate from frame to frame (the dot crawl of NTSC).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Signal {
+    /// The VIC-II that makes it (its lumas: `Chip::luma`).
+    pub chip: Chip,
     pub standard: Standard,
     /// Color subcarrier, Hz.
     pub fsc: f64,
     /// Sampling rate, Hz: 4 × fsc.
     pub sample_rate: f64,
-    /// Samples every 4 pixels: 9 PAL, 7 NTSC.
+    /// Samples every 4 pixels: 9 PAL, 7 the others.
     pub phases: usize,
     /// Samples per framebuffer line.
     pub samples: usize,
 }
 
 impl Signal {
-    pub fn of(standard: Standard) -> Signal {
+    pub fn of(chip: Chip) -> Signal {
+        let standard = chip.standard();
         let (fsc, phases) = match standard {
             Standard::Pal => (4_433_618.75, 9),
-            Standard::Ntsc => (315e6 / 88.0, 7),
+            Standard::Ntsc | Standard::NtscOld => (315e6 / 88.0, 7),
+            // 4 × fsc is the Drean's 14.328225 MHz crystal
+            Standard::PalN => (3_582_056.25, 7),
         };
-        Signal { standard, fsc, sample_rate: 4.0 * fsc, phases, samples: (WIDTH * phases + 3) / 4 }
+        Signal { chip, standard, fsc, sample_rate: 4.0 * fsc, phases, samples: (WIDTH * phases + 3) / 4 }
     }
 
-    /// PAL: V switched on alternate lines and averaged by the delay line.
+    pub fn color(&self) -> Color {
+        Color::of(self.standard)
+    }
+
+    /// PAL and PAL-N: V switched on alternate lines and averaged by the
+    /// delay line.
     pub fn pal(&self) -> bool {
-        self.standard == Standard::Pal
+        self.color() != Color::Ntsc
+    }
+
+    /// Samples in a raster line.
+    pub fn line_samples(&self) -> usize {
+        8 * self.standard.cycles_per_line() as usize * self.phases / 4
+    }
+
+    /// The subcarrier phase flips from a raster line to the next (half a
+    /// cycle over a whole number per line).
+    pub fn line_flip(&self) -> bool {
+        self.line_samples() % 4 == 2
     }
 
     /// Pixel clock, Hz.
@@ -86,31 +153,24 @@ impl Signal {
     }
 
     /// Width over height of a C64 pixel on the screen: the square-pixel
-    /// rate of the standard (PAL 7.375 MHz, NTSC 6.136 MHz, for 320-pixel
-    /// lines) over the pixel clock: 0.936 PAL, 0.75 NTSC.
+    /// rate of the line system (625 lines 7.375 MHz, 525 lines 6.136 MHz,
+    /// for 320-pixel lines) over the pixel clock: 0.936 PAL, 0.75 NTSC, 0.90
+    /// PAL-N.
     pub fn pixel_aspect(&self) -> f64 {
-        let square = match self.standard {
-            Standard::Pal => 7_375_000.0,
-            Standard::Ntsc => 135e6 / 22.0,
-        };
+        let square = if self.color().lines_625() { 7_375_000.0 } else { 135e6 / 22.0 };
         square / self.dot_clock()
     }
 
-    /// Active part of a line, seconds: 52 µs PAL, 52.66 µs NTSC.
+    /// Active part of a line, seconds: 52 µs in 625-line sets, 52.66 µs in
+    /// 525-line ones.
     pub fn active_line(&self) -> f64 {
-        match self.standard {
-            Standard::Pal => 52e-6,
-            Standard::Ntsc => 52.66e-6,
-        }
+        if self.color().lines_625() { 52e-6 } else { 52.66e-6 }
     }
 
-    /// Lines of a field that fill the picture height: 288 PAL (576 active
-    /// lines), 242.5 NTSC (485).
+    /// Lines of a field that fill the picture height: 288 in 625-line sets
+    /// (576 active lines), 242.5 in 525-line ones (485).
     pub fn picture_lines(&self) -> f64 {
-        match self.standard {
-            Standard::Pal => 288.0,
-            Standard::Ntsc => 242.5,
-        }
+        if self.color().lines_625() { 288.0 } else { 242.5 }
     }
 }
 
@@ -120,13 +180,11 @@ const VIC_LUMA_OVERSHOOT: f64 = 0.12;
 /// Luma rise time of the VIC-II, 10-90%, in pixels (same measurement:
 /// "almost 2 pixels" to white; 10-90% about 1.5).
 const VIC_LUMA_RISE_PX: f64 = 1.5;
-/// Chroma phase difference between odd and even raster lines, degrees
-/// (mean of Tobias' measurements on the 6569R5: 11-16°).
+/// Chroma phase difference between odd and even raster lines of the PAL
+/// chips, degrees (mean of Tobias' measurements on the 6569R5: 11-16°; on
+/// the 8565R2 most colors measure 12-19°, but yellow and brown the other
+/// way, so the same mean is kept; the 6572 is assumed to be as the 6569).
 const ODD_LINE_PHASE: f64 = 13.0;
-
-/// Luma levels (0-32) of the 16 colors in the colodore model, later
-/// VIC-II revisions (6569R3 on, 8565).
-const LUMA: [u8; 16] = [0, 32, 10, 20, 12, 16, 8, 24, 12, 8, 16, 10, 15, 24, 15, 20];
 /// Hue of the colors: angle 11.25° + a × 22.5°; None without chroma.
 const HUE: [Option<u8>; 16] = [
     None, None, Some(4), Some(12), Some(2), Some(10), Some(15), Some(7),
@@ -159,7 +217,7 @@ impl Input {
         match self {
             Input::LumaChroma => "luma/chroma",
             Input::Composite => "composite",
-            Input::Rf => "RF (UHF channel 36)",
+            Input::Rf => "RF",
         }
     }
 
@@ -173,7 +231,7 @@ impl Input {
     }
 }
 
-/// Emulated monitors.
+/// Emulated monitors and TVs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Model {
     /// Commodore 1084S-P1 (Philips chassis, PAL, 1990).
@@ -182,23 +240,50 @@ pub enum Model {
     C1084SD1,
     /// Commodore 1901 (Thomson chassis, PAL, 1986).
     C1901,
-    /// Philips 15CE1510 color TV (CP90 chassis, 1988).
+    /// Philips 15CE1510 color TV (CP90 chassis, PAL, 1988).
     PhilipsCp90,
     /// Commodore 1702 (JVC chassis, NTSC, 1984).
     C1702,
+    /// Commodore 1084S-P for NTSC countries (Philips/Magnavox, 1988).
+    C1084SPNtsc,
+    /// Sony Trinitron KV-1311CR color TV (NTSC, about 1985).
+    SonyKv1311,
+    /// Sontec CNT-4442 B color TV (Argentina, PAL-N).
+    SontecCnt4442,
+    /// Commodore 1900 M green monochrome monitor (Philips BM7502).
+    C1900,
 }
 
 impl Model {
     /// Names accepted by `parse`, for help and error messages.
-    pub const NAMES: &'static str = "1084s-p1 (or 1084s), 1084s-d1, 1901, cp90 (or tv) for PAL; 1702 for NTSC";
+    pub const NAMES: &'static str = "1084s (the 1084S-P1 on PAL, the NTSC 1084S-P on NTSC), 1084s-p1, 1084s-d1, 1901, \
+        cp90 for PAL; 1702, 1084s-p, kv1311 for NTSC; cnt4442 for PAL-N; tv (the TV of the standard); 1900 (monochrome)";
 
-    pub fn parse(s: &str) -> Option<Model> {
+    pub const ALL: [Model; 9] = [
+        Model::C1084SP1, Model::C1084SD1, Model::C1901, Model::PhilipsCp90, Model::C1702,
+        Model::C1084SPNtsc, Model::SonyKv1311, Model::SontecCnt4442, Model::C1900,
+    ];
+
+    /// The model named `s`; `1084s` and `tv` are the ones of the machine's
+    /// `standard`.
+    pub fn parse(s: &str, standard: Standard) -> Option<Model> {
+        let color = Color::of(standard);
         match s.to_ascii_lowercase().as_str() {
-            "1084s" | "1084s-p1" | "1084sp1" | "1084" => Some(Model::C1084SP1),
+            "1084s" | "1084" if color == Color::Ntsc => Some(Model::C1084SPNtsc),
+            "1084s" | "1084" | "1084s-p1" | "1084sp1" => Some(Model::C1084SP1),
+            "1084s-p" | "1084sp" => Some(Model::C1084SPNtsc),
             "1084s-d1" | "1084sd1" => Some(Model::C1084SD1),
             "1901" => Some(Model::C1901),
-            "cp90" | "tv" | "15ce1510" => Some(Model::PhilipsCp90),
+            "tv" => Some(match color {
+                Color::Pal => Model::PhilipsCp90,
+                Color::Ntsc => Model::SonyKv1311,
+                Color::PalN => Model::SontecCnt4442,
+            }),
+            "cp90" | "15ce1510" => Some(Model::PhilipsCp90),
             "1702" => Some(Model::C1702),
+            "kv1311" | "kv-1311cr" | "kv1311cr" | "sony" => Some(Model::SonyKv1311),
+            "cnt4442" | "cnt-4442" | "sontec" => Some(Model::SontecCnt4442),
+            "1900" | "1900m" | "dm602" => Some(Model::C1900),
             _ => None,
         }
     }
@@ -211,6 +296,10 @@ impl Model {
             Model::C1901 => "1901",
             Model::PhilipsCp90 => "CP90",
             Model::C1702 => "1702",
+            Model::C1084SPNtsc => "1084S-P",
+            Model::SonyKv1311 => "KV1311",
+            Model::SontecCnt4442 => "CNT4442",
+            Model::C1900 => "1900",
         }
     }
 
@@ -222,6 +311,10 @@ impl Model {
             Model::C1901 => "Commodore 1901",
             Model::PhilipsCp90 => "Philips 15CE1510 TV (CP90 chassis)",
             Model::C1702 => "Commodore 1702",
+            Model::C1084SPNtsc => "Commodore 1084S-P (NTSC)",
+            Model::SonyKv1311 => "Sony Trinitron KV-1311CR TV",
+            Model::SontecCnt4442 => "Sontec CNT-4442 B TV",
+            Model::C1900 => "Commodore 1900 M",
         }
     }
 
@@ -232,45 +325,210 @@ impl Model {
             Model::C1901 => &C1901,
             Model::PhilipsCp90 => &PHILIPS_CP90,
             Model::C1702 => &C1702,
+            Model::C1084SPNtsc => &C1084S_P_NTSC,
+            Model::SonyKv1311 => &SONY_KV1311CR,
+            Model::SontecCnt4442 => &SONTEC_CNT4442,
+            Model::C1900 => &C1900,
         }
     }
 }
 
-/// CRT emulation settings: monitor and connection.
+/// A front-panel control of a set. The manuals say only which way each one
+/// turns and that the normal setting is the centre click-stop position
+/// (knob 0, where the model gives the colodore colors): the ranges are
+/// estimates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Knob {
+    /// Black level: at ±100 the drive of the guns moves by ±BRIGHTNESS_RANGE
+    /// of white (before the tube gamma).
+    Brightness,
+    /// Gain of the video amplifier (luma and chroma): ×2^(knob/100), half to
+    /// twice.
+    Contrast,
+    /// Chroma gain ("colour", "intensity"): ×(1 + knob/100), from none to
+    /// twice.
+    Color,
+    /// NTSC hue ("tint"): the demodulation axes turn by ±TINT_RANGE, to
+    /// the left towards red (purple), to the right towards green.
+    Tint,
+    /// Luma peaking of the sets that have the control (`Monitor::peak`):
+    /// its gain ×(1 + knob/100), from none to twice.
+    Sharpness,
+}
+
+/// Brightness range, share of the white drive.
+pub const BRIGHTNESS_RANGE: f64 = 0.25;
+/// Tint range, degrees.
+pub const TINT_RANGE: f64 = 45.0;
+
+impl Knob {
+    pub const ALL: [Knob; 5] = [Knob::Brightness, Knob::Contrast, Knob::Color, Knob::Tint, Knob::Sharpness];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Knob::Brightness => "brightness",
+            Knob::Contrast => "contrast",
+            Knob::Color => "color",
+            Knob::Tint => "tint",
+            Knob::Sharpness => "sharpness",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Knob> {
+        match s {
+            "brightness" | "bright" => Some(Knob::Brightness),
+            "contrast" => Some(Knob::Contrast),
+            "color" | "colour" | "saturation" => Some(Knob::Color),
+            "tint" | "hue" => Some(Knob::Tint),
+            "sharpness" => Some(Knob::Sharpness),
+            _ => None,
+        }
+    }
+}
+
+/// CRT emulation settings: monitor, connection, front-panel controls and
+/// switches.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Crt {
     pub model: Model,
     pub input: Input,
+    /// Positions of the knobs (`Knob` order), -100 to 100, 0 at the centre.
+    pub knobs: [i8; 5],
+    /// The comb filter of the sets that have one is on (the "comb defeat"
+    /// switch of the 1084S-P turns it off).
+    pub comb: bool,
+    /// The VIC-II's jail bars (`jail_bars`) in its luma.
+    pub bars: bool,
 }
 
 impl Crt {
-    /// The model with its first input: luma/chroma for the monitors, RF
-    /// for the TV.
+    /// The model with its first input (luma/chroma for the monitors, RF
+    /// for the TVs), the knobs at the centre, comb filter and jail bars on.
     pub fn new(model: Model) -> Crt {
-        Crt { model, input: model.monitor().inputs[0] }
+        Crt { model, input: model.monitor().inputs[0], knobs: [0; 5], comb: true, bars: true }
+    }
+
+    /// Gain of the peaking of the set, with its sharpness knob.
+    pub fn peak_gain(&self) -> f64 {
+        let Some(p) = self.model.monitor().peak else { return 0.0 };
+        p.gain * (1.0 + self.knob(Knob::Sharpness) as f64 / 100.0)
+    }
+
+    /// The comb filter separates luma and chroma: the set has one, it is on,
+    /// and the input is composite or RF.
+    pub fn comb_active(&self) -> bool {
+        self.comb && self.input != Input::LumaChroma && self.model.monitor().comb.is_some()
+    }
+
+    pub fn knob(&self, k: Knob) -> i8 {
+        self.knobs[k as usize]
+    }
+
+    /// Brightness as an offset of the gun drive, 0-255 units.
+    pub fn brightness(&self) -> f64 {
+        255.0 * BRIGHTNESS_RANGE * self.knob(Knob::Brightness) as f64 / 100.0
+    }
+
+    /// Gain of the video amplifier.
+    pub fn contrast(&self) -> f64 {
+        2f64.powf(self.knob(Knob::Contrast) as f64 / 100.0)
+    }
+
+    /// Chroma gain.
+    pub fn color(&self) -> f64 {
+        1.0 + self.knob(Knob::Color) as f64 / 100.0
+    }
+
+    /// Hue rotation, radians.
+    pub fn tint(&self) -> f64 {
+        (TINT_RANGE * self.knob(Knob::Tint) as f64 / 100.0).to_radians()
+    }
+
+    /// The set shown by default for a machine of `standard`, or connected
+    /// by `input` when the emulation is turned on with it: the 1084S-P1 for
+    /// PAL, the 1702 for NTSC, the TV of the standard for RF.
+    pub fn default_for(standard: Standard, input: Option<Input>) -> Crt {
+        let model = match (Color::of(standard), input) {
+            (Color::Pal, Some(Input::Rf)) => Model::PhilipsCp90,
+            (Color::Pal, _) => Model::C1084SP1,
+            (Color::Ntsc, Some(Input::Rf)) => Model::SonyKv1311,
+            (Color::Ntsc, _) => Model::C1702,
+            (Color::PalN, _) => Model::SontecCnt4442,
+        };
+        let crt = Crt::new(model);
+        match input {
+            Some(input) if model.monitor().inputs.contains(&input) => Crt { input, ..crt },
+            _ => crt,
+        }
     }
 
     /// The settings `crt` (None: off) changed by `arg`: `off`, a model
-    /// (keeping the input if the model has it, otherwise its default one) or
-    /// an input (`lc`, `composite`, `rf`; turning the emulation on with the
-    /// monitor of the machine's `standard`: the 1084S-P1 for PAL, the 1702
-    /// for NTSC, or the TV for RF).
+    /// (keeping the input if the model has it, otherwise its default one,
+    /// and the knobs it has), an input (`lc`, `composite`, `rf`; turning the
+    /// emulation on with the set of the machine's `standard`,
+    /// `default_for`), a knob (`tint=-20`: -100 to 100, 0 the centre), a
+    /// switch (`comb=on|off`, `bars=on|off`), or several of them separated
+    /// by commas.
     pub fn apply(crt: Option<Crt>, arg: &str, standard: Standard) -> Result<Option<Crt>, String> {
+        if arg.contains(',') {
+            let mut crt = crt;
+            for a in arg.split(',').filter(|a| !a.is_empty()) {
+                crt = Crt::apply(crt, a, standard)?;
+            }
+            return Ok(crt);
+        }
         if arg == "off" {
             return Ok(None);
         }
-        if let Some(input) = Input::parse(arg) {
-            let default = match (input, standard) {
-                (Input::Rf, _) => Model::PhilipsCp90,
-                (_, Standard::Pal) => Model::C1084SP1,
-                (_, Standard::Ntsc) => Model::C1702,
-            };
-            return Ok(Some(Crt { input, ..crt.unwrap_or(Crt::new(default)) }));
+        if let Some((name, value @ ("on" | "off"))) = arg.split_once('=') {
+            let on = value == "on";
+            let mut c = crt.unwrap_or(Crt::default_for(standard, None));
+            match name {
+                "comb" if c.model.monitor().comb.is_some() => c.comb = on,
+                "comb" => return Err(format!("the {} has no comb filter", c.model.full_name())),
+                "bars" | "jailbars" => c.bars = on,
+                _ => return Err(format!("unknown switch '{name}': comb, bars")),
+            }
+            return Ok(Some(c));
         }
-        let model = Model::parse(arg)
-            .ok_or_else(|| format!("unknown monitor or input '{arg}': monitors {}; inputs lc, composite, rf", Model::NAMES))?;
-        let input = crt.map(|c| c.input).filter(|i| model.monitor().inputs.contains(i));
-        Ok(Some(Crt { model, input: input.unwrap_or(Crt::new(model).input) }))
+        if let Some((name, value)) = arg.split_once('=') {
+            let knob = Knob::parse(name).ok_or_else(|| {
+                let names: Vec<&str> = Knob::ALL.iter().map(|k| k.name()).collect();
+                format!("unknown control '{name}': {}", names.join(", "))
+            })?;
+            let value: i8 = value.parse().ok().filter(|v: &i8| (-100..=100).contains(v))
+                .ok_or_else(|| format!("{}: a position from -100 to 100 (0 the centre), not '{value}'", knob.name()))?;
+            let mut c = crt.unwrap_or(Crt::default_for(standard, None));
+            if !c.model.monitor().knobs.contains(&knob) {
+                return Err(format!("the {} has no {} control", c.model.full_name(), knob.name()));
+            }
+            c.knobs[knob as usize] = value;
+            return Ok(Some(c));
+        }
+        if let Some(input) = Input::parse(arg) {
+            return Ok(Some(match crt {
+                Some(c) => Crt { input, ..c },
+                None => Crt { input, ..Crt::default_for(standard, Some(input)) },
+            }));
+        }
+        let model = Model::parse(arg, standard)
+            .ok_or_else(|| format!("unknown monitor or input '{arg}': sets {}; inputs lc, composite, rf", Model::NAMES))?;
+        let m = model.monitor();
+        let input = crt.map(|c| c.input).filter(|i| m.inputs.contains(i));
+        let mut knobs = crt.map(|c| c.knobs).unwrap_or([0; 5]);
+        for k in Knob::ALL {
+            if !m.knobs.contains(&k) {
+                knobs[k as usize] = 0;
+            }
+        }
+        let fresh = Crt::new(model);
+        Ok(Some(Crt {
+            model,
+            input: input.unwrap_or(fresh.input),
+            knobs,
+            comb: crt.map_or(true, |c| c.comb),
+            bars: crt.map_or(true, |c| c.bars),
+        }))
     }
 
     /// Error if the model does not have the input, or does not decode the
@@ -278,11 +536,13 @@ impl Crt {
     /// black and white, and vice versa).
     pub fn check(&self, standard: Standard) -> Result<(), String> {
         let m = self.model.monitor();
-        if m.standard != standard {
-            let other = if standard == Standard::Ntsc { "1702" } else { "1084s, 1084s-d1, 1901 or tv" };
-            let a = |s: Standard| if s == Standard::Ntsc { "an NTSC" } else { "a PAL" };
-            return Err(format!("the {} is {} monitor: with {} C64 use {other}",
-                self.model.full_name(), a(m.standard), a(standard)));
+        let color = Color::of(standard);
+        if let Some(mc) = m.color.filter(|&c| c != color) {
+            let sets: Vec<&str> = Model::ALL.iter().filter(|x| x.monitor().color == Some(color)).map(|x| x.name()).collect();
+            let a = |c: Color| if c == Color::Ntsc { "an NTSC" } else { "a" };
+            let set = if m.if_filter.is_some() { "set" } else { "monitor" };
+            return Err(format!("the {} is {} {} {set}: with {} {} C64 use {}",
+                self.model.full_name(), a(mc), mc.name(), a(color), color.name(), sets.join(", ")));
         }
         let inputs = m.inputs;
         if inputs.contains(&self.input) {
@@ -293,7 +553,17 @@ impl Crt {
     }
 
     pub fn describe(&self) -> String {
-        format!("{}, {} input", self.model.full_name(), self.input.name())
+        let mut s = format!("{}, {} input", self.model.full_name(), self.input.name());
+        for k in Knob::ALL.into_iter().filter(|&k| self.knob(k) != 0) {
+            s += &format!(", {} {:+}", k.name(), self.knob(k));
+        }
+        if !self.comb && self.model.monitor().comb.is_some() {
+            s += ", comb filter off";
+        }
+        if !self.bars {
+            s += ", no jail bars";
+        }
+        s
     }
 }
 
@@ -302,17 +572,24 @@ impl Crt {
 /// Physical data of a monitor.
 #[derive(Debug)]
 pub struct Monitor {
-    /// Color standard it decodes: its C64 must be of the same standard.
-    pub standard: Standard,
-    /// Picture on the screen (the active part of the PAL signal), mm.
+    /// Color system of its decoder: its C64 must send that one. None: a
+    /// monochrome monitor, which shows every standard, without color.
+    pub color: Option<Color>,
+    /// Color of the phosphor of a monochrome tube, CIE xy.
+    pub phosphor: Option<(f64, f64)>,
+    /// Visible screen, mm.
     pub screen_width: f64,
     pub screen_height: f64,
-    /// Horizontal pitch of the phosphor triads, mm.
+    /// Share of the picture scanned beyond the edges of the screen, on
+    /// each axis: a TV hides part of the border (a monitor is set to show
+    /// all of it).
+    pub overscan: f64,
+    /// Horizontal pitch of the phosphor triads, mm; 0: no mask (monochrome).
     pub triad_pitch: f64,
     /// Width of a phosphor stripe, as a fraction of the triad.
     pub stripe: f64,
     /// Vertical period of the mask slots, mm, and height of the bridges
-    /// between them as a fraction of it.
+    /// between them as a fraction of it (0: an aperture grille).
     pub slot_pitch: f64,
     pub bridge: f64,
     /// Standard deviation of the beam, in line pitches: at black and at
@@ -322,26 +599,36 @@ pub struct Monitor {
     pub glow: (f64, f64),
     /// Inputs of the set; the first is the default.
     pub inputs: &'static [Input],
-    /// Response of the IF filter of the TV tuner (RF input): attenuation,
-    /// dB, at IF frequencies, MHz, with the vision carrier at 38.9 MHz.
-    pub if_filter: Option<&'static [(f64, f64)]>,
+    /// Front-panel controls of the picture.
+    pub knobs: &'static [Knob],
+    /// IF filter of the TV tuner (RF input).
+    pub if_filter: Option<&'static IfFilter>,
     /// Bandwidth (-3 dB) of the luma amplifier, Hz, with separate luma and
     /// with a composite signal (composite or RF input).
     pub luma_bandwidth: [f64; 2],
     /// Luma peaking: time constant, s, of a high shelf of +6 dB (zero at
     /// 1/(2πτ), pole at twice that).
     pub luma_peaking: Option<f64>,
-    /// Luma trap at 4.43 MHz with a composite signal (without one the
-    /// subcarrier stays in the luma).
+    /// Luma peaking around a frequency (with the Sharpness knob, if the set
+    /// has it, from none at -100 to twice the gain at +100).
+    pub peak: Option<Peak>,
+    /// Luma trap at the subcarrier with a composite signal (without one,
+    /// or with a comb filter, the subcarrier stays in the luma).
     pub luma_trap: Option<Trap>,
-    /// Q of the chroma band-pass tuned to 4.43 MHz, which takes the chroma
-    /// out of a composite signal.
-    pub chroma_q: f64,
+    /// Comb filter for a composite signal: luma and chroma separated with
+    /// the previous line through a 1H delay line of this many subcarrier
+    /// cycles (NTSC: 227.5).
+    pub comb: Option<f64>,
+    /// Band-pass that takes the chroma out of a composite signal.
+    pub chroma_filter: ChromaFilter,
     /// The chroma input goes through that band-pass also with separate
     /// luma and chroma.
     pub chroma_bandpass: bool,
     /// Bandwidth (-3 dB) of the low-pass after the chroma demodulators, Hz.
     pub chroma_bandwidth: f64,
+    /// Chroma delay line of the PAL decoder, subcarrier cycles: 283.5
+    /// (63.943 µs) in PAL B/G sets, 229 (63.930 µs) in PAL-N ones.
+    pub delay_line: f64,
     /// White point, K; None: D65, the white of the colodore palette.
     pub white_point: Option<f64>,
 }
@@ -354,15 +641,52 @@ pub struct Trap {
     pub depth: f64,
 }
 
+/// Luma peaking: 1 + gain · (second-order band-pass of Q at f0, 1 at f0).
+#[derive(Debug, Clone, Copy)]
+pub struct Peak {
+    pub f0: f64,
+    pub q: f64,
+    pub gain: f64,
+}
+
+/// Chroma band-pass of a set.
+#[derive(Debug, Clone, Copy)]
+pub enum ChromaFilter {
+    /// Second-order band-pass of this Q tuned to the subcarrier.
+    Tuned(f64),
+    /// A series capacitor into a shunt of a coil, a capacitor and a
+    /// resistor, from a low-impedance source (farads, henries, ohms).
+    Network { series_c: f64, l: f64, shunt_c: f64, r: f64 },
+}
+
+/// IF filter of a TV tuner: attenuation, dB, at IF frequencies, MHz, with
+/// the picture carrier at `picture` MHz.
+#[derive(Debug)]
+pub struct IfFilter {
+    pub picture: f64,
+    pub points: &'static [(f64, f64)],
+}
+
+/// Controls of a PAL set: brightness, contrast, color (a PAL decoder needs
+/// no tint).
+const KNOBS_PAL: &[Knob] = &[Knob::Brightness, Knob::Contrast, Knob::Color];
+/// Controls of an NTSC set, with the tint.
+const KNOBS_NTSC: &[Knob] = &[Knob::Brightness, Knob::Contrast, Knob::Color, Knob::Tint];
+/// Controls of a monochrome monitor.
+const KNOBS_MONO: &[Knob] = &[Knob::Brightness, Knob::Contrast];
+
 /// Commodore 1084S-P1 (service manual, Philips chassis): tube M34EAQ10X,
-/// "slot triplet pitch 0.42 mm", 14", 90°; video bandwidth 8 MHz; TDA4510
-/// PAL decoder with a 64 µs delay line and an adjustable 4.43 MHz
-/// "chrominance suppression" trap, used in composite mode only.
+/// "slot triplet pitch 0.42 mm", 14", 90°; useful screen 280.8 × 210.6 mm
+/// (Philips data handbook T08, 1986: "slotted shadow mask", in-line gun);
+/// video bandwidth 8 MHz; TDA4510 PAL decoder with a 64 µs delay line and
+/// an adjustable 4.43 MHz "chrominance suppression" trap, used in composite
+/// mode only.
 pub static C1084S_P1: Monitor = Monitor {
-    standard: Standard::Pal,
-    // M34: 34 cm visible diagonal, 4:3
-    screen_width: 272.0,
-    screen_height: 204.0,
+    color: Some(Color::Pal),
+    phosphor: None,
+    screen_width: 280.8,
+    screen_height: 210.6,
+    overscan: 0.0,
     triad_pitch: 0.42,
     // Estimates: stripes with black guard bands, slots of the usual
     // shape for TV slot masks
@@ -372,14 +696,18 @@ pub static C1084S_P1: Monitor = Monitor {
     beam_sigma: (0.26, 0.42),
     glow: (0.05, 2.0),
     inputs: &[Input::LumaChroma, Input::Composite],
+    knobs: KNOBS_PAL,
     if_filter: None,
     luma_bandwidth: [8_000_000.0, 8_000_000.0],
     luma_peaking: None,
+    peak: None,
     luma_trap: Some(Trap { q: 2.0, depth: 0.0 }),
-    chroma_q: 2.0,
+    comb: None,
+    chroma_filter: ChromaFilter::Tuned(2.0),
     chroma_bandpass: false,
     // U/V bandwidth of PAL
     chroma_bandwidth: 1_300_000.0,
+    delay_line: 283.5,
     white_point: None,
 };
 
@@ -390,9 +718,11 @@ pub static C1084S_P1: Monitor = Monitor {
 /// TDA3507. The estimates are those of the P1: the manual gives nothing
 /// about the beam, the slots or the trap.
 pub static C1084S_D1: Monitor = Monitor {
-    standard: Standard::Pal,
+    color: Some(Color::Pal),
+    phosphor: None,
     screen_width: 260.0,
     screen_height: 186.0,
+    overscan: 0.0,
     triad_pitch: 0.41,
     stripe: 0.25,
     slot_pitch: 0.8,
@@ -400,13 +730,17 @@ pub static C1084S_D1: Monitor = Monitor {
     beam_sigma: (0.26, 0.42),
     glow: (0.05, 2.0),
     inputs: &[Input::LumaChroma, Input::Composite],
+    knobs: KNOBS_PAL,
     if_filter: None,
     luma_bandwidth: [5_200_000.0, 4_400_000.0],
     luma_peaking: None,
+    peak: None,
     luma_trap: Some(Trap { q: 2.0, depth: 0.0 }),
-    chroma_q: 2.0,
+    comb: None,
+    chroma_filter: ChromaFilter::Tuned(2.0),
     chroma_bandpass: false,
     chroma_bandwidth: 1_300_000.0,
+    delay_line: 283.5,
     white_point: None,
 };
 
@@ -421,9 +755,11 @@ pub static C1084S_D1: Monitor = Monitor {
 /// pattern. The manual gives neither the picture size nor the bandwidth:
 /// those are the P1's, as the estimates.
 pub static C1901: Monitor = Monitor {
-    standard: Standard::Pal,
-    screen_width: 272.0,
-    screen_height: 204.0,
+    color: Some(Color::Pal),
+    phosphor: None,
+    screen_width: 280.8,
+    screen_height: 210.6,
+    overscan: 0.0,
     triad_pitch: 0.43,
     stripe: 0.25,
     slot_pitch: 0.8,
@@ -431,13 +767,17 @@ pub static C1901: Monitor = Monitor {
     beam_sigma: (0.26, 0.42),
     glow: (0.05, 2.0),
     inputs: &[Input::LumaChroma, Input::Composite],
+    knobs: KNOBS_PAL,
     if_filter: None,
     luma_bandwidth: [8_000_000.0, 8_000_000.0],
     luma_peaking: Some(560.0 * 470e-12),
+    peak: None,
     luma_trap: None,
-    chroma_q: 3.6,
+    comb: None,
+    chroma_filter: ChromaFilter::Tuned(3.6),
     chroma_bandpass: true,
     chroma_bandwidth: 1_300_000.0,
+    delay_line: 283.5,
     white_point: Some(7500.0),
 };
 
@@ -452,13 +792,16 @@ pub static C1901: Monitor = Monitor {
 /// does some dot pattern); chroma band-pass S5259. Inputs: antenna and
 /// SCART (composite; its RGB is not used by the C64). The SAW is not named
 /// in the manual: the response is that of a B/G intercarrier SAW of the
-/// time (EPCOS K2966M). Q of the trap and of the band-pass, bandwidth and
-/// white point are not in the manual: the band-pass has the Q of the
-/// TDA356x application circuit (10.7 µH ∥ 120 pF from 1 kΩ: about 3).
+/// time (EPCOS K2966M). Q of the trap and of the band-pass, bandwidth,
+/// overscan and white point are not in the manual: the band-pass has the Q
+/// of the TDA356x application circuit (10.7 µH ∥ 120 pF from 1 kΩ: about
+/// 3), the overscan the 7% "normal scan" of Sony's monitors.
 pub static PHILIPS_CP90: Monitor = Monitor {
-    standard: Standard::Pal,
+    color: Some(Color::Pal),
+    phosphor: None,
     screen_width: 284.5,
     screen_height: 213.4,
+    overscan: TV_OVERSCAN,
     triad_pitch: 0.52,
     stripe: 0.25,
     slot_pitch: 0.8,
@@ -466,13 +809,17 @@ pub static PHILIPS_CP90: Monitor = Monitor {
     beam_sigma: (0.26, 0.42),
     glow: (0.05, 2.0),
     inputs: &[Input::Rf, Input::Composite],
+    knobs: KNOBS_PAL,
     if_filter: Some(&SAW_BG),
     luma_bandwidth: [5_000_000.0, 5_000_000.0],
     luma_peaking: None,
+    peak: None,
     luma_trap: Some(Trap { q: 2.0, depth: 0.5 }),
-    chroma_q: 3.0,
+    comb: None,
+    chroma_filter: ChromaFilter::Tuned(3.0),
     chroma_bandpass: false,
     chroma_bandwidth: 1_300_000.0,
+    delay_line: 283.5,
     white_point: None,
 };
 
@@ -488,10 +835,12 @@ pub static PHILIPS_CP90: Monitor = Monitor {
 /// point are not in the manual: estimates (NTSC video bandwidth 4.2 MHz, Q
 /// of the TDA356x application circuits).
 pub static C1702: Monitor = Monitor {
-    standard: Standard::Ntsc,
+    color: Some(Color::Ntsc),
+    phosphor: None,
     // 13" (330 mm) viewable, 4:3
     screen_width: 264.0,
     screen_height: 198.0,
+    overscan: 0.0,
     triad_pitch: 0.64,
     stripe: 0.25,
     slot_pitch: 0.8,
@@ -499,61 +848,261 @@ pub static C1702: Monitor = Monitor {
     beam_sigma: (0.26, 0.42),
     glow: (0.05, 2.0),
     inputs: &[Input::LumaChroma, Input::Composite],
+    knobs: KNOBS_NTSC,
     if_filter: None,
     luma_bandwidth: [4_200_000.0, 4_200_000.0],
     luma_peaking: None,
+    peak: None,
     luma_trap: Some(Trap { q: 2.0, depth: 0.0 }),
-    chroma_q: 3.0,
+    comb: None,
+    chroma_filter: ChromaFilter::Tuned(3.0),
     chroma_bandpass: true,
     chroma_bandwidth: 1_300_000.0,
+    delay_line: 0.0,
     white_point: None,
 };
+
+/// Commodore 1084S-P for NTSC countries (Commodore service manual 1084S-P,
+/// July 1988, PN-314890-01: Philips/Magnavox CM8500 family, 115 V, 60 Hz):
+/// 13", 90°, tube of the M34EAQ series (slotted mask, 0.42 mm, useful
+/// screen 280.8 × 210.6 mm: Philips data handbook T08); RGB amplifier of 8
+/// MHz; a 1H delay-line comb filter for the composite input, with a "COMB
+/// DEFEAT" switch on the back, and a 3.58 MHz trap (S533) that takes over
+/// when the comb is off; front controls brightness, contrast, color, hue and
+/// sharpness, which sets the peaking stage TS544 (6.8 µH, 680 pF, 220 Ω:
+/// 2.34 MHz, Q about 0.45). Not in the manual (estimates): the gain of the
+/// peaking at the centre of the knob (+3 dB), the Q of the chroma
+/// band-pass and of the trap, the composite bandwidth, the white point.
+pub static C1084S_P_NTSC: Monitor = Monitor {
+    color: Some(Color::Ntsc),
+    phosphor: None,
+    screen_width: 280.8,
+    screen_height: 210.6,
+    overscan: 0.0,
+    triad_pitch: 0.42,
+    stripe: 0.25,
+    slot_pitch: 0.8,
+    bridge: 0.12,
+    beam_sigma: (0.26, 0.42),
+    glow: (0.05, 2.0),
+    inputs: &[Input::LumaChroma, Input::Composite],
+    knobs: &[Knob::Brightness, Knob::Contrast, Knob::Color, Knob::Tint, Knob::Sharpness],
+    if_filter: None,
+    luma_bandwidth: [8_000_000.0, 8_000_000.0],
+    luma_peaking: None,
+    peak: Some(Peak { f0: 2_340_000.0, q: 0.45, gain: 0.41 }),
+    luma_trap: Some(Trap { q: 2.0, depth: 0.0 }),
+    comb: Some(227.5),
+    chroma_filter: ChromaFilter::Tuned(2.0),
+    chroma_bandpass: false,
+    chroma_bandwidth: 1_300_000.0,
+    delay_line: 0.0,
+    white_point: None,
+};
+
+/// Sony Trinitron KV-1311CR, a 13" NTSC TV of about 1985 (Sams Photofact
+/// 2393-2, 3-86; owner's manual): tube A34JHS10X, an aperture grille of 0.37
+/// mm (the Sony PVM-1390 with the same tube); tuner, one SAW and the
+/// CX20014A detector; a 1H glass delay-line comb filter (T351, DL351), then
+/// the chroma band-pass T352 into the CX848 decoder, whose "sharp Y amp"
+/// has a fixed peaking network (100 µH, 39 pF: about 2.5 MHz); controls
+/// picture, bright, color and hue, no sharpness; inputs antenna and video.
+/// The SAW is known only by Sony's part number: the response is that of an
+/// NTSC intercarrier SAW (EPCOS M1967M). White point 9300 K and 5 MHz of
+/// luma bandwidth are those of the PVM-1390; the picture size (13" at
+/// 4:3), the overscan ("slight overscan" in the service procedure: 7%, the
+/// "normal scan" of Sony's PVM-1341), the gain and Q of the peaking and the
+/// Q of the band-pass are estimates.
+pub static SONY_KV1311CR: Monitor = Monitor {
+    color: Some(Color::Ntsc),
+    phosphor: None,
+    screen_width: 264.0,
+    screen_height: 198.0,
+    overscan: TV_OVERSCAN,
+    triad_pitch: 0.37,
+    stripe: 0.25,
+    slot_pitch: 0.8,
+    bridge: 0.0,
+    beam_sigma: (0.26, 0.42),
+    glow: (0.05, 2.0),
+    inputs: &[Input::Rf, Input::Composite],
+    knobs: KNOBS_NTSC,
+    if_filter: Some(&SAW_M),
+    luma_bandwidth: [5_000_000.0, 5_000_000.0],
+    luma_peaking: None,
+    peak: Some(Peak { f0: 2_550_000.0, q: 1.0, gain: 0.41 }),
+    luma_trap: None,
+    comb: Some(227.5),
+    chroma_filter: ChromaFilter::Tuned(3.0),
+    chroma_bandpass: false,
+    chroma_bandwidth: 1_300_000.0,
+    delay_line: 0.0,
+    white_point: Some(9300.0),
+};
+
+/// Sontec CNT-4442 B, an Argentine PAL-N TV (single standard; the luma and
+/// chroma schematic in the DsTecnologia repair course, lesson 14): LA7520
+/// IF and detector, a ceramic 3.58 MHz luma trap (the Murata TPS3.58 type:
+/// about 27 dB, very narrow), TDA3562A PAL decoder with a glass chroma
+/// delay line. The chroma band-pass before the decoder is C207 82 pF in
+/// series into L201 5.6 µH ∥ C209 100 pF ∥ R210 1 kΩ: tuned to 5 MHz, not
+/// to 3.58 (the course's author thinks the maker kept the PAL B/G values),
+/// so the subcarrier comes in on its slope, with its upper sideband
+/// stronger than the lower one. The PAL-N delay line is 63.930 µs (the
+/// only figure found, in Thomson's patent US 5,374,962), 229 subcarrier
+/// cycles: 0.42 µs longer than a line of the Drean C64 (227.5 cycles), so
+/// the decoder averages each line with the chroma of the previous one 3.4
+/// pixels to the left. Tube, screen, overscan and SAW are not documented:
+/// the tube of the CP90 (36 cm) and the NTSC/N SAW of the Sony are
+/// estimates; the white point is BT.470's for N/PAL (illuminant C, about
+/// 6774 K), the luma bandwidth the 4.2 MHz of system N.
+pub static SONTEC_CNT4442: Monitor = Monitor {
+    color: Some(Color::PalN),
+    phosphor: None,
+    screen_width: 284.5,
+    screen_height: 213.4,
+    overscan: TV_OVERSCAN,
+    triad_pitch: 0.52,
+    stripe: 0.25,
+    slot_pitch: 0.8,
+    bridge: 0.12,
+    beam_sigma: (0.26, 0.42),
+    glow: (0.05, 2.0),
+    inputs: &[Input::Rf],
+    knobs: KNOBS_PAL,
+    if_filter: Some(&SAW_M),
+    luma_bandwidth: [4_200_000.0, 4_200_000.0],
+    luma_peaking: None,
+    peak: None,
+    luma_trap: Some(Trap { q: 20.0, depth: 0.045 }),
+    comb: None,
+    chroma_filter: ChromaFilter::Network { series_c: 82e-12, l: 5.6e-6, shunt_c: 100e-12, r: 1e3 },
+    chroma_bandpass: false,
+    chroma_bandwidth: 1_000_000.0,
+    delay_line: 229.0,
+    white_point: Some(6774.0),
+};
+
+/// Commodore 1900 M, a green monochrome monitor (the Commodore DM602, a
+/// Philips BM7502 "Computer Monitor 80": user manual): 12", 90°, composite
+/// input, video bandwidth "> 20 MHz", "> 850 lines in centre", brightness
+/// and contrast knobs. Tube Philips M31-344GH/PD (photographed in one):
+/// phosphor GH, P31 green, medium-short persistence (10 µs to 1 ms: no
+/// trail from frame to frame), x 0.265 y 0.550; useful screen at least 257
+/// × 195 mm (Philips data handbook T16, 1987). No trap and no decoder: the
+/// C64's subcarrier shows as a fine pattern over the colored areas. The
+/// thin beam (about 0.3 mm for 850 lines) is an estimate.
+pub static C1900: Monitor = Monitor {
+    color: None,
+    phosphor: Some((0.265, 0.550)),
+    screen_width: 257.0,
+    screen_height: 195.0,
+    overscan: 0.0,
+    triad_pitch: 0.0,
+    stripe: 0.25,
+    slot_pitch: 0.8,
+    bridge: 0.0,
+    beam_sigma: (0.16, 0.26),
+    glow: (0.05, 2.0),
+    inputs: &[Input::Composite],
+    knobs: KNOBS_MONO,
+    if_filter: None,
+    luma_bandwidth: [20_000_000.0, 20_000_000.0],
+    luma_peaking: None,
+    peak: None,
+    luma_trap: None,
+    comb: None,
+    chroma_filter: ChromaFilter::Tuned(2.0),
+    chroma_bandpass: false,
+    chroma_bandwidth: 1_300_000.0,
+    delay_line: 0.0,
+    white_point: None,
+};
+
+/// Overscan of the TVs, on each axis: 7%, the "normal scan" of Sony's
+/// PVM-1341 monitor (the TV service manuals only say "slight overscan").
+pub const TV_OVERSCAN: f64 = 0.07;
 
 /// IF response of a PAL B/G intercarrier SAW filter, EPCOS K2966M
 /// (datasheet: picture carrier 38.9 MHz on the Nyquist slope, -5.6 dB;
 /// color carrier 34.47 MHz, -3.1 dB; sound shelf 33.4-32.4 MHz, about -20
 /// dB; adjacent carriers 31.9 and 40.4 MHz, -58 dB; the other points read
 /// from its curve).
-pub static SAW_BG: [(f64, f64); 13] = [
-    (30.0, -60.0), (31.9, -58.0), (32.4, -20.4), (33.4, -19.3), (34.2, -8.0),
-    (34.47, -3.1), (35.0, 0.0), (38.0, 0.0), (38.5, -2.3), (38.9, -5.6),
-    (39.1, -8.0), (40.2, -40.0), (45.0, -42.0),
-];
+pub static SAW_BG: IfFilter = IfFilter {
+    picture: 38.9,
+    points: &[
+        (30.0, -60.0), (31.9, -58.0), (32.4, -20.4), (33.4, -19.3), (34.2, -8.0),
+        (34.47, -3.1), (35.0, 0.0), (38.0, 0.0), (38.5, -2.3), (38.9, -5.6),
+        (39.1, -8.0), (40.2, -40.0), (45.0, -42.0),
+    ],
+};
+
+/// IF response of an NTSC (M/N) intercarrier SAW filter, EPCOS M1967M
+/// (datasheet, relative to 44 MHz: picture carrier 45.75 MHz -6 dB, color
+/// carrier 42.17 MHz -1 dB, 41.92 MHz -3 dB, 41.67 MHz -7.4 dB, sound
+/// carrier 41.25 MHz -19.1 dB, adjacent picture 39.75 MHz -62 dB, adjacent
+/// sound 47.25 MHz -56 dB, sidelobes -46 and -47 dB). The Nyquist slope
+/// between them is drawn linear in amplitude, from 45.0 to 46.5 MHz (0.75
+/// MHz of vestigial sideband), as the Nyquist condition wants.
+pub static SAW_M: IfFilter = IfFilter {
+    picture: 45.75,
+    points: &[
+        (35.0, -46.0), (39.75, -62.0), (40.5, -46.0), (41.25, -19.1), (41.67, -7.4),
+        (41.92, -3.0), (42.17, -1.0), (44.0, 0.0), (45.0, 0.0), (45.375, -2.5),
+        (45.75, -6.0), (46.125, -12.0), (46.5, -40.0), (47.25, -56.0), (55.0, -47.0),
+    ],
+};
 
 impl Monitor {
-    /// The signal it decodes.
-    pub fn signal(&self) -> Signal {
-        Signal::of(self.standard)
+    /// The picture on the screen, mm: the visible screen and the overscan.
+    fn picture(&self) -> (f64, f64) {
+        (self.screen_width / (1.0 - self.overscan), self.screen_height / (1.0 - self.overscan))
     }
 
-    /// Width of a C64 pixel on the screen, mm: the active line fills the
-    /// width of the picture.
-    pub fn pixel_width(&self) -> f64 {
-        let s = self.signal();
-        self.screen_width / (s.active_line() * s.dot_clock())
+    /// Width of a C64 pixel of signal `sig` on the screen, mm: the active
+    /// line fills the width of the picture.
+    pub fn pixel_width(&self, sig: &Signal) -> f64 {
+        self.picture().0 / (sig.active_line() * sig.dot_clock())
     }
 
-    /// Distance between two lines, mm: the lines of a field (288 PAL,
-    /// 242.5 NTSC) fill the height of the picture.
-    pub fn line_pitch(&self) -> f64 {
-        self.screen_height / self.signal().picture_lines()
+    /// Distance between two lines of signal `sig`, mm: the lines of a field
+    /// (288 in 625-line sets, 242.5 in 525-line ones) fill the height of the
+    /// picture.
+    pub fn line_pitch(&self, sig: &Signal) -> f64 {
+        self.picture().1 / sig.picture_lines()
+    }
+
+    /// The part of the framebuffer (`WIDTH` × `rows` pixels, centred) on the
+    /// screen, as fractions of its width and height: all of it on a
+    /// monitor, less on an overscanning TV.
+    pub fn visible(&self, sig: &Signal, rows: usize) -> (f64, f64) {
+        let w = self.screen_width / self.pixel_width(sig) / WIDTH as f64;
+        let h = self.screen_height / self.line_pitch(sig) / rows as f64;
+        (w.min(1.0), h.min(1.0))
+    }
+
+    /// Accepts the signal of a machine of `standard`.
+    pub fn shows(&self, standard: Standard) -> bool {
+        self.color.is_none_or(|c| c == Color::of(standard))
     }
 }
 
 // ── Colors ───────────────────────────────────────────────────────────────────
 
 /// Luma and chroma of the 16 colors, in Pepto's units (luma 0-256), on
-/// even or odd raster lines. PAL: the two lines have the chroma rotated by
-/// ∓ODD_LINE_PHASE/2, with the amplitude raised so that their average (the
-/// PAL delay line) is exactly the colodore vector. NTSC: the colodore
-/// vector on every line (the 6567 is assumed to have the chroma of the
-/// 6569: no measurements of its phases were found, and NTSC monitors have
-/// a tint control).
+/// even or odd raster lines, with the lumas of the chip (`Chip::luma`: 5
+/// levels on the first revisions). PAL and PAL-N: the two lines have the
+/// chroma rotated by ∓ODD_LINE_PHASE/2, with the amplitude raised so that
+/// their average (the PAL delay line) is exactly the colodore vector.
+/// NTSC: the colodore vector on every line (the 6567 is assumed to have the
+/// chroma of the 6569: no measurements of its phases were found, and NTSC
+/// monitors have a tint control).
 pub fn palette_yuv(odd_line: bool, sig: &Signal) -> [[f64; 3]; 16] {
     let half = if sig.pal() { (ODD_LINE_PHASE / 2.0).to_radians() } else { 0.0 };
     let turn = if odd_line { half } else { -half };
+    let luma = sig.chip.luma();
     std::array::from_fn(|i| {
-        let y = 8.0 * LUMA[i] as f64;
+        let y = 8.0 * luma[i] as f64;
         match HUE[i] {
             None => [y, 0.0, 0.0],
             Some(a) => {
@@ -602,13 +1151,13 @@ pub fn white_balance(m: &Monitor) -> [f64; 3] {
     rgb.map(|c| c / max)
 }
 
-/// Palette index of an ARGB pixel: the VIC color it is, or the nearest
-/// one (frames drawn by the VIC only have palette colors).
-pub fn palette_index(argb: u32) -> usize {
+/// Palette index of an ARGB pixel: the color of `palette` it is, or the
+/// nearest one (frames drawn by the VIC only have palette colors).
+pub fn palette_index(argb: u32, palette: &[u32; 16]) -> usize {
     let rgb = |c: u32| [(c >> 16 & 0xFF) as i32, (c >> 8 & 0xFF) as i32, (c & 0xFF) as i32];
     let p = rgb(argb);
     (0..16)
-        .min_by_key(|&i| rgb(C64_PALETTE[i]).iter().zip(&p).map(|(a, b)| (a - b) * (a - b)).sum::<i32>())
+        .min_by_key(|&i| rgb(palette[i]).iter().zip(&p).map(|(a, b)| (a - b) * (a - b)).sum::<i32>())
         .unwrap_or(0)
 }
 
@@ -742,9 +1291,9 @@ fn zero_phase_fir(sig: &Signal, mag: impl Fn(f64) -> f64) -> [f32; FIR_LEN] {
 
 /// Luma amplifier of the monitor: second-order Butterworth magnitude at its
 /// bandwidth for the input.
-pub fn luma_fir(m: &Monitor, input: Input) -> [f32; FIR_LEN] {
+pub fn luma_fir(sig: &Signal, m: &Monitor, input: Input) -> [f32; FIR_LEN] {
     let fc = m.luma_bandwidth[(input != Input::LumaChroma) as usize];
-    zero_phase_fir(&m.signal(), |f| 1.0 / (1.0 + (f / fc).powi(4)).sqrt())
+    zero_phase_fir(sig, |f| 1.0 / (1.0 + (f / fc).powi(4)).sqrt())
 }
 
 /// Low-pass of the demodulated chroma: second-order Butterworth magnitude
@@ -752,12 +1301,15 @@ pub fn luma_fir(m: &Monitor, input: Input) -> [f32; FIR_LEN] {
 /// through the tuned band-pass its effect on the demodulated chroma is here
 /// too (with a composite signal the band-pass is done on the signal): a
 /// circuit of Q tuned to FSC passes FSC ± Δ with 1 / sqrt(1 + (2QΔ/FSC)²).
-pub fn chroma_fir(m: &Monitor, input: Input) -> [f32; FIR_LEN] {
+pub fn chroma_fir(sig: &Signal, m: &Monitor, input: Input) -> [f32; FIR_LEN] {
     let fc = m.chroma_bandwidth;
     let band = m.chroma_bandpass && input == Input::LumaChroma;
-    let q = m.chroma_q;
-    let sig = m.signal();
-    zero_phase_fir(&sig, |f| {
+    let q = match m.chroma_filter {
+        ChromaFilter::Tuned(q) => q,
+        // Only the tuned band-passes are used on a separate chroma input
+        ChromaFilter::Network { .. } => 1.0,
+    };
+    zero_phase_fir(sig, |f| {
         let lp = 1.0 / (1.0 + (f / fc).powi(4)).sqrt();
         if band { lp / (1.0 + (2.0 * q * f / sig.fsc).powi(2)).sqrt() } else { lp }
     })
@@ -784,15 +1336,40 @@ fn trap(sig: &Signal, t: Trap) -> Vec<f64> {
     notch_section(sig, t.depth / t.q, 1.0 / t.q)
 }
 
-/// Chroma band-pass of Q at the subcarrier: the signal minus a full notch
-/// of the same Q (for a second-order circuit the two are complementary).
-fn band_pass(sig: &Signal, q: f64) -> Vec<f64> {
-    let mut h = notch_section(sig, 0.0, 1.0 / q);
-    for x in h.iter_mut() {
-        *x = -*x;
+/// Luma peaking around `p.f0` of `gain`: 1 + gain · jωω0/Q / (ω0² - ω² +
+/// jωω0/Q), from its complex response.
+fn peak(sig: &Signal, p: Peak, gain: f64) -> Vec<f64> {
+    fir_from_response(sig, SEP_HALF, move |f| {
+        let x = f / p.f0;
+        // Band-pass x/Q j / (1 - x² + x/Q j)
+        let (dr, di) = (1.0 - x * x, x / p.q);
+        let d = dr * dr + di * di;
+        let (br, bi) = (di * di / d, di * dr / d);
+        (1.0 + gain * br, gain * bi)
+    }, 0.0)
+}
+
+/// Complex response of a set's chroma filter at `f` Hz, for a signal of
+/// subcarrier `fsc`.
+fn chroma_filter_response(filter: ChromaFilter, fsc: f64, f: f64) -> (f64, f64) {
+    match filter {
+        ChromaFilter::Tuned(q) => {
+            // x/Q j / (1 - x² + x/Q j), 1 at the subcarrier
+            let x = f / fsc;
+            let (dr, di) = (1.0 - x * x, x / q);
+            let d = dr * dr + di * di;
+            (di * di / d, di * dr / d)
+        }
+        ChromaFilter::Network { series_c, l, shunt_c, r } => {
+            // Z / (Z + 1/(jωC)), Z the shunt L ∥ C ∥ R: with admittances,
+            // jωC / (Y + jωC), Y = 1/R + jωC_s - j/(ωL)
+            let w = 2.0 * PI * f.max(1.0);
+            let (yr, yi) = (1.0 / r, w * shunt_c - 1.0 / (w * l) + w * series_c);
+            let (nr, ni) = (0.0, w * series_c);
+            let d = yr * yr + yi * yi;
+            ((nr * yr + ni * yi) / d, (ni * yr - nr * yi) / d)
+        }
     }
-    h[SEP_HALF] += 1.0;
-    h
 }
 
 /// Luma peaking of time constant `tau`: 2(1 + sτ) / (2 + sτ), unity gain at
@@ -807,10 +1384,12 @@ fn peaking(sig: &Signal, tau: f64) -> Vec<f64> {
 }
 
 /// Video response of the TV's IF filter: the C64's modulator sends both
-/// sidebands (no vestigial filter), which reach the IF at 38.9 MHz ∓ f;
-/// the synchronous demodulator adds them, and the Nyquist slope makes the
-/// sum flat at low frequencies.
-fn if_response(sig: &Signal, points: &[(f64, f64)]) -> Vec<f64> {
+/// sidebands (no vestigial filter), which reach the IF at the picture
+/// carrier ∓ f; the synchronous demodulator adds them, and the Nyquist
+/// slope makes the sum flat at low frequencies.
+fn if_response(sig: &Signal, filter: &IfFilter) -> Vec<f64> {
+    let points = filter.points;
+    let picture = filter.picture;
     let at = |mhz: f64| -> f64 {
         let (first, last) = (points[0], points[points.len() - 1]);
         let db = if mhz <= first.0 {
@@ -824,7 +1403,7 @@ fn if_response(sig: &Signal, points: &[(f64, f64)]) -> Vec<f64> {
         };
         10f64.powf(db / 20.0)
     };
-    let video = |f: f64| at(38.9 - f / 1e6) + at(38.9 + f / 1e6);
+    let video = |f: f64| at(picture - f / 1e6) + at(picture + f / 1e6);
     fir_from_response(sig, SEP_HALF, |f| (video(f), 0.0), 0.0)
 }
 
@@ -891,61 +1470,200 @@ pub fn modulator_fir(sig: &Signal) -> [f32; SEP_LEN] {
     std::array::from_fn(|i| h[i] as f32)
 }
 
-/// Luma input of the monitor, SEP_LEN taps around the sample: the IF
-/// filter (RF), the trap (composite signal), the peaking.
-pub fn luma_input_fir(m: &Monitor, input: Input) -> [f32; SEP_LEN] {
-    let sig = m.signal();
+/// The TV's IF filter (RF input), SEP_LEN taps around the sample; None
+/// without one.
+pub fn if_fir(sig: &Signal, crt: &Crt) -> Option<[f32; SEP_LEN]> {
+    let filter = crt.model.monitor().if_filter.filter(|_| crt.input == Input::Rf)?;
+    let h = if_response(sig, filter);
+    Some(std::array::from_fn(|i| h[i] as f32))
+}
+
+/// The set's luma peaking (shelf and band), SEP_LEN taps around the sample.
+fn peakings(sig: &Signal, crt: &Crt) -> Vec<f64> {
+    let m = crt.model.monitor();
     let mut h = vec![0f64; SEP_LEN];
     h[SEP_HALF] = 1.0;
-    if input == Input::Rf {
-        if let Some(points) = m.if_filter {
-            h = convolve(&h, SEP_HALF, &if_response(&sig, points), SEP_HALF);
-        }
-    }
-    if input != Input::LumaChroma {
-        if let Some(t) = m.luma_trap {
-            h = convolve(&h, SEP_HALF, &trap(&sig, t), SEP_HALF);
-        }
-    }
     if let Some(tau) = m.luma_peaking {
-        h = convolve(&h, SEP_HALF, &peaking(&sig, tau), SEP_HALF);
+        h = convolve(&h, SEP_HALF, &peaking(sig, tau), SEP_HALF);
+    }
+    if let Some(p) = m.peak {
+        h = convolve(&h, SEP_HALF, &peak(sig, p, crt.peak_gain()), SEP_HALF);
+    }
+    h
+}
+
+/// Luma input of the set, after the IF filter (RF), SEP_LEN taps around
+/// the sample: the trap (composite signal, unless the comb filter does the
+/// separation), the peaking.
+pub fn luma_input_fir(sig: &Signal, crt: &Crt) -> [f32; SEP_LEN] {
+    let m = crt.model.monitor();
+    let mut h = peakings(sig, crt);
+    if crt.input != Input::LumaChroma && !crt.comb_active() {
+        if let Some(t) = m.luma_trap {
+            h = convolve(&h, SEP_HALF, &trap(sig, t), SEP_HALF);
+        }
     }
     let dc: f64 = h.iter().sum();
     std::array::from_fn(|i| (h[i] / dc) as f32)
 }
 
-/// Chroma out of a composite signal, SEP_LEN taps around the sample: the
-/// IF filter (RF) and the band-pass, with unity gain at the subcarrier (the
-/// burst sets the chroma gain: ACC).
-pub fn chroma_input_fir(m: &Monitor, input: Input) -> [f32; SEP_LEN] {
-    let sig = m.signal();
-    let mut h = band_pass(&sig, m.chroma_q);
-    if input == Input::Rf {
-        if let Some(points) = m.if_filter {
-            h = convolve(&h, SEP_HALF, &if_response(&sig, points), SEP_HALF);
-        }
-    }
-    // Gain at FSC = SAMPLE_RATE/4, where the taps weigh 1, 0, -1, 0... and
-    // 0, 1, 0, -1...
+/// Kernel of the chroma filter, SEP_LEN taps around the sample, and its
+/// gain at the subcarrier (magnitude).
+fn chroma_band(sig: &Signal, filter: ChromaFilter) -> (Vec<f64>, f64) {
+    let fsc = sig.fsc;
+    let resp = move |f: f64| chroma_filter_response(filter, fsc, f);
+    // fir_from_response takes the DC gain as 1: without DC, the raw sum
+    let fs = sig.sample_rate;
+    const M: usize = 4096;
+    let h: Vec<f64> = (-(SEP_HALF as i64)..=SEP_HALF as i64).map(|k| {
+        let sum: f64 = (0..M).map(|i| {
+            let f = (i as f64 + 0.5) * fs / 2.0 / M as f64;
+            let (re, im) = resp(f);
+            let w = 2.0 * PI * f * k as f64 / fs;
+            re * w.cos() - im * w.sin()
+        }).sum();
+        let x = k.unsigned_abs() as f64 / (SEP_HALF + 1) as f64;
+        let window = if x < 0.75 { 1.0 } else { 0.5 * (1.0 + (PI * (x - 0.75) / 0.25).cos()) };
+        sum / M as f64 * window
+    }).collect();
+    let (re, im) = response_at_fsc(&h);
+    (h, (re * re + im * im).sqrt())
+}
+
+/// Complex response at the subcarrier, SAMPLE_RATE/4, of a kernel of
+/// SEP_LEN taps: there the taps weigh 1, 0, -1, 0... and 0, 1, 0, -1...
+fn response_at_fsc(h: &[f64]) -> (f64, f64) {
     let (mut re, mut im) = (0.0, 0.0);
     for (i, &x) in h.iter().enumerate() {
         let k = (i as i64 - SEP_HALF as i64).rem_euclid(4);
         re += x * [1.0, 0.0, -1.0, 0.0][k as usize];
         im -= x * [0.0, 1.0, 0.0, -1.0][k as usize];
     }
+    (re, im)
+}
+
+/// The chroma path of a composite signal: IF filter (RF) and band-pass.
+fn chroma_path(sig: &Signal, crt: &Crt) -> (Vec<f64>, Vec<f64>) {
+    let (h, _) = chroma_band(sig, crt.model.monitor().chroma_filter);
+    let path = match if_fir(sig, crt) {
+        Some(f) => {
+            let f: Vec<f64> = f.iter().map(|&x| x as f64).collect();
+            convolve(&h, SEP_HALF, &f, SEP_HALF)
+        }
+        None => h.clone(),
+    };
+    (h, path)
+}
+
+/// Phase that the chroma path (`chroma_path`) gives the subcarrier,
+/// radians: the burst goes through it too, and the decoder's oscillator
+/// locks to it, so the demodulation turns by as much (0 with a band-pass
+/// tuned to the subcarrier; 165° on the CNT-4442's, tuned to 5 MHz).
+pub fn chroma_phase(sig: &Signal, crt: &Crt) -> f64 {
+    if crt.input == Input::LumaChroma {
+        return 0.0;
+    }
+    let (re, im) = response_at_fsc(&chroma_path(sig, crt).1);
+    im.atan2(re)
+}
+
+/// Chroma out of a composite signal (after the IF filter with RF), SEP_LEN
+/// taps around the sample: the band-pass, with the gain that makes the
+/// whole path (IF filter and band-pass) unity at the subcarrier (the burst
+/// sets the chroma gain: ACC).
+pub fn chroma_input_fir(sig: &Signal, crt: &Crt) -> [f32; SEP_LEN] {
+    let (h, path) = chroma_path(sig, crt);
+    let (re, im) = response_at_fsc(&path);
     let g = (re * re + im * im).sqrt();
     std::array::from_fn(|i| (h[i] / g) as f32)
+}
+
+/// Comb filter: the chroma it takes out of the luma, SEP_LEN taps around the
+/// sample, applied to half the difference of a line and the previous one:
+/// the chroma band (at unity gain at the subcarrier, where the comb is
+/// balanced), through the set's peaking.
+pub fn comb_luma_fir(sig: &Signal, crt: &Crt) -> [f32; SEP_LEN] {
+    let m = crt.model.monitor();
+    let (band, g) = chroma_band(sig, m.chroma_filter);
+    let unit: Vec<f64> = band.iter().map(|x| x / g).collect();
+    let h = convolve(&peakings(sig, crt), SEP_HALF, &unit, SEP_HALF);
+    std::array::from_fn(|i| h[i] as f32)
+}
+
+// ── Line delays ──────────────────────────────────────────────────────────────
+
+/// A delay line of `cycles` subcarrier cycles, as a shift of the previous
+/// line: its sample n + offset is the one delayed to sample n (the delay is
+/// the line minus the offset). 0 when the delay is exactly a line.
+fn line_delay_offset(sig: &Signal, cycles: f64) -> i32 {
+    sig.line_samples() as i32 - (4.0 * cycles).round() as i32
+}
+
+/// Shift of the previous line in the set's comb filter.
+pub fn comb_offset(sig: &Signal, m: &Monitor) -> i32 {
+    m.comb.map_or(0, |c| line_delay_offset(sig, c))
+}
+
+/// Shift of the previous line in the set's PAL delay line: 0 for the PAL
+/// C64 on a PAL B/G set (283.5 cycles, 63.943 µs, also the C64's line),
+/// -6 samples (3.4 pixels) for the Drean on a PAL-N set (229 cycles,
+/// 63.930 µs, against its 227.5).
+pub fn delay_offset(sig: &Signal, m: &Monitor) -> i32 {
+    if sig.pal() { line_delay_offset(sig, m.delay_line) } else { 0 }
+}
+
+// ── VIC-II jail bars ─────────────────────────────────────────────────────────
+
+/// Jail bars: interference of the VIC-II's AEC and PHI0 on its own luma
+/// output, the same on every line and in the border too (forum64.de,
+/// "Streifenfix", and the LumaFix64 documentation: the edges of AEC make a
+/// dark and a bright dot). Added to the luma, 0-256 units, for each pixel
+/// of a character cell (8 pixels, one PHI0 cycle), measured on frame grabs
+/// of real C64s (ikari's captures, before the fix): on an 8565 a dark dip
+/// of one pixel on the first pixel of the cell and a bright peak on pixel
+/// 4, about 3% of black to white peak to peak; on the NMOS chips (6569R5)
+/// a broader pattern, about 5 pixels darker and 3 brighter, 2% peak to
+/// peak, whose phase in the cell is assumed to be the same.
+pub fn jail_bars(chip: Chip) -> [f64; 8] {
+    let bars = if chip.hmos() {
+        [-3.5, 0.0, 0.0, 0.0, 4.4, 0.0, 0.0, 0.0]
+    } else {
+        [-1.8, -1.8, -1.8, -1.8, -1.8, 3.0, 3.0, 3.0]
+    };
+    // No change of the average level
+    let mean = bars.iter().sum::<f64>() / 8.0;
+    bars.map(|b| b - mean)
+}
+
+// ── Monochrome ───────────────────────────────────────────────────────────────
+
+/// The color of a phosphor (CIE xy) on the host display: linear sRGB, the
+/// brightest channel at 1 (the part outside the sRGB gamut is clipped).
+pub fn phosphor_rgb((x, y): (f64, f64)) -> [f64; 3] {
+    let (cx, cy, cz) = (x / y, 1.0, (1.0 - x - y) / y);
+    let rgb = [
+        3.2406 * cx - 1.5372 * cy - 0.4986 * cz,
+        -0.9689 * cx + 1.8758 * cy + 0.0415 * cz,
+        0.0557 * cx - 0.2040 * cy + 1.0570 * cz,
+    ].map(|c: f64| c.max(0.0));
+    let max = rgb.iter().cloned().fold(0.0, f64::max);
+    rgb.map(|c| c / max)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vic::C64_PALETTE;
 
     /// The PAL signal, for the tests of the PAL monitors.
     const FSC: f64 = 4_433_618.75;
     const SAMPLE_RATE: f64 = 4.0 * FSC;
     fn pal() -> Signal {
-        Signal::of(Standard::Pal)
+        Signal::of(Chip::Mos6569)
+    }
+
+    fn with(model: Model, input: Input) -> Crt {
+        Crt { input, ..Crt::new(model) }
     }
 
     /// Gain of a FIR centered on its middle tap at `f` Hz (magnitude).
@@ -961,13 +1679,17 @@ mod tests {
     #[test]
     fn flat_colors_are_colodore() {
         // Through the delay line (average of an even and an odd line) the
-        // model gives back exactly the palette of the VIC
-        let (even, odd) = (palette_yuv(false, &pal()), palette_yuv(true, &pal()));
-        for i in 0..16 {
-            let avg: [f64; 3] = std::array::from_fn(|k| (even[i][k] + odd[i][k]) / 2.0);
-            let rgb = yuv_to_rgb(avg[0], avg[1], avg[2]).map(|c| to_display(to_light(c)).round() as u32);
-            let argb = 0xFF00_0000 | rgb[0] << 16 | rgb[1] << 8 | rgb[2];
-            assert_eq!(argb, C64_PALETTE[i], "color {i}");
+        // model gives back exactly the palette of the VIC, for every chip
+        // (the first revisions with their 5 lumas)
+        for chip in Chip::ALL {
+            let sig = Signal::of(chip);
+            let (even, odd) = (palette_yuv(false, &sig), palette_yuv(true, &sig));
+            for i in 0..16 {
+                let avg: [f64; 3] = std::array::from_fn(|k| (even[i][k] + odd[i][k]) / 2.0);
+                let rgb = yuv_to_rgb(avg[0], avg[1], avg[2]).map(|c| to_display(to_light(c)).round() as u32);
+                let argb = 0xFF00_0000 | rgb[0] << 16 | rgb[1] << 8 | rgb[2];
+                assert_eq!(argb, chip.palette()[i], "{chip:?} color {i}");
+            }
         }
     }
 
@@ -991,14 +1713,26 @@ mod tests {
         assert!((p.pixel_aspect() - 0.9357).abs() < 1e-4);
         // NTSC: 8.18 MHz, 7 samples every 4 pixels, 520 pixels per line =
         // 227.5 subcarrier cycles, pixel aspect 0.75
-        let n = Signal::of(Standard::Ntsc);
+        let n = Signal::of(Chip::Mos6567R8);
         assert!((n.dot_clock() - 8_181_818.2).abs() < 1.0);
         assert_eq!(n.samples, 706);
         assert!((520.0 * n.fsc / n.dot_clock() - 227.5).abs() < 1e-9);
         assert!((n.pixel_aspect() - 0.75).abs() < 1e-6);
+        // Old NTSC: 512 pixels = 224 cycles, no flip from line to line
+        let o = Signal::of(Chip::Mos6567R56A);
+        assert!((512.0 * o.fsc / o.dot_clock() - 224.0).abs() < 1e-9);
+        assert!(!o.line_flip() && n.line_flip() && p.line_flip());
+        // PAL-N: the NTSC pixel timing with the PAL-N subcarrier, 227.5
+        // cycles per line, and the 625-line geometry
+        let pn = Signal::of(Chip::Mos6572);
+        assert!(pn.pal() && pn.line_flip() && !n.pal());
+        assert!((520.0 * pn.fsc / pn.dot_clock() - 227.5).abs() < 1e-9);
+        // CPU clock = pixel clock / 8: 1,023,445 Hz (VICE: 1,023,440)
+        assert!((pn.dot_clock() / 8.0 - 1_023_440.0).abs() < 10.0);
+        assert!((pn.pixel_aspect() - 0.9008).abs() < 1e-4);
         // The monitor geometry agrees with the PAL pixel aspect
         let m = &C1084S_P1;
-        assert!((m.pixel_width() / m.line_pitch() - p.pixel_aspect()).abs() < 0.005);
+        assert!((m.pixel_width(&p) / m.line_pitch(&p) - p.pixel_aspect()).abs() < 0.005);
     }
 
     #[test]
@@ -1036,7 +1770,7 @@ mod tests {
 
     #[test]
     fn chroma_bandwidth() {
-        let h = chroma_fir(&C1084S_P1, Input::LumaChroma);
+        let h = chroma_fir(&pal(), &C1084S_P1, Input::LumaChroma);
         assert!((gain(&h, 0.0) - 1.0).abs() < 1e-6);
         let g = gain(&h, 1_300_000.0);
         assert!((g - 0.707).abs() < 0.03, "{g}");
@@ -1052,7 +1786,7 @@ mod tests {
             (&C1084S_D1, Input::LumaChroma, 5_200_000.0),
             (&C1084S_D1, Input::Composite, 4_400_000.0),
         ] {
-            let h = luma_fir(m, input);
+            let h = luma_fir(&pal(), m, input);
             assert!((gain(&h, 0.0) - 1.0).abs() < 1e-6);
             let g = gain(&h, bw);
             assert!((g - 0.707).abs() < 0.03, "{bw}: {g}");
@@ -1062,25 +1796,25 @@ mod tests {
     #[test]
     fn peaking_1901() {
         // +6 dB shelf: gain 1 at DC, about 2 well above 1.2 MHz
-        let h = luma_input_fir(&C1901, Input::LumaChroma);
+        let h = luma_input_fir(&pal(), &with(Model::C1901, Input::LumaChroma));
         assert!((gain(&h, 0.0) - 1.0).abs() < 1e-3);
         let g = gain(&h, 4_000_000.0);
         assert!(g > 1.8 && g < 2.05, "{g}");
         // No trap: the subcarrier stays in the luma with composite
-        assert!(gain(&luma_input_fir(&C1901, Input::Composite), FSC) > 1.8);
+        assert!(gain(&luma_input_fir(&pal(), &with(Model::C1901, Input::Composite)), FSC) > 1.8);
         // The 1084S has neither: luma/chroma passes as it is
-        let flat = luma_input_fir(&C1084S_P1, Input::LumaChroma);
+        let flat = luma_input_fir(&pal(), &with(Model::C1084SP1, Input::LumaChroma));
         assert!((gain(&flat, 3_000_000.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn chroma_band_pass_1901() {
         // Q 3.6 at 4.43 MHz: ±0.62 MHz, narrower than the 1.3 MHz of PAL
-        let h = chroma_fir(&C1901, Input::LumaChroma);
+        let h = chroma_fir(&pal(), &C1901, Input::LumaChroma);
         let g = gain(&h, FSC / (2.0 * 3.6));
         assert!(g > 0.6 && g < 0.72, "{g}");
         // In composite the band-pass is done on the signal instead
-        let c = chroma_fir(&C1901, Input::Composite);
+        let c = chroma_fir(&pal(), &C1901, Input::Composite);
         assert!((gain(&c, 1_300_000.0) - 0.707).abs() < 0.03);
     }
 
@@ -1100,18 +1834,24 @@ mod tests {
 
     #[test]
     fn models() {
-        assert_eq!(Model::parse("1084S"), Some(Model::C1084SP1));
-        assert_eq!(Model::parse("1084s-d1"), Some(Model::C1084SD1));
-        assert_eq!(Model::parse("1702"), Some(Model::C1702));
-        assert_eq!(Model::parse("1703"), None);
-        for model in [Model::C1084SP1, Model::C1084SD1, Model::C1901, Model::PhilipsCp90, Model::C1702] {
-            assert_eq!(Model::parse(model.name()), Some(model));
+        let pal = Standard::Pal;
+        assert_eq!(Model::parse("1084S", pal), Some(Model::C1084SP1));
+        assert_eq!(Model::parse("1084s-d1", pal), Some(Model::C1084SD1));
+        assert_eq!(Model::parse("1702", pal), Some(Model::C1702));
+        assert_eq!(Model::parse("1703", pal), None);
+        for model in Model::ALL {
+            assert_eq!(Model::parse(model.name(), pal), Some(model));
         }
+        // 1084s and tv are the sets of the standard
+        assert_eq!(Model::parse("1084s", Standard::Ntsc), Some(Model::C1084SPNtsc));
+        assert_eq!(Model::parse("tv", pal), Some(Model::PhilipsCp90));
+        assert_eq!(Model::parse("tv", Standard::NtscOld), Some(Model::SonyKv1311));
+        assert_eq!(Model::parse("tv", Standard::PalN), Some(Model::SontecCnt4442));
     }
 
     #[test]
     fn luma_trap() {
-        let h = luma_input_fir(&C1084S_P1, Input::Composite);
+        let h = luma_input_fir(&pal(), &with(Model::C1084SP1, Input::Composite));
         assert!((gain(&h, 0.0) - 1.0).abs() < 1e-6);
         assert!(gain(&h, FSC) < 0.005);
         assert!(gain(&h, 3_000_000.0) > 0.8);
@@ -1122,7 +1862,7 @@ mod tests {
     fn chroma_band_pass() {
         // Composite chroma: unity at the subcarrier, nothing at DC, the
         // band of a Q 2 circuit on the 1084S
-        let h = chroma_input_fir(&C1084S_P1, Input::Composite);
+        let h = chroma_input_fir(&pal(), &with(Model::C1084SP1, Input::Composite));
         assert!((gain(&h, FSC) - 1.0).abs() < 1e-6);
         assert!(gain(&h, 0.0) < 1e-3);
         // The analog response: 1 / sqrt(1 + Q²(x - 1/x)²) at x = f/FSC
@@ -1135,7 +1875,7 @@ mod tests {
     #[test]
     fn tv_shallow_trap() {
         // CP90 with SCART composite: the trap takes 6 dB at the subcarrier
-        let h = luma_input_fir(&PHILIPS_CP90, Input::Composite);
+        let h = luma_input_fir(&pal(), &with(Model::PhilipsCp90, Input::Composite));
         let g = gain(&h, FSC);
         assert!((g - 0.5).abs() < 0.02, "{g}");
     }
@@ -1154,7 +1894,7 @@ mod tests {
         assert!(gain(&h, 5.5e6) < 0.13);
         // RF on the TV: luma through the IF and the shallow trap, well
         // below the monitors above 3.5 MHz
-        let rf = luma_input_fir(&PHILIPS_CP90, Input::Rf);
+        let rf = luma_input_fir(&pal(), &with(Model::PhilipsCp90, Input::Rf));
         assert!(gain(&rf, 4e6) < 0.6 && gain(&rf, 2e6) > 0.9);
     }
 
@@ -1195,20 +1935,136 @@ mod tests {
     }
 
     #[test]
+    fn knobs() {
+        let c = Crt::apply(None, "1702,composite,tint=-20,color=15", Standard::Ntsc).unwrap().unwrap();
+        assert_eq!((c.model, c.input, c.knob(Knob::Tint), c.knob(Knob::Color)), (Model::C1702, Input::Composite, -20, 15));
+        assert!((c.tint() + (0.2 * TINT_RANGE).to_radians()).abs() < 1e-12);
+        assert!((c.color() - 1.15).abs() < 1e-12);
+        assert_eq!(c.describe(), "Commodore 1702, composite input, color +15, tint -20");
+        // Centre: no change
+        let n = Crt::new(Model::C1084SP1);
+        assert_eq!((n.brightness(), n.contrast(), n.color(), n.tint()), (0.0, 1.0, 1.0, 0.0));
+        // PAL sets have no tint; out of range and unknown controls
+        assert!(Crt::apply(Some(n), "tint=10", Standard::Pal).is_err());
+        assert!(Crt::apply(Some(n), "contrast=101", Standard::Pal).is_err());
+        assert!(Crt::apply(Some(n), "sharpness=10", Standard::Pal).is_err());
+        // A model without the knob drops it, the others are kept
+        let p = Crt::apply(Some(c), "contrast=30", Standard::Ntsc).unwrap().unwrap();
+        let q = Crt::apply(Some(p), "1084s-p1", Standard::Ntsc).unwrap().unwrap();
+        assert_eq!(q.knobs, [0, 30, 15, 0, 0]);
+        // The NTSC 1084S keeps the tint and has sharpness
+        let r = Crt::apply(Some(p), "1084s,sharpness=50", Standard::Ntsc).unwrap().unwrap();
+        assert_eq!((r.model, r.knobs), (Model::C1084SPNtsc, [0, 30, 15, -20, 50]));
+        assert!((r.peak_gain() - 1.5 * C1084S_P_NTSC.peak.unwrap().gain).abs() < 1e-12);
+        // Switches
+        let s = Crt::apply(Some(r), "comb=off,bars=off", Standard::Ntsc).unwrap().unwrap();
+        assert!(!s.comb && !s.bars);
+        assert!(Crt::apply(Some(q), "comb=off", Standard::Ntsc).is_err());
+    }
+
+    #[test]
+    fn line_delays() {
+        let sig = |c: Chip| Signal::of(c);
+        // PAL C64 on a PAL B/G set: its line is the delay line
+        assert_eq!(delay_offset(&sig(Chip::Mos6569), &C1084S_P1), 0);
+        // Drean on the PAL-N set: 227.5 against 229 cycles, 6 samples
+        assert_eq!(delay_offset(&sig(Chip::Mos6572), &SONTEC_CNT4442), -6);
+        // NTSC comb: the 6567R8's line is 1H; the 6567R56A's is 8 pixels
+        // shorter
+        assert_eq!(comb_offset(&sig(Chip::Mos6567R8), &SONY_KV1311CR), 0);
+        assert_eq!(comb_offset(&sig(Chip::Mos6567R56A), &SONY_KV1311CR), -14);
+        assert_eq!(delay_offset(&sig(Chip::Mos6567R8), &SONY_KV1311CR), 0);
+    }
+
+    #[test]
+    fn sontec_chroma_network() {
+        // As built it resonates near 5 MHz: the subcarrier comes in on the
+        // slope, lower than at 5 MHz, and turned
+        let f = SONTEC_CNT4442.chroma_filter;
+        let fsc = 3_582_056.25;
+        let mag = |f0: f64| {
+            let (re, im) = chroma_filter_response(f, fsc, f0);
+            (re * re + im * im).sqrt()
+        };
+        assert!(mag(4.99e6) > 0.95 && mag(fsc) < 0.6, "{} {}", mag(4.99e6), mag(fsc));
+        let (re, im) = chroma_filter_response(f, fsc, fsc);
+        assert!(im.atan2(re).abs() > 0.5);
+        // The decoder follows the phase: the tuned band-passes turn nothing
+        let n = Signal::of(Chip::Mos6572);
+        let tv = Crt::new(Model::SontecCnt4442);
+        assert!((chroma_phase(&n, &tv) - im.atan2(re)).abs() < 0.3);
+        assert!(chroma_phase(&pal(), &with(Model::C1084SP1, Input::Composite)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ntsc_if_filter() {
+        // NTSC M SAW: flat low frequencies through the Nyquist slope, the
+        // color carrier 1 dB down in the IF, the sound carrier (4.5 MHz)
+        // 19 dB
+        let n = Signal::of(Chip::Mos6567R8);
+        let h = if_response(&n, &SAW_M);
+        let gain = |f: f64| {
+            let (re, im) = h.iter().enumerate().fold((0.0, 0.0), |(re, im), (i, &c)| {
+                let w = 2.0 * PI * f * (i as f64 - SEP_HALF as f64) / n.sample_rate;
+                (re + c * w.cos(), im + c * w.sin())
+            });
+            (re * re + im * im).sqrt()
+        };
+        for f in [100e3, 500e3, 1e6, 2e6] {
+            assert!((gain(f) - 1.0).abs() < 0.1, "{f}: {}", gain(f));
+        }
+        assert!((gain(n.fsc) - 0.89).abs() < 0.1, "{}", gain(n.fsc));
+        assert!(gain(4.5e6) < 0.15);
+    }
+
+    #[test]
+    fn overscan() {
+        // Monitors show the whole screen, TVs about 93% of it
+        assert_eq!(C1084S_P1.visible(&pal(), 284), (1.0, 1.0));
+        let (w, h) = PHILIPS_CP90.visible(&pal(), 284);
+        assert!(w > 0.85 && w < 0.99 && h > 0.85 && h < 0.99, "{w} {h}");
+    }
+
+    #[test]
+    fn jail_bars_and_phosphor() {
+        for chip in Chip::ALL {
+            assert!(jail_bars(chip).iter().sum::<f64>().abs() < 1e-9);
+        }
+        // HMOS: a dip on the first pixel of the cell, a peak on pixel 4
+        let b = jail_bars(Chip::Mos8565);
+        assert!(b[0] < 0.0 && b[4] > 0.0);
+        // P31 green: no red, some blue
+        let [r, g, bl] = phosphor_rgb(C1900.phosphor.unwrap());
+        assert!(r == 0.0 && g == 1.0 && bl > 0.05 && bl < 0.3, "{r} {g} {bl}");
+    }
+
+    #[test]
+    fn monochrome_shows_every_standard() {
+        let m = Crt::new(Model::C1900);
+        for s in [Standard::Pal, Standard::Ntsc, Standard::NtscOld, Standard::PalN] {
+            assert!(m.check(s).is_ok());
+        }
+        assert!(Crt::new(Model::SontecCnt4442).check(Standard::Pal).is_err());
+        assert!(Crt::new(Model::SontecCnt4442).check(Standard::PalN).is_ok());
+    }
+
+    #[test]
     fn inputs() {
         assert!(Crt::new(Model::PhilipsCp90).input == Input::Rf);
         assert!(Crt::new(Model::C1901).input == Input::LumaChroma);
-        assert!(Crt { model: Model::C1084SP1, input: Input::Rf }.check(Standard::Pal).is_err());
-        assert!(Crt { model: Model::PhilipsCp90, input: Input::LumaChroma }.check(Standard::Pal).is_err());
-        assert!(Crt { model: Model::PhilipsCp90, input: Input::Composite }.check(Standard::Pal).is_ok());
+        assert!(Crt { input: Input::Rf, ..Crt::new(Model::C1084SP1) }.check(Standard::Pal).is_err());
+        assert!(Crt { input: Input::LumaChroma, ..Crt::new(Model::PhilipsCp90) }.check(Standard::Pal).is_err());
+        assert!(Crt { input: Input::Composite, ..Crt::new(Model::PhilipsCp90) }.check(Standard::Pal).is_ok());
     }
 
     #[test]
     fn palette_lookup() {
-        for (i, &c) in C64_PALETTE.iter().enumerate() {
-            assert_eq!(palette_index(c), i);
+        for palette in [&C64_PALETTE, &crate::vic::C64_PALETTE_OLD] {
+            for (i, &c) in palette.iter().enumerate() {
+                assert_eq!(palette_index(c, palette), i);
+            }
         }
         // Not a palette color: the nearest
-        assert_eq!(palette_index(0xFF7A7C7B), 12);
+        assert_eq!(palette_index(0xFF7A7C7B, &C64_PALETTE), 12);
     }
 }

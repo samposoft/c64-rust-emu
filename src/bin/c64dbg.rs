@@ -419,7 +419,7 @@ impl WindowLink {
     fn publish(&mut self, c64: &C64, paused: bool) {
         // With the CRT emulation the frame as the VIC drew it: the GPU
         // does the blending
-        let crt = c64.crt().map(|crt| CrtView { crt, blend: c64.blend(), frame: c64.frame_count });
+        let crt = c64.crt().map(|crt| CrtView { crt, chip: c64.chip(), blend: c64.blend(), frame: c64.frame_count, hdr: c64.hdr() });
         let fb = match (paused, crt) {
             (true, _) => c64.live_framebuffer(),
             (false, Some(_)) => c64.last_frame(),

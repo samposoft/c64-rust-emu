@@ -11,16 +11,16 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-use super::window::{layout, CrtView, Placement, Rect};
+use super::window::{layout, CrtShape, CrtView, Placement, Rect};
 use crate::crt::{self, Crt, Signal};
 use crate::timing::Standard;
-use crate::vic::{HEIGHT, WIDTH};
+use crate::vic::{Chip, HEIGHT, WIDTH};
 
 const SHADER: &str = include_str!("crt.wgsl");
 
 /// Layout of the parameters (floats): the values that change with the
 /// window, then the tables of the model.
-const U_PAL_Y: usize = 24;
+const U_PAL_Y: usize = 36;
 const U_PAL_UV: usize = U_PAL_Y + 16;
 const U_LUMA: usize = U_PAL_UV + 64;
 const U_CHROMA: usize = U_LUMA + crt::LUMA_PHASES * crt::LUMA_TAPS;
@@ -28,10 +28,15 @@ const U_LUMA_LPF: usize = U_CHROMA + crt::FIR_LEN.next_multiple_of(4);
 const U_MOD: usize = U_LUMA_LPF + crt::FIR_LEN.next_multiple_of(4);
 const U_LUMA_IN: usize = U_MOD + crt::SEP_LEN.next_multiple_of(4);
 const U_CHROMA_IN: usize = U_LUMA_IN + crt::SEP_LEN.next_multiple_of(4);
-const PARAMS: usize = U_CHROMA_IN + crt::SEP_LEN.next_multiple_of(4);
+const U_IF: usize = U_CHROMA_IN + crt::SEP_LEN.next_multiple_of(4);
+const U_COMB: usize = U_IF + crt::SEP_LEN.next_multiple_of(4);
+const U_BARS: usize = U_COMB + crt::SEP_LEN.next_multiple_of(4);
+const PARAMS: usize = U_BARS + 8;
 
 /// Format of the intermediate images (signal, light, halation).
 const SIGNAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Format of an HDR window (extended linear sRGB).
+const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The shader with the constants of the model for the signal of a standard
 /// in front.
@@ -40,22 +45,23 @@ fn shader_source(sig: &Signal) -> String {
     format!(
         "const W: i32 = {};\nconst H: i32 = {};\nconst NS: i32 = {};\nconst PH: i32 = {};\n\
          const LUMA_TAPS: i32 = {};\nconst LUMA_FIRST: i32 = {};\nconst FIR_HALF: i32 = {};\nconst SEP_HALF: i32 = {};\n\
-         const FIRST_LINE: i32 = {};\nconst LINES: i32 = {};\nconst PAL: bool = {};\nconst NV: u32 = {};\n\
+         const FIRST_LINE: i32 = {};\nconst LINES: i32 = {};\nconst PAL: bool = {};\nconst LINE_FLIP: bool = {};\nconst NV: u32 = {};\n\
          const U_PAL_Y: u32 = {U_PAL_Y};\nconst U_PAL_UV: u32 = {U_PAL_UV};\nconst U_LUMA: u32 = {U_LUMA};\n\
          const U_CHROMA: u32 = {U_CHROMA};\nconst U_LUMA_LPF: u32 = {U_LUMA_LPF};\nconst U_MOD: u32 = {U_MOD};\n\
          const U_LUMA_IN: u32 = {U_LUMA_IN};\nconst U_CHROMA_IN: u32 = {U_CHROMA_IN};\n\
+         const U_IF: u32 = {U_IF};\nconst U_COMB: u32 = {U_COMB};\nconst U_BARS: u32 = {U_BARS};\n\
          const CONTRAST: f32 = {:?};\nconst TUBE_GAMMA: f32 = {:?};\nconst DISPLAY_GAMMA: f32 = {:?};\n{SHADER}",
         WIDTH, std.fb_height(), sig.samples, sig.phases, crt::LUMA_TAPS, crt::LUMA_FIRST, crt::FIR_HALF, crt::SEP_HALF,
-        std.first_fb_line(), std.raster_lines(), sig.pal(), PARAMS / 4,
+        std.first_fb_line(), std.raster_lines(), sig.pal(), sig.line_flip(), PARAMS / 4,
         crt::CONTRAST as f32, crt::TUBE_GAMMA as f32, crt::DISPLAY_GAMMA as f32,
     )
 }
 
-/// Tables of the model: palette in YUV, luma of the VIC, filters of the
-/// monitor.
-fn tables(crt: Crt) -> Vec<f32> {
+/// Tables of the model for the signal of `chip`: palette in YUV, luma of
+/// the VIC, filters of the monitor.
+fn tables(crt: Crt, chip: Chip) -> Vec<f32> {
     let m = crt.model.monitor();
-    let sig = m.signal();
+    let sig = Signal::of(chip);
     let mut t = vec![0f32; PARAMS];
     let (even, odd) = (crt::palette_yuv(false, &sig), crt::palette_yuv(true, &sig));
     for c in 0..16 {
@@ -66,11 +72,18 @@ fn tables(crt: Crt) -> Vec<f32> {
     for (phase, k) in crt::luma_kernels(&sig).iter().enumerate() {
         t[U_LUMA + phase * crt::LUMA_TAPS..][..crt::LUMA_TAPS].copy_from_slice(k);
     }
-    t[U_CHROMA..][..crt::FIR_LEN].copy_from_slice(&crt::chroma_fir(m, crt.input));
-    t[U_LUMA_LPF..][..crt::FIR_LEN].copy_from_slice(&crt::luma_fir(m, crt.input));
+    t[U_CHROMA..][..crt::FIR_LEN].copy_from_slice(&crt::chroma_fir(&sig, m, crt.input));
+    t[U_LUMA_LPF..][..crt::FIR_LEN].copy_from_slice(&crt::luma_fir(&sig, m, crt.input));
     t[U_MOD..][..crt::SEP_LEN].copy_from_slice(&crt::modulator_fir(&sig));
-    t[U_LUMA_IN..][..crt::SEP_LEN].copy_from_slice(&crt::luma_input_fir(m, crt.input));
-    t[U_CHROMA_IN..][..crt::SEP_LEN].copy_from_slice(&crt::chroma_input_fir(m, crt.input));
+    t[U_LUMA_IN..][..crt::SEP_LEN].copy_from_slice(&crt::luma_input_fir(&sig, &crt));
+    t[U_CHROMA_IN..][..crt::SEP_LEN].copy_from_slice(&crt::chroma_input_fir(&sig, &crt));
+    if let Some(h) = crt::if_fir(&sig, &crt) {
+        t[U_IF..][..crt::SEP_LEN].copy_from_slice(&h);
+    }
+    t[U_COMB..][..crt::SEP_LEN].copy_from_slice(&crt::comb_luma_fir(&sig, &crt));
+    if crt.bars {
+        t[U_BARS..][..8].copy_from_slice(&crt::jail_bars(chip).map(|x| x as f32));
+    }
     t
 }
 
@@ -107,11 +120,12 @@ fn shader(device: &wgpu::Device, sig: &Signal) -> wgpu::ShaderModule {
 }
 
 /// Pipelines and images of the CRT emulation for the signal of one
-/// standard (lines and samples per line differ).
+/// standard (lines, samples per line, subcarrier phases differ).
 struct CrtSet {
     sig: Signal,
     vic: wgpu::RenderPipeline,
     cable: wgpu::RenderPipeline,
+    tuner: wgpu::RenderPipeline,
     separate: wgpu::RenderPipeline,
     decode: wgpu::RenderPipeline,
     glow_h: wgpu::RenderPipeline,
@@ -119,10 +133,11 @@ struct CrtSet {
     crt: wgpu::RenderPipeline,
     /// Palette indices of the frame (R8Uint).
     index_tex: wgpu::Texture,
-    /// Signal of the VIC, after the cable and after the set's input stage,
-    /// light of the last two frames, halation.
+    /// Signal of the VIC, after the cable, after the TV's IF filter and
+    /// after the set's input stage, light of the last two frames, halation.
     sig_tex: wgpu::TextureView,
     cab: wgpu::TextureView,
+    tun: wgpu::TextureView,
     sep: wgpu::TextureView,
     lin: [wgpu::TextureView; 2],
     glow: [wgpu::TextureView; 2],
@@ -130,7 +145,7 @@ struct CrtSet {
 
 impl CrtSet {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat, standard: Standard) -> CrtSet {
-        let sig = Signal::of(standard);
+        let sig = Signal::of(Chip::of(standard));
         let module = shader(device, &sig);
         let pipe = |entry: &str, format| pipeline(device, &module, entry, format);
         let rows = standard.fb_height();
@@ -138,6 +153,7 @@ impl CrtSet {
         CrtSet {
             vic: pipe("vic", SIGNAL_FORMAT),
             cable: pipe("cable", SIGNAL_FORMAT),
+            tuner: pipe("tuner", SIGNAL_FORMAT),
             separate: pipe("separate", SIGNAL_FORMAT),
             decode: pipe("decode_fs", SIGNAL_FORMAT),
             glow_h: pipe("glow_h", SIGNAL_FORMAT),
@@ -146,6 +162,7 @@ impl CrtSet {
             index_tex: texture(device, WIDTH, rows, wgpu::TextureFormat::R8Uint, false),
             sig_tex: image(),
             cab: image(),
+            tun: image(),
             sep: image(),
             lin: [image(), image()],
             glow: [image(), image()],
@@ -159,6 +176,10 @@ pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
+    /// The target is extended linear sRGB (HDR): the shaders write linear
+    /// light, 1 at SDR white, up to `headroom`.
+    hdr: bool,
+    headroom: f32,
     blit: wgpu::RenderPipeline,
     /// CRT emulation for the standard of the last frame drawn with it.
     crt: Option<CrtSet>,
@@ -170,17 +191,17 @@ pub struct Renderer {
     bar_tex: wgpu::Texture,
     /// Values of the parameters, with the tables for `tables_for`.
     values: Vec<f32>,
-    tables_for: Option<Crt>,
+    tables_for: Option<(Crt, Chip)>,
     /// Indices of the frame being uploaded and of the one in `lin[cur]`,
     /// with the settings it was computed with.
     indices: Vec<u8>,
     done: Vec<u8>,
-    done_crt: Option<Crt>,
+    done_crt: Option<(Crt, Chip)>,
     bytes: Vec<u8>,
     /// Lines of `screen_tex`: those of the last frame (284 PAL, 253 NTSC).
     screen_rows: usize,
-    /// CRT emulation asked for on a frame of another standard than its
-    /// monitor's: said once.
+    /// CRT emulation asked for with a set that does not decode the
+    /// machine's colors: said once.
     crt_warned: bool,
     cur: usize,
     /// `lin[cur ^ 1]` holds the previous frame.
@@ -207,8 +228,10 @@ fn view(t: &wgpu::Texture) -> wgpu::TextureView {
 }
 
 impl Renderer {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Renderer {
-        let blit = pipeline(&device, &shader(&device, &Signal::of(Standard::Pal)), "blit", format);
+    /// With `hdr` the target is extended linear sRGB (`Rgba16Float`).
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat, hdr: bool) -> Renderer {
+        let entry = if hdr { "blit_linear" } else { "blit" };
+        let blit = pipeline(&device, &shader(&device, &Signal::of(Chip::Mos6569)), entry, format);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: (PARAMS * 4) as u64,
@@ -224,7 +247,7 @@ impl Renderer {
         Renderer {
             screen_tex: texture(&device, WIDTH, HEIGHT, wgpu::TextureFormat::Bgra8Unorm, false),
             bar_tex: texture(&device, WIDTH, bar_h, wgpu::TextureFormat::Bgra8Unorm, false),
-            blit, crt: None, format, params, sampler, device, queue,
+            blit, crt: None, format, hdr, headroom: 1.0, params, sampler, device, queue,
             values: vec![0.0; PARAMS],
             tables_for: None,
             indices: Vec::new(),
@@ -283,48 +306,69 @@ impl Renderer {
 
     /// Parameters for the CRT drawn in `screen` (window pixels).
     fn set_params(&mut self, view: &CrtView, screen: &Rect, rows: usize) {
-        if self.tables_for != Some(view.crt) {
-            self.values = tables(view.crt);
-            self.tables_for = Some(view.crt);
+        if self.tables_for != Some((view.crt, view.chip)) {
+            self.values = tables(view.crt, view.chip);
+            self.tables_for = Some((view.crt, view.chip));
         }
         let m = view.crt.model.monitor();
-        let sig = m.signal();
+        let sig = Signal::of(view.chip);
+        let mono = m.phosphor;
         // Window pixels per mm on the tube, from the line pitch
-        let px_mm = screen.sy / m.line_pitch();
-        let samples_per_mm = sig.samples as f64 / WIDTH as f64 / m.pixel_width();
+        let px_mm = screen.sy / m.line_pitch(&sig);
+        let samples_per_mm = sig.samples as f64 / WIDTH as f64 / m.pixel_width(&sig);
         let v = &mut self.values;
+        // With HDR the mask as deep as on the tube, as far as the headroom
+        // allows
+        let mask = if m.triad_pitch == 0.0 { 0.0 } else if self.hdr { 1.0 } else { crt::MASK_STRENGTH };
         let dynamic = [
             (view.crt.input != crt::Input::LumaChroma) as u8 as f64, view.blend as u8 as f64,
-            crt::MASK_STRENGTH, m.glow.0,
+            mask, m.glow.0,
             screen.x, screen.y, screen.sx * WIDTH as f64, screen.sy * rows as f64,
             m.triad_pitch * px_mm, m.slot_pitch * px_mm, m.stripe, m.bridge,
-            m.beam_sigma.0, m.beam_sigma.1, m.glow.1 * samples_per_mm, m.glow.1 / m.line_pitch(),
+            m.beam_sigma.0, m.beam_sigma.1, m.glow.1 * samples_per_mm, m.glow.1 / m.line_pitch(&sig),
             crt::MASK_WHITE_LOSS,
         ];
-        let white = crt::white_balance(m);
+        // The guns balanced to the white point, or the phosphor of a
+        // monochrome tube
+        let white = mono.map_or(crt::white_balance(m), crt::phosphor_rgb);
         for (i, x) in dynamic.iter().chain(&white).enumerate() {
             v[i] = *x as f32;
         }
         v[20] = (view.frame & 1) as f32;
+        let crt = &view.crt;
+        let knobs = [crt.brightness(), crt.contrast(), crt.color(), crt.tint().cos(), crt.tint().sin()];
+        for (i, x) in knobs.iter().enumerate() {
+            v[21 + i] = *x as f32;
+        }
+        v[26] = if self.hdr { self.headroom.max(1.0) } else { 1.0 };
+        v[27] = self.hdr as u8 as f32;
+        v[28] = view.crt.comb_active() as u8 as f32;
+        v[29] = crt::comb_offset(&sig, m) as f32;
+        v[30] = crt::delay_offset(&sig, m) as f32;
+        v[31] = mono.is_some() as u8 as f32;
+        v[32] = crt::chroma_phase(&sig, &view.crt) as f32;
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.queue.write_buffer(&self.params, 0, &bytes);
     }
 
     /// Signal chain of a new frame (or of new settings) into `lin[cur]` of
     /// the CRT set.
-    fn run_signal(&mut self, encoder: &mut wgpu::CommandEncoder, screen: &[u32], crt: Crt, frame: u64) {
+    fn run_signal(&mut self, encoder: &mut wgpu::CommandEncoder, screen: &[u32], cv: &CrtView) {
+        let crt = cv.crt;
+        let palette = cv.chip.palette();
         self.indices.clear();
-        let mut last = (u32::MAX, 0u8);
+        let mut last: Option<(u32, u8)> = None;
         for &p in screen {
-            let c = p & 0xFF_FFFF;
-            if c != last.0 {
-                last = (c, crt::palette_index(c) as u8);
-            }
-            self.indices.push(last.1);
+            let index = match last {
+                Some((q, i)) if q == p => i,
+                _ => crt::palette_index(p, palette) as u8,
+            };
+            last = Some((p, index));
+            self.indices.push(index);
         }
         // The frame parity counts too: the NTSC subcarrier alternates
-        self.indices.push((frame & 1) as u8);
-        let same_crt = self.done_crt == Some(crt);
+        self.indices.push((cv.frame & 1) as u8);
+        let same_crt = self.done_crt == Some((crt, cv.chip));
         if self.indices == self.done && same_crt {
             return;
         }
@@ -334,7 +378,7 @@ impl Renderer {
             self.cur ^= 1;
         }
         std::mem::swap(&mut self.indices, &mut self.done);
-        self.done_crt = Some(crt);
+        self.done_crt = Some((crt, cv.chip));
         let set = self.crt.as_ref().expect("CRT set");
         let rows = screen.len() / WIDTH;
         self.queue.write_texture(
@@ -353,6 +397,11 @@ impl Renderer {
             let cable = self.bind(&set.cable, &[(0, params.clone()), (2, tv(&set.sig_tex))]);
             self.signal_pass(encoder, &set.cable, &cable, &set.cab);
             input = &set.cab;
+            if crt.input == crt::Input::Rf && crt.model.monitor().if_filter.is_some() {
+                let tuner = self.bind(&set.tuner, &[(0, params.clone()), (2, tv(&set.cab))]);
+                self.signal_pass(encoder, &set.tuner, &tuner, &set.tun);
+                input = &set.tun;
+            }
         }
         let separate = self.bind(&set.separate, &[(0, params.clone()), (2, tv(input))]);
         self.signal_pass(encoder, &set.separate, &separate, &set.sep);
@@ -368,10 +417,10 @@ impl Renderer {
     pub fn render(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, dw: u32, dh: u32,
                   screen: &[u32], bar: Option<&[u32]>, crt: Option<CrtView>) -> Placement {
         let rows = screen.len() / WIDTH;
-        // The monitor decodes one standard: the frame must be of it (after
-        // loading a state of the other standard it is drawn as it is)
+        // The set decodes one color system: the machine must send it (after
+        // loading a state of another standard the frame is drawn as it is)
         let crt = match crt {
-            Some(v) if v.crt.model.monitor().standard.fb_height() != rows => {
+            Some(v) if v.crt.check(v.chip.standard()).is_err() || v.chip.standard().fb_height() != rows => {
                 if !self.crt_warned {
                     self.crt_warned = true;
                     crate::notice!("WARN: the {} does not show this video standard: CRT emulation off.", v.crt.model.full_name());
@@ -384,11 +433,14 @@ impl Renderer {
             self.screen_tex = texture(&self.device, WIDTH, rows, wgpu::TextureFormat::Bgra8Unorm, false);
             self.screen_rows = rows;
         }
-        let aspect = crt.map(|v| v.crt.model.monitor().signal().pixel_aspect());
-        let placement = layout(dw as usize, dh as usize, rows, bar.is_some(), aspect);
+        let shape = crt.map(|v| {
+            let sig = Signal::of(v.chip);
+            CrtShape { aspect: sig.pixel_aspect(), visible: v.crt.model.monitor().visible(&sig, rows) }
+        });
+        let placement = layout(dw as usize, dh as usize, rows, bar.is_some(), shape);
         let screen_group = match &crt {
             Some(v) => {
-                let standard = v.crt.model.monitor().standard;
+                let standard = v.chip.standard();
                 if self.crt.as_ref().is_none_or(|set| set.sig.standard != standard) {
                     self.crt = Some(CrtSet::new(&self.device, self.format, standard));
                     self.done.clear();
@@ -396,7 +448,7 @@ impl Renderer {
                     self.have_prev = false;
                 }
                 self.set_params(v, &placement.screen, rows);
-                self.run_signal(encoder, screen, v.crt, v.frame);
+                self.run_signal(encoder, screen, v);
                 let set = self.crt.as_ref().expect("CRT set");
                 let prev = if self.have_prev { self.cur ^ 1 } else { self.cur };
                 let tv = wgpu::BindingResource::TextureView;
@@ -443,6 +495,12 @@ impl Renderer {
             pass.set_viewport(x0 as f32, y0 as f32, (x1 - x0).max(1.0) as f32, (y1 - y0).max(1.0) as f32, 0.0, 1.0);
         };
         viewport(&mut pass, &placement.screen, rows);
+        if let Some([x0, y0, x1, y1]) = placement.tube {
+            // Only the set's screen: an overscanning TV hides the edges
+            let (x0, y0) = (x0.max(0.0).round(), y0.max(0.0).round());
+            let (x1, y1) = (x1.min(dw as f64).round(), y1.min(dh as f64).round());
+            pass.set_scissor_rect(x0 as u32, y0 as u32, (x1 - x0).max(1.0) as u32, (y1 - y0).max(1.0) as u32);
+        }
         match (&crt, &self.crt) {
             (Some(_), Some(set)) => pass.set_pipeline(&set.crt),
             _ => pass.set_pipeline(&self.blit),
@@ -450,6 +508,7 @@ impl Renderer {
         pass.set_bind_group(0, &screen_group, &[]);
         pass.draw(0..3, 0..1);
         if let (Some(group), Some(r)) = (&bar_group, &placement.bar) {
+            pass.set_scissor_rect(0, 0, dw, dh);
             viewport(&mut pass, r, super::status::BAR_HEIGHT);
             pass.set_pipeline(&self.blit);
             pass.set_bind_group(0, group, &[]);
@@ -465,11 +524,21 @@ impl Renderer {
 /// Drawing into a window.
 pub struct WindowRenderer {
     surface: wgpu::Surface<'static>,
+    adapter: wgpu::Adapter,
     config: wgpu::SurfaceConfiguration,
-    /// Format of the views drawn into (without sRGB: the shaders apply the
-    /// display gamma themselves, and the plain image is copied as it is).
+    /// SDR configuration: format of the surface and of the views drawn
+    /// into (without sRGB: the shaders apply the display gamma themselves,
+    /// and the plain image is copied as it is).
+    sdr_format: wgpu::TextureFormat,
+    sdr_view_format: wgpu::TextureFormat,
     format: wgpu::TextureFormat,
     renderer: Renderer,
+    /// The surface can be extended linear sRGB (HDR), and it is now.
+    hdr_ok: bool,
+    hdr: bool,
+    hdr_warned: bool,
+    /// Frames drawn in HDR since the last query of the headroom.
+    headroom_age: u32,
 }
 
 impl WindowRenderer {
@@ -507,12 +576,54 @@ impl WindowRenderer {
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
-        Ok(WindowRenderer { surface, config, format, renderer: Renderer::new(device, queue, format) })
+        let hdr_ok = caps.color_spaces(HDR_FORMAT).contains(wgpu::SurfaceColorSpaces::EXTENDED_SRGB_LINEAR);
+        Ok(WindowRenderer {
+            surface, adapter, config, sdr_format: surface_format, sdr_view_format: format, format,
+            renderer: Renderer::new(device, queue, format, false),
+            hdr_ok, hdr: false, hdr_warned: false, headroom_age: 0,
+        })
+    }
+
+    /// Switches the surface between SDR and extended linear sRGB (HDR).
+    fn set_hdr(&mut self, hdr: bool) {
+        self.hdr = hdr;
+        let (format, view, space) = if hdr {
+            (HDR_FORMAT, HDR_FORMAT, wgpu::SurfaceColorSpace::ExtendedSrgbLinear)
+        } else {
+            (self.sdr_format, self.sdr_view_format, wgpu::SurfaceColorSpace::Auto)
+        };
+        self.config.format = format;
+        self.config.view_formats = if view != format { vec![view] } else { vec![] };
+        self.config.color_space = space;
+        self.format = view;
+        let (device, queue) = (self.renderer.device.clone(), self.renderer.queue.clone());
+        self.surface.configure(&device, &self.config);
+        self.renderer = Renderer::new(device, queue, view, hdr);
+        self.headroom_age = u32::MAX;
     }
 
     /// Draws in the window of size `size` (physical pixels); None if the
     /// window cannot be drawn now (minimized, being resized).
     pub fn draw(&mut self, size: (u32, u32), screen: &[u32], bar: Option<&[u32]>, crt: Option<CrtView>) -> Option<Placement> {
+        // HDR only for the CRT emulation, where the display has it
+        let want = crt.is_some_and(|v| v.hdr);
+        if want && !self.hdr_ok && !self.hdr_warned {
+            self.hdr_warned = true;
+            crate::notice!("WARN: this display has no HDR output: the CRT emulation stays in SDR.");
+        }
+        if (want && self.hdr_ok) != self.hdr {
+            self.set_hdr(want && self.hdr_ok);
+        }
+        if self.hdr {
+            // The headroom changes with the brightness of the display: asked
+            // about once a second
+            if self.headroom_age >= 50 {
+                let info = self.surface.display_hdr_info(&self.adapter);
+                self.renderer.headroom = info.headroom.and_then(|h| h.current).unwrap_or(1.0);
+                self.headroom_age = 0;
+            }
+            self.headroom_age += 1;
+        }
         let device = &self.renderer.device;
         if (self.config.width, self.config.height) != size {
             self.config.width = size.0;
@@ -541,24 +652,29 @@ impl WindowRenderer {
 
 // ── Images ───────────────────────────────────────────────────────────────────
 
-/// The C64 screen through the CRT emulation, as an ARGB image `height`
-/// pixels high (width from the pixel aspect of the standard), for frame
-/// number `frame` (its parity: the NTSC subcarrier alternates). Creates a
-/// device of its own: for screenshots, not for every frame.
-pub fn crt_image(screen: &[u32], crt: Crt, height: usize, frame: u64) -> Result<(Vec<u32>, usize, usize), String> {
-    let standard = crt.model.monitor().standard;
+/// The C64 screen, drawn by a VIC-II `chip`, through the CRT emulation, as
+/// an ARGB image `height` pixels high (width from the pixel aspect of the
+/// standard), for frame number `frame` (its parity: the NTSC subcarrier
+/// alternates). Creates a device of its own: for screenshots, not for every
+/// frame.
+pub fn crt_image(screen: &[u32], crt: Crt, chip: Chip, height: usize, frame: u64) -> Result<(Vec<u32>, usize, usize), String> {
+    let standard = chip.standard();
+    crt.check(standard)?;
     if screen.len() != standard.fb_len() {
-        return Err(format!("the {} does not show this video standard", crt.model.full_name()));
+        return Err(format!("the frame is not of a {} C64", standard.name()));
     }
     let rows = standard.fb_height();
-    let aspect = crt.model.monitor().signal().pixel_aspect();
+    let sig = Signal::of(chip);
+    let aspect = sig.pixel_aspect();
+    // Only the part on the set's screen (a TV overscans)
+    let (vw, vh) = crt.model.monitor().visible(&sig, rows);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         .map_err(|e| format!("no GPU: {e}"))?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
         .map_err(|e| e.to_string())?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
-    let (w, h) = ((height as f64 * WIDTH as f64 * aspect / rows as f64).round() as usize, height);
+    let (w, h) = ((height as f64 * WIDTH as f64 * vw * aspect / (rows as f64 * vh)).round() as usize, height);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
@@ -576,10 +692,10 @@ pub fn crt_image(screen: &[u32], crt: Crt, height: usize, frame: u64) -> Result<
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
-    let mut renderer = Renderer::new(device.clone(), queue.clone(), format);
+    let mut renderer = Renderer::new(device.clone(), queue.clone(), format, false);
     let mut encoder = device.create_command_encoder(&Default::default());
     renderer.render(&mut encoder, &view(&target), w as u32, h as u32, screen, None,
-                    Some(CrtView { crt, blend: false, frame }));
+                    Some(CrtView { crt, chip, blend: false, frame, hdr: false }));
     encoder.copy_texture_to_buffer(
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {

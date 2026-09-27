@@ -26,8 +26,8 @@ pub enum HostKey {
 /// the counts sit the characters of host keys held down (`char_down` /
 /// `char_up`: pressed for as long as the host key, at least `CHAR_MIN_FRAMES`,
 /// with the SHIFT state the character needs) and the character being typed
-/// from the queue (`push_char`: pasted text, the debugger), pressed for one
-/// frame.
+/// from the queue (`push_char`: pasted text, the debugger), pressed for
+/// `TYPE_FRAMES` frames.
 pub struct KeyMatrix {
     /// State seen by the C64: `matrix[col]` = row bitmask, bit 0 = pressed.
     /// Derived from `holds`, `typed` and `typed_shift` on every change.
@@ -40,14 +40,24 @@ pub struct KeyMatrix {
     /// same key, or a release without a press, does not change the counts.
     host_down: u32,
 
-    /// Keys of the character being typed, pressed for one frame.
+    /// Keys pressed now for the character being typed.
     typed: Vec<(usize, usize)>,
+    /// The character being typed: its keys, whether it changes the SHIFT
+    /// state (then SHIFT moves a frame before the keys and comes back a
+    /// frame after them), the frames since it started.
+    typed_keys: Vec<(usize, usize)>,
+    typed_lead: bool,
+    typed_frames: u8,
+    /// Keys of the last character typed, and the frames since they were
+    /// released.
+    released: Vec<(usize, usize)>,
+    released_frames: u8,
 
     /// SHIFT forced by the character being typed: `Some(true)` LSHIFT down,
     /// `Some(false)` both SHIFTs up, `None` as the counts say.
     typed_shift: Option<bool>,
 
-    // Queue of characters to "type" into the C64 (one char per frame)
+    // Queue of characters to "type" into the C64
     type_queue: VecDeque<char>,
 
     /// Characters of host keys held down, oldest first.
@@ -73,6 +83,17 @@ struct HeldChar {
 /// keyboard, such as GEOS, want to see it in more than one scan.
 pub const CHAR_MIN_FRAMES: u8 = 3;
 
+/// A character from the typing queue stays pressed this many frames (time
+/// slices of 1/50 or 1/60 s), and as long up before the same key is pressed
+/// again. The KERNAL scans the keyboard 60 times a second and takes a few
+/// hundred cycles to do it: with one frame a scan that falls across its
+/// start or end sees the key only in some columns, and loses it (on the
+/// 6567R56A the scan comes just before the end of the frame). For the same
+/// reason a character that needs SHIFT (or needs it up) moves SHIFT one
+/// frame before its keys and back one frame after them: a scan across the
+/// press would otherwise see the key without its SHIFT.
+pub const TYPE_FRAMES: u8 = 2;
+
 impl KeyMatrix {
     pub fn new() -> Self {
         Self {
@@ -80,6 +101,11 @@ impl KeyMatrix {
             holds: [[0; 8]; 8],
             host_down: 0,
             typed: Vec::new(),
+            typed_keys: Vec::new(),
+            typed_lead: false,
+            typed_frames: 0,
+            released: Vec::new(),
+            released_frames: 0,
             typed_shift: None,
             type_queue: VecDeque::new(),
             held: Vec::new(),
@@ -166,10 +192,16 @@ impl KeyMatrix {
 
     /// True if the typing queue still has keys to press or release.
     pub fn typing(&self) -> bool {
-        !self.type_queue.is_empty() || !self.typed.is_empty()
+        !self.type_queue.is_empty() || !self.typed_keys.is_empty()
     }
 
-    /// Queues a character to type, one per frame (pasted text, debugger).
+    /// A SHIFT is down in the matrix now.
+    fn shift_down(&self) -> bool {
+        self.matrix[1] & (1 << 7) == 0 || self.matrix[6] & (1 << 4) == 0
+    }
+
+    /// Queues a character to type (pasted text, debugger): `TYPE_FRAMES`
+    /// frames each.
     pub fn push_char(&mut self, c: char) {
         self.type_queue.push_back(c);
     }
@@ -235,19 +267,40 @@ impl KeyMatrix {
             h.frames = h.frames.saturating_add(1);
         }
         self.drop_released();
-        let released = std::mem::take(&mut self.typed);
-        self.typed_shift = None;
+        if !self.typed_keys.is_empty() {
+            self.typed_frames += 1;
+            // Lead frame (SHIFT only), the keys, lag frame (SHIFT only)
+            let lead = self.typed_lead as u8;
+            if self.typed_frames < lead + TYPE_FRAMES + lead {
+                let down = (lead..lead + TYPE_FRAMES).contains(&self.typed_frames);
+                self.typed = if down { self.typed_keys.clone() } else { Vec::new() };
+                self.rebuild();
+                return;
+            }
+            self.typed.clear();
+            self.released = std::mem::take(&mut self.typed_keys);
+            self.released_frames = 0;
+            // SHIFT stays as it is until the next character decides
+            self.rebuild();
+            self.typed_shift = None;
+        } else {
+            self.released_frames = self.released_frames.saturating_add(1);
+        }
 
         if let Some(&c) = self.type_queue.front() {
             let mapped = char_to_c64(c);
-            // A key just released stays up for one frame: pressed again right
-            // away, the keyboard scan would not see the release
+            // A key just released stays up as long as it was down: pressed
+            // again right away, the keyboard scan would not see the release
             // ("LL" would become "L")
-            let again = matches!(&mapped, Some((keys, _)) if keys.iter().any(|k| released.contains(k)));
+            let again = self.released_frames < TYPE_FRAMES
+                && matches!(&mapped, Some((keys, _)) if keys.iter().any(|k| self.released.contains(k)));
             if !again {
                 self.type_queue.pop_front();
                 if let Some((keys, need_shift)) = mapped {
-                    self.typed = keys;
+                    self.typed_lead = need_shift != self.shift_down();
+                    self.typed = if self.typed_lead { Vec::new() } else { keys.clone() };
+                    self.typed_keys = keys;
+                    self.typed_frames = 0;
                     self.typed_shift = Some(need_shift);
                 }
             }
@@ -445,7 +498,9 @@ fn letter_pos(c: char) -> Option<(usize, usize)> {
 
 // Keys held down on the host are not part of the state: a reloaded state
 // must not keep them pressed
-crate::snapshot::impl_state!(KeyMatrix { matrix, holds, host_down, typed, typed_shift, type_queue } skip { held, idle_frames });
+crate::snapshot::impl_state!(KeyMatrix {
+    matrix, holds, host_down, typed, typed_keys, typed_lead, typed_frames, released, released_frames, typed_shift, type_queue,
+} skip { held, idle_frames });
 
 #[cfg(test)]
 mod tests {
@@ -483,18 +538,59 @@ mod tests {
     }
 
     #[test]
-    fn typing_forces_shift_for_one_frame() {
+    fn typing_forces_shift_while_typed() {
         let mut k = KeyMatrix::new();
         k.update(HostKey::RShift, true);
         k.push_char('a');
         k.push_char('!');
-        k.advance_typing();                     // 'a': SHIFT up
-        assert!(down(&k, 1, 2) && !down(&k, 6, 4) && !down(&k, 1, 7));
-        k.advance_typing();                     // '!': LSHIFT + 1
-        assert!(down(&k, 7, 0) && down(&k, 1, 7) && !down(&k, 1, 2));
-        k.advance_typing();                     // queue empty: the held SHIFT is back
+        let (mut a, mut bang) = (0, 0);
+        for _ in 0..12 {
+            k.advance_typing();
+            // 'a' only with both SHIFTs up, '!' only with LSHIFT
+            if down(&k, 1, 2) {
+                assert!(!down(&k, 6, 4) && !down(&k, 1, 7) && !down(&k, 7, 0));
+                a += 1;
+            }
+            if down(&k, 7, 0) {
+                assert!(down(&k, 1, 7) && !down(&k, 1, 2));
+                bang += 1;
+            }
+        }
+        assert_eq!((a, bang), (TYPE_FRAMES, TYPE_FRAMES));
+        // The queue done: the held SHIFT is back
         assert!(down(&k, 6, 4) && !down(&k, 1, 7) && !down(&k, 7, 0));
         assert!(!k.typing());
+    }
+
+    #[test]
+    fn shift_moves_before_and_after_the_key() {
+        // '"' (SHIFT + 2): SHIFT a frame before the key and a frame after
+        let mut k = KeyMatrix::new();
+        k.push_char('"');
+        let mut seq = Vec::new();
+        for _ in 0..TYPE_FRAMES + 3 {
+            k.advance_typing();
+            seq.push((down(&k, 1, 7), down(&k, 7, 3)));
+        }
+        let mut want = vec![(true, false)];
+        want.extend(std::iter::repeat((true, true)).take(TYPE_FRAMES as usize));
+        want.extend([(true, false), (false, false)]);
+        assert_eq!(seq, want);
+    }
+
+    #[test]
+    fn repeated_char_is_released_between() {
+        let mut k = KeyMatrix::new();
+        k.push_char('l');
+        k.push_char('l');
+        let mut states = Vec::new();
+        for _ in 0..3 * TYPE_FRAMES {
+            k.advance_typing();
+            states.push(down(&k, 5, 2));
+        }
+        // Down, up as long, down again
+        let t = TYPE_FRAMES as usize;
+        assert!(states[..t].iter().all(|&d| d) && states[t..2 * t].iter().all(|&d| !d) && states[2 * t], "{states:?}");
     }
 
     #[test]
@@ -567,13 +663,26 @@ mod tests {
         k.push_char(named_key_char("left").unwrap());
         k.push_char(named_key_char("F2").unwrap());
         k.push_char(named_key_char("return").unwrap());
-        k.advance_typing();                     // CRSR left: RSHIFT + CRSR right, LSHIFT up
-        assert!(down(&k, 6, 4) && down(&k, 0, 2) && !down(&k, 1, 7));
-        k.advance_typing();                     // F2: LSHIFT + F1
-        assert!(down(&k, 1, 7) && down(&k, 0, 4) && !down(&k, 6, 4) && !down(&k, 0, 2));
-        k.advance_typing();                     // RETURN, without SHIFT
-        assert!(down(&k, 0, 1) && !down(&k, 1, 7) && !down(&k, 0, 4));
-        k.advance_typing();
+        let (mut left, mut f2, mut ret) = (0, 0, 0);
+        for _ in 0..16 {
+            k.advance_typing();
+            if down(&k, 0, 2) {
+                // CRSR left: RSHIFT + CRSR right, LSHIFT up
+                assert!(down(&k, 6, 4) && !down(&k, 1, 7));
+                left += 1;
+            }
+            if down(&k, 0, 4) {
+                // F2: LSHIFT + F1
+                assert!(down(&k, 1, 7) && !down(&k, 6, 4));
+                f2 += 1;
+            }
+            if down(&k, 0, 1) {
+                // RETURN, without SHIFT
+                assert!(!down(&k, 1, 7) && !down(&k, 6, 4));
+                ret += 1;
+            }
+        }
+        assert_eq!((left, f2, ret), (TYPE_FRAMES, TYPE_FRAMES, TYPE_FRAMES));
         assert!(!k.typing() && down(&k, 1, 7), "the held SHIFT is back");
         assert_eq!(named_key_char("nokey"), None);
     }

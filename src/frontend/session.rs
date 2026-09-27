@@ -46,22 +46,30 @@ pub struct MachineOptions {
     pub remote: Option<PathBuf>,
     /// Frame blending (`--blend`, `C64::set_blend`).
     pub blend: bool,
+    /// HDR output of the CRT emulation (`--hdr`, `C64::set_hdr`).
+    pub hdr: bool,
     /// CRT monitor emulation in the window: the arguments of `--crt`,
     /// `--composite` and `--rf`, in order (`crt`: resolved with the
     /// machine's standard, which may come later on the command line).
     pub crt_args: Vec<String>,
-    /// Video standard (`--ntsc`; PAL by default).
-    pub standard: crate::timing::Standard,
+    /// VIC-II, and with it the video standard (`--vic`, `--ntsc`; the PAL
+    /// 6569 by default).
+    pub chip: crate::vic::Chip,
 }
 
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--ntsc] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt MONITOR] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
+        "[--version] [--ntsc | --vic CHIP] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
   --ntsc       an NTSC C64 (VIC-II 6567R8, 1.023 MHz, 60 Hz, 263 lines) instead of PAL
+  --vic CHIP   the VIC-II, and with it the video standard: 6569 (PAL, the default),
+               6569r1 (first PAL C64s: 5 lumas), 8565 (PAL C64C: grey dots), 6567 (NTSC,
+               as --ntsc), 6567r56a (first NTSC C64s: 64 cycles, 262 lines, 5 lumas),
+               8562 (NTSC C64C), 6572 (PAL-N: the Drean C64 of Argentina, 65 cycles,
+               312 lines)
   --roms DIR   directory of kernal.rom, basic.rom, chargen.rom and dos1541.rom (default:
                roms/ next to the executable or in a directory above it, else ./roms)
   --reu KB     attach a REU (128, 256, 512 ... 16384 KB)
@@ -76,13 +84,19 @@ impl MachineOptions {
                joymouse (1351 in joystick mode, as the 1350), in the window only
   --blend      show every frame mixed with the previous one, as the eye sees a 50 Hz
                CRT: for pictures that alternate two frames (interlace, IFLI)
-  --crt MONITOR  show the screen as a real monitor does, on the GPU: the PAL signal of
-               the VIC-II and the picture tube of MONITOR, with the luma/chroma input:
-               1084s-p1 (or 1084s: Commodore 1084S-P1, Philips), 1084s-d1 (Daewoo),
-               1901 (Thomson), or the TV cp90 (or tv: Philips 15CE1510) through the RF
-               modulator; with --ntsc the 1702; off by default, window only
-  --composite  connect the monitor through composite video (implies --crt 1084s, or 1702)
-  --rf         connect a TV to the RF output, channel 36 (implies --crt tv)
+  --crt SET    show the screen as a real set does, on the GPU: the signal of the VIC-II
+               and the picture tube of SET, with its default input: for PAL 1084s (Commodore
+               1084S-P1), 1084s-d1, 1901 or the TV cp90 (Philips, RF); for NTSC 1702, 1084s
+               (the NTSC 1084S-P, comb filter) or the TV kv1311 (Sony Trinitron, RF, comb
+               filter); for PAL-N the TV cnt4442 (Sontec, RF); 1900 (green monochrome) for
+               all; tv is the TV of the machine's standard. Also its controls and switches,
+               comma-separated: brightness=N, contrast=N, color=N, tint=N (NTSC), sharpness=N
+               (NTSC 1084S), from -100 to 100 (0 the centre), comb=off, bars=off (no VIC-II
+               jail bars); e.g. --crt 1702,tint=-20. Off by default, window only
+  --composite  connect the set through composite video (implies --crt 1084s, or 1702)
+  --rf         connect a TV to the RF output (implies --crt tv)
+  --hdr        with --crt, on a display with HDR headroom (Apple EDR): the slot mask at
+               its full depth, its stripes brighter than white
   --remote     remote monitor: debugger commands from other programs (c64mcp, the
                MCP server for Claude) on a Unix socket, macOS and Linux only
   --remote-socket PATH  remote monitor on the socket PATH instead of the default one
@@ -104,8 +118,12 @@ impl MachineOptions {
                 None => { eprintln!("--reu needs the size in KB (128, 256, 512 ... 16384)"); std::process::exit(2); }
             },
             "--no-drive" => self.no_drive = true,
-            "--ntsc" => self.standard = crate::timing::Standard::Ntsc,
-            "--pal" => self.standard = crate::timing::Standard::Pal,
+            "--ntsc" => self.chip = crate::vic::Chip::Mos6567R8,
+            "--pal" => self.chip = crate::vic::Chip::Mos6569,
+            "--vic" => match rest.next().as_deref().and_then(crate::vic::Chip::parse) {
+                Some(c) => self.chip = c,
+                None => { eprintln!("--vic needs the VIC-II: {}", crate::vic::Chip::NAMES); std::process::exit(2); }
+            },
             "--sid" => match rest.next().as_deref().and_then(parse_sid_model) {
                 Some(m) => self.sid = Some(m),
                 None => { eprintln!("--sid needs the model: 6581, 8580 or 8580d (8580 with digiboost)"); std::process::exit(2); }
@@ -120,6 +138,7 @@ impl MachineOptions {
             }
             "--tape-sound" => self.tape_sound = true,
             "--blend" => self.blend = true,
+            "--hdr" => self.hdr = true,
             "--crt" | "--composite" | "--rf" => {
                 let value = match arg {
                     "--composite" => Some("composite".to_string()),
@@ -152,11 +171,12 @@ impl MachineOptions {
     /// standard.
     pub fn crt(&self) -> Result<Option<crate::crt::Crt>, String> {
         let mut crt = None;
+        let standard = self.chip.standard();
         for a in &self.crt_args {
-            crt = crate::crt::Crt::apply(crt, a, self.standard).map_err(|e| format!("--crt: {e}"))?;
+            crt = crate::crt::Crt::apply(crt, a, standard).map_err(|e| format!("--crt: {e}"))?;
         }
         if let Some(c) = crt {
-            c.check(self.standard).map_err(|e| format!("--crt: {e}"))?;
+            c.check(standard).map_err(|e| format!("--crt: {e}"))?;
         }
         Ok(crt)
     }
@@ -178,7 +198,7 @@ impl MachineOptions {
     /// the error is an invalid REU size.
     pub fn build(&self) -> Result<C64, String> {
         let mut c64 = C64::new();
-        c64.set_standard(self.standard)?;
+        c64.set_chip(self.chip)?;
         let roms = self.roms_dir.clone().unwrap_or_else(C64::default_roms_dir);
         for w in c64.load_roms_from_dir(&roms) {
             eprintln!("WARN: {w}");
@@ -189,6 +209,7 @@ impl MachineOptions {
         }
         c64.set_sid2(self.sid2)?;
         c64.set_blend(self.blend);
+        c64.set_hdr(self.hdr);
         c64.set_crt(self.crt()?);
         if self.tape_sound {
             c64.bus.tape.set_sound(Some(crate::tape::SOUND_VOLUME_DEFAULT));
@@ -389,7 +410,9 @@ impl Session {
             None => (self.screen(), None),
             Some(crt) => {
                 let fb = if self.paused() { self.c64.live_framebuffer() } else { self.c64.last_frame() };
-                (fb, Some(super::window::CrtView { crt, blend: self.c64.blend(), frame: self.c64.frame_count }))
+                (fb, Some(super::window::CrtView {
+                    crt, chip: self.c64.chip(), blend: self.c64.blend(), frame: self.c64.frame_count, hdr: self.c64.hdr(),
+                }))
             }
         }
     }

@@ -6,6 +6,7 @@ use crate::snapshot::{impl_state, impl_state_enum, Reader, State, Writer};
 use std::path::{Path, PathBuf};
 
 use crate::timing::Standard;
+use crate::vic::Chip;
 
 /// Kind of queued PRG.
 #[derive(Clone, Copy, PartialEq)]
@@ -36,8 +37,8 @@ pub struct StepResult {
 }
 
 pub struct C64 {
-    /// PAL (default) or NTSC machine (`set_standard`).
-    standard: Standard,
+    /// VIC-II of the machine, which sets its video standard (`set_chip`).
+    chip: Chip,
     pub cpu: Cpu,
     pub bus: Bus,
     /// Last complete frame (background + sprites): the one to present.
@@ -46,6 +47,8 @@ pub struct C64 {
     work_fb: Vec<u32>,
     /// Frame blending (`set_blend`): the previous frame as the VIC drew it.
     blend: Option<Vec<u32>>,
+    /// HDR output of the CRT emulation (`set_hdr`).
+    hdr: bool,
     /// CRT monitor emulation of the window frontends (`set_crt`).
     crt: Option<crate::crt::Crt>,
 
@@ -98,10 +101,11 @@ impl C64 {
         Self {
             cpu: Cpu::new(),
             bus: Bus::new(),
-            standard: Standard::Pal,
+            chip: Chip::Mos6569,
             framebuffer: vec![0xFF000000; WIDTH * HEIGHT],
             work_fb: vec![0xFF000000; WIDTH * HEIGHT],
             blend: None,
+            hdr: false,
             crt: None,
             pending_prg: None,
             prg_kind: PrgKind::Basic,
@@ -137,19 +141,42 @@ impl C64 {
         self.blend.is_some()
     }
 
-    pub fn standard(&self) -> Standard {
-        self.standard
+    /// HDR output of the CRT emulation, a setting of the window frontends:
+    /// on a display with headroom above white (Apple EDR) the slot mask is
+    /// shown at its full depth, its stripes brighter than white. Off by
+    /// default.
+    pub fn set_hdr(&mut self, on: bool) {
+        self.hdr = on;
     }
 
-    /// Video standard: PAL (VIC-II 6569, the default) or NTSC (6567R8),
-    /// with the clock, the raster and the framebuffer size (`fb_height`)
-    /// that go with it; the CIAs' TOD inputs (50 or 60 Hz mains), the SID,
-    /// the drive and the Datasette follow the clock. The machine is reset:
-    /// as changing the crystal and the VIC-II of a real C64.
+    pub fn hdr(&self) -> bool {
+        self.hdr
+    }
+
+    pub fn standard(&self) -> Standard {
+        self.chip.standard()
+    }
+
+    pub fn chip(&self) -> Chip {
+        self.chip
+    }
+
+    /// The machine's usual VIC-II for a video standard (`set_chip`): the
+    /// 6569 for PAL, the 6567R8 for NTSC.
     pub fn set_standard(&mut self, standard: Standard) -> Result<(), String> {
-        self.standard = standard;
-        self.bus.vic.standard = standard;
-        let len = standard.fb_len();
+        self.set_chip(Chip::of(standard))
+    }
+
+    /// VIC-II of the machine (6569 by default), with the video standard,
+    /// clock, raster and framebuffer size (`fb_height`) that go with it; the
+    /// CIAs' TOD inputs (50 or 60 Hz mains), the SID, the drive and the
+    /// Datasette follow the clock. The machine is reset: as changing the
+    /// crystal and the VIC-II of a real C64.
+    pub fn set_chip(&mut self, chip: Chip) -> Result<(), String> {
+        self.chip = chip;
+        self.bus.vic.chip = chip;
+        self.bus.vic.standard = chip.standard();
+        let len = chip.standard().fb_len();
         self.framebuffer = vec![0xFF000000; len];
         self.work_fb = vec![0xFF000000; len];
         if let Some(prev) = &mut self.blend {
@@ -163,12 +190,12 @@ impl C64 {
 
     /// Framebuffer height (the width is `vic::WIDTH`): 284 PAL, 253 NTSC.
     pub fn fb_height(&self) -> usize {
-        self.standard.fb_height()
+        self.standard().fb_height()
     }
 
     /// Gives the clock of the standard to the parts timed by it.
     fn apply_clocks(&mut self) -> Result<(), String> {
-        let s = self.standard;
+        let s = self.standard();
         let hz = s.clock_hz();
         self.bus.cia1.set_tod_input(hz, s.mains_hz());
         self.bus.cia2.set_tod_input(hz, s.mains_hz());
@@ -376,7 +403,12 @@ impl C64 {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // As VICE, the header says the machine's video standard
                 let mut tap = crate::tape::Tap::blank();
-                tap.video = (self.standard == Standard::Ntsc) as u8;
+                tap.video = match self.standard() {
+                    Standard::Pal => 0,
+                    Standard::Ntsc => 1,
+                    Standard::NtscOld => 2,
+                    Standard::PalN => 3,
+                };
                 (tap, true)
             }
             Err(e) => return Err(format!("Cannot read {path}: {e}")),
@@ -518,7 +550,7 @@ impl C64 {
         let rom = NAMES.iter().find_map(|n| std::fs::read(dir.join(n)).ok())
             .ok_or_else(|| format!("1541 ROM not found in {} ({})", dir.display(), NAMES.join(", ")))?;
         let mut drive = Box::new(crate::drive::Drive::new(&rom, 8)?);
-        drive.set_c64_clock(self.standard.clock_hz());
+        drive.set_c64_clock(self.standard().clock_hz());
         self.bus.drive = Some(drive);
         Ok(())
     }
@@ -933,7 +965,7 @@ impl C64 {
         }
 
         self.frame_elapsed += elapsed;
-        let frame_done = self.frame_elapsed >= self.standard.slice_cycles();
+        let frame_done = self.frame_elapsed >= self.standard().slice_cycles();
         if frame_done {
             self.frame_elapsed = 0;
             self.end_of_frame();
@@ -1098,7 +1130,7 @@ impl C64 {
             return Err(format!("invalid second SID address: ${base:04X} ($D420-$D7E0 or $DE00-$DFE0, in steps of $20)"));
         }
         let mut sid2 = Box::new(crate::sid::Sid::new());
-        sid2.set_clock(self.standard.clock_hz())?;
+        sid2.set_clock(self.standard().clock_hz())?;
         sid2.set_model(self.bus.sid.model(), self.bus.sid.digiboost());
         sid2.set_audio(self.bus.sid.audio_rate())?;
         sid2.sync_sampling(&self.bus.sid);
@@ -1171,7 +1203,7 @@ impl C64 {
     /// bursts but it is not a load; a load keeps the motor on for tens of
     /// seconds.
     pub fn tape_loading(&self) -> bool {
-        let second = self.standard.clock_hz();
+        let second = self.standard().clock_hz();
         self.bus.tape.moving_since().is_some_and(|t| self.bus.cycle - t >= second)
     }
 }
@@ -1218,7 +1250,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 19;
+const STATE_VERSION: u32 = 20;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
@@ -1252,8 +1284,8 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
 // Excluded: the audio buffer (rewritten every frame), the debugger hooks,
 // frame blending and the CRT emulation (display settings).
 impl_state!(C64 {
-    standard, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
+    chip, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
     disk, disk_path, disk_autoload, tape_path, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
     autoload_run,
     frame_elapsed, frame_count,
-} skip { audio_buf, audio_buf2, dbg, blend, crt });
+} skip { audio_buf, audio_buf2, dbg, blend, hdr, crt });

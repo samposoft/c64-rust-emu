@@ -35,6 +35,7 @@ cargo build --release
 ./target/release/c64 --crt 1901 prg/game.d64               # as on the 1901 (Thomson)
 ./target/release/c64 --rf prg/game.d64                     # on a home TV through the RF modulator
 ./target/release/c64 --ntsc prg/game.d64                   # an NTSC C64 (American, 60 Hz) instead of PAL
+./target/release/c64 --vic 8565 prg/game.d64               # the VIC-II of the C64C (grey dots)
 ./target/release/c64 --composite prg/game.d64              # the same monitor through composite video
 ./target/release/c64mcp                                    # MCP server for Claude, see below
 ```
@@ -270,79 +271,137 @@ the previous one, which is what the eye sees on the CRT; screenshots are
 blended too. Moving objects leave a half-bright trail, so it is off by
 default. `demo/earthrise` is an IFLI picture made for it.
 
-### PAL and NTSC: `--ntsc`
+### VIC-II and video standard: `--ntsc`, `--vic`
 
-The emulator is a PAL C64 (the European one) by default; `--ntsc` makes it
-an NTSC C64 (the American and Japanese one), in all the frontends and in the
-debugger. The two differ only in the crystal and in the VIC-II; ROMs, SID,
-CIAs and the 1541 are the same, and the KERNAL tells the two apart at boot
-(it writes the result at $02A6: 1 PAL, 0 NTSC) from the number of raster
-lines:
+The emulator is a PAL C64 (the European one, VIC-II 6569) by default;
+`--ntsc` makes it an NTSC C64 (the American and Japanese one, 6567R8), and
+`--vic CHIP` chooses any of the seven VIC-II models of VICE, in all the
+frontends and in the debugger. The chip sets the video standard: the
+machines differ only in the crystal and in the VIC-II; ROMs, SID, CIAs and
+the 1541 are the same, and the KERNAL tells PAL from NTSC at boot (it writes
+the result at $02A6: 1 PAL, 0 NTSC) from the number of raster lines.
 
-| | PAL | NTSC |
-|---|---|---|
-| VIC-II | 6569 | 6567R8 |
-| Clock | 985,248 Hz | 1,022,730 Hz |
-| Raster | 312 lines × 63 cycles | 263 lines × 65 cycles |
-| Frames per second | 50.12 | 59.83 |
-| Visible lines (screen) | 284 | 253 |
-| CIA TOD input (mains) | 50 Hz | 60 Hz |
+| `--vic` | Machine | Standard | Raster | Clock | Frames/s | Screen lines |
+|---|---|---|---|---|---|---|
+| `6569` (default) | PAL C64 | PAL | 312 lines × 63 cycles | 985,248 Hz | 50.12 | 284 |
+| `6569r1` | first PAL C64s (1982-83) | PAL | 312 × 63 | 985,248 Hz | 50.12 | 284 |
+| `8565` | PAL C64C and C64 II | PAL | 312 × 63 | 985,248 Hz | 50.12 | 284 |
+| `6567` (`--ntsc`) | NTSC C64 | NTSC | 263 × 65 | 1,022,730 Hz | 59.83 | 253 |
+| `6567r56a` | first NTSC C64s (1982-83) | old NTSC | 262 × 64 | 1,022,730 Hz | 60.99 | 253 |
+| `8562` | NTSC C64C | NTSC | 263 × 65 | 1,022,730 Hz | 59.83 | 253 |
+| `6572` | Drean C64 (Argentina) | PAL-N | 312 × 65 | 1,023,440 Hz | 50.47 | 284 |
 
-The 6567R8 is ported from VICE as the 6569 (the cycle table is converted
-from VICE's `vicii-chip-model.c`, `src/vic/tables.rs`): on its 65 cycles the
-sprites are fetched two cycles later and the line is 520 pixels long; the
-extra cycles fall in the right border and the retrace, so the 320×200
-display is where it is on PAL, with lower top and bottom borders. The screen
-shows lines 22-262 and then lines 0-11 of the next frame, which an NTSC
-monitor shows below them (the vertical retrace is in lines 12-21), as VICE
-does. The SID runs at the NTSC clock (the notes are 3.8% higher than PAL
-with the same values, as on the real machine), the drive and the Datasette
-follow the clock; TAP pulses are played as they are, as VICE does, and new
-tapes are marked NTSC. Programs written for PAL run as on a real NTSC C64:
-those that count on 63 cycles per line (demos, many European games) break
-their raster effects, and those timed by frames run 20% faster.
+The CIAs' TOD input is the 50 or 60 Hz of the mains of the country (60 Hz
+for NTSC, 50 Hz for PAL and PAL-N). The chips differ in three ways, all
+ported from VICE's x64sc (`src/vic/chip.rs`; the cycle tables are converted
+from VICE's `vicii-chip-model.c`, `src/vic/tables.rs`):
 
-It is checked against VICE with `x64sc -model ntsc`: the boot matches it
-instruction by instruction and cycle by cycle (1.4 million instructions after
-the RAM test), and the VIC test programs give the same screen, pixel for
-pixel, and the same raster, IRQ and stolen-cycle timings. On an NTSC C64 the CRT emulation (`--crt`) shows the Commodore 1702,
-the NTSC monitor of the C64 (see below).
+- **Timing**: on the 65 cycles of the 6567R8, 8562 and 6572 the sprites are
+  fetched two cycles later and the line is 520 pixels long; the 6567R56A
+  has 64 cycles and 512 pixels. The extra cycles fall in the right border and
+  the retrace, so the 320×200 display is where it is on PAL. The NTSC screen
+  shows lines 22 to the last and then the first lines of the next frame
+  (0-11, on the 6567R56A 0-12), which an NTSC monitor shows below them, as
+  VICE does: the top and bottom borders are lower than on PAL.
+- **Colors**: the HMOS chips of the C64C (8565, 8562) switch a color the
+  moment its register is written, where the NMOS ones take one more pixel;
+  but for the first pixel after the write they show light grey (the "grey
+  dots" of raster splits on the C64C). They also latch the mode bits of
+  $D011 and the sprite multicolor bits at other pixels, and read the graphics
+  address with the $D011 of the previous cycle.
+- **Luma**: the first revisions (6569R1, 6567R56A) have only 5 luma levels
+  instead of 9, so for example red and brown, or the three greys, are
+  closer; the palette is the colodore one with Pepto's levels for them.
+
+The SID runs at the machine's clock (on NTSC the notes are 3.8% higher than
+PAL with the same values, as on the real machine), the drive and the
+Datasette follow the clock; TAP pulses are played as they are, as VICE does,
+and new tapes are marked with the standard. Programs written for PAL run as
+on a real NTSC or Drean C64: those that count on 63 cycles per line (demos,
+many European games) break their raster effects, and on NTSC those timed by
+frames run 20% faster. `--vic` changes only the VIC-II: a whole C64C also
+has the 8580 SID (`--sid 8580`) and newer CIAs (not emulated), and VICE's
+old NTSC machine also has the first KERNAL (`--roms` with it).
+
+It is checked against VICE (`x64sc -model ntsc`, `-model drean`,
+`-VICIImodel`): for every chip the boot matches it instruction by
+instruction and cycle by cycle (0.9 million instructions after the RAM
+test), and the VIC test programs give the same screen, pixel for pixel, grey
+dots included, and the same raster, IRQ and stolen-cycle timings. The CRT
+emulation (`--crt`) shows each machine on a set of its color system (see
+below).
 
 ### Monitor and TV: `--crt`
 
 `--crt 1084s` (in the debugger `crt 1084s`, `crt off`) shows the screen as
 a real monitor does, emulating on the GPU the analog path from the VIC-II
 to the picture tube; `--rf` (`crt tv`) shows it on a home TV connected to
-the C64's antenna socket. Five sets, from their service manuals:
+the C64's antenna socket. Nine sets, from their service manuals and data
+books. For the PAL C64:
 
-| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `cp90` (or `tv`) | `1702` |
+| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `cp90` (or `tv`) |
+|---|---|---|---|---|
+| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) |
+| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna, channel 36), composite (SCART) |
+| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm |
+| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed); with RF the IF filter |
+| Luma peaking | none documented | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | none documented |
+| Luma trap (composite, RF) | full | full | none | shallow: -6 dB |
+| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | band-pass, Q about 3 |
+| Color decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | TDA3561A, 64 µs delay line |
+| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) |
+| Overscan | none (monitor) | none | none | 7% (assumed) |
+
+For the NTSC C64 (`--ntsc`, also the old 6567R56A), the Drean (PAL-N) and
+any of them:
+
+| | `1702` | `1084s` (NTSC: `1084s-p`) | `kv1311` (NTSC `tv`) | `cnt4442` (PAL-N `tv`) | `1900` |
 |---|---|---|---|---|---|
-| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) | Commodore monitor, JVC chassis (1984) |
-| Standard | PAL | PAL | PAL | PAL | NTSC (`--ntsc`) |
-| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna), composite (SCART) | luma/chroma, composite |
-| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm | 370FVB22, 13", in-line guns, vertical stripes, 0.64 mm |
-| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed); with RF the IF filter | not given (4.2 MHz, NTSC's, assumed) |
-| Luma peaking | none documented | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | none documented | fixed peaking coils, response not given |
-| Luma trap (composite, RF) | full | full | none | shallow: -6 dB | full, 3.58 MHz |
-| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | band-pass, Q about 3 | band-pass amplifier (Q about 3 assumed) |
-| Color decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | TDA3561A, 64 µs delay line | HA11247, NTSC: no delay line |
-| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) | not given (D65 assumed) |
+| Set | Commodore monitor, JVC chassis (1984) | Commodore 1084S-P for NTSC countries, Philips/Magnavox CM8500 chassis (1988) | Sony Trinitron KV-1311CR TV (about 1985) | Sontec CNT-4442 B TV (Argentina) | Commodore 1900 M, green monochrome (a Philips BM7502) |
+| Standard | NTSC | NTSC | NTSC | PAL-N | any (no color) |
+| Inputs | luma/chroma, composite | luma/chroma, composite | RF (channel 3), video (composite) | RF (channel 3) | composite |
+| Picture tube | 370FVB22, 13", in-line guns, vertical stripes, 0.64 mm | M34EAQ series, 13", slot mask, 0.42 mm | A34JHS10X, 13", aperture grille, 0.37 mm | not documented (the CP90's assumed) | M31-344GH, 12", P31 green phosphor, no mask |
+| Luma bandwidth | not given (4.2 MHz assumed) | RGB amplifier 8 MHz | 5 MHz (the PVM-1390 with the same tube) | 4.2 MHz (system N) | over 20 MHz |
+| Luma peaking | fixed coils, response not given | sharpness control: 2.34 MHz, Q 0.45 | fixed, about 2.5 MHz | none documented | none |
+| Luma/chroma separation (composite, RF) | 3.58 MHz trap | 1H comb filter ("comb defeat" switch: then a 3.58 MHz trap) | 1H comb filter | ceramic 3.58 MHz trap, very narrow | none: the subcarrier stays in the picture |
+| Chroma | band-pass amplifier (Q about 3 assumed) | band-pass (Q about 2 assumed) | band-pass T352 (Q about 3 assumed) | a band-pass tuned to 5 MHz (82 pF into 5.6 µH ∥ 100 pF) | — |
+| Color decoder | HA11247 | NTSC decoder, 7.16 MHz crystal | Sony CX848 | TDA3562A, glass delay line of 63.930 µs | — |
+| White point | not given (D65 assumed) | not given (D65 assumed) | 9300 K (the PVM-1390) | illuminant C (BT.470 for N/PAL) | the phosphor's green |
+| Overscan | none | none | 7% ("slight overscan") | 7% (assumed) | none |
+| Controls | brightness, contrast, color, tint | brightness, contrast, color, tint, sharpness | picture, bright, color, hue | brightness, contrast, color | brightness, contrast |
 
-A monitor decodes one standard, as the real ones: the PAL sets go with the
-PAL C64, the 1702 with the NTSC one (`--ntsc --crt 1702`, or just `--ntsc
---crt lc`); the other pairs are refused (the picture would be in black and
-white). The NTSC signal has its own subcarrier (3.58 MHz: 7 samples every 4
-pixels) and no delay line; the 263 lines of a frame end half a subcarrier
-cycle off, so in composite the color fringes alternate from frame to frame
-(the dot crawl of NTSC), where on PAL they stand still. The chroma of the
-6567 is assumed to be that of the 6569 (no measurements were found; NTSC
-monitors have a tint control), and the C64's modulator network is tuned to
-3.58 MHz. The NTSC pixel is narrower (aspect 0.75).
+A color set decodes one standard, as the real ones: the PAL sets go with the
+PAL C64, the NTSC ones with the NTSC C64 (`--ntsc --crt 1702`, or just
+`--ntsc --crt lc`), the Sontec with the Drean (`--vic 6572 --rf`); the
+other pairs are refused (the picture would be in black and white). `1084s`
+and `tv` are the sets of the machine's standard. The monochrome 1900 shows
+any of them, without color. The signals differ:
+
+- **PAL**: subcarrier 4.43 MHz, 9 samples every 4 pixels; the C64's line is
+  283.5 subcarrier cycles, as long as the PAL delay line (63.943 µs), so the
+  delay line averages each line with the one exactly above it, and the color
+  artifacts are the same in every frame.
+- **NTSC**: subcarrier 3.58 MHz, 7 samples every 4 pixels, no delay line;
+  the 6567R8's line is 227.5 cycles, exactly the 1H of NTSC, and the 263
+  lines of a frame end half a cycle off, so in composite the color fringes
+  alternate from frame to frame (the dot crawl of NTSC). The 6567R56A's line
+  is 224 cycles, a whole number: its artifacts do not alternate from line to
+  line but line up in vertical stripes, and in a comb filter the previous
+  line comes 3.5 cycles (8 pixels) off, which still separates the colors of
+  flat areas but smears their vertical edges. The chroma of the 6567 is
+  assumed to be that of the 6569 (no measurements were found; NTSC sets have
+  a tint control), and the C64's modulator network is tuned to 3.58 MHz. The
+  NTSC pixel is narrower (aspect 0.75).
+- **PAL-N** (Drean): subcarrier 3.58 MHz as NTSC, but PAL, with 312 lines;
+  its 520-pixel line is 227.5 cycles (63.51 µs), shorter than the 229 cycles
+  (63.930 µs) of a PAL-N delay line, so the decoder averages each line with
+  the chroma of the previous one 3.4 pixels to the left: a colored fringe
+  on the vertical edges of colors. Pixel aspect 0.90.
 
 The monitors are connected by default through their separate luma/chroma
-inputs (the 3-RCA cable, like S-Video), the TV through RF; `--composite`
+inputs (the 3-RCA cable, like S-Video), the TVs through RF; `--composite`
 (`crt composite`, `crt lc`, `crt rf`) chooses another input the set has.
-With the C64 the two 1084S differ little: the D1 has a slightly softer
+With the C64 the two PAL 1084S differ little: the D1 has a slightly softer
 luma, and its smaller picture (260 × 186 mm) makes the mask a little coarser
 relative to the pixels. (It was known as the sharpest of the family with
 the Amiga's RGB input, 10-15 MHz, which the C64 does not use.) The 1901 is
@@ -351,72 +410,114 @@ light steps; its narrow chroma band-pass makes colors bleed more and fades
 the color of thin details; its white is colder (bluish next to a D65
 display). Its composite input needs an internal jumper, and having no luma
 trap it keeps the subcarrier in the luma, as a fine dot pattern over the
-colored areas, which also look brighter. The TV is the softest picture: RF
-limits the luma to about 3.5 MHz, its shallow trap leaves a dot pattern in
-colored areas and color fringes on fine detail (yellow text on blue turns
-whitish), and its mask is coarser.
+colored areas, which also look brighter. The CP90 TV is the softest
+picture: RF limits the luma to about 3.5 MHz, its shallow trap leaves a dot
+pattern in colored areas and color fringes on fine detail (yellow text on
+blue turns whitish), and its mask is coarser.
+
+The NTSC 1084S and the Sony TV separate luma and chroma of a composite
+signal with a comb filter: the chroma is half the difference between the
+line and the one above it, through a 1H delay line, the luma the rest. On
+flat areas (the chroma flips from line to line) this takes all the chroma
+out of the luma, with no dot pattern and no loss of luma detail, where a
+trap removes both; it fails on vertical color edges, which get a pattern
+for one line. The 1084S's "comb defeat" switch (`crt comb=off`) goes back to
+its trap. The Sontec's trap is a ceramic resonator, deep but very narrow:
+the sidebands of the chroma stay in the luma as a coarse pattern. Its
+chroma band-pass is tuned to 5 MHz, as its service course notes (the maker
+kept the PAL B/G values): the subcarrier comes in on its slope, at a fifth
+of the gain of the peak and turned by 165°, which the decoder follows by
+locking to the burst, with its upper sideband stronger than the lower one. The 1900 has no trap and no
+decoder: the chroma of colored areas shows as a fine pattern on the green,
+and with its 20 MHz amplifier and thin beam the text is sharp, with dark
+gaps between the lines.
+
+The front-panel knobs of each set (`crt tint=-20`, `--crt 1702,color=20`)
+go from -100 to 100; 0 is the centre click-stop position, where the model
+gives the colodore colors. Brightness moves the black level by up to a
+quarter of white, contrast changes the gain from half to twice, color the
+chroma from none to twice, tint (NTSC) turns the hue up to 45° (to the
+left towards red, to the right towards green), sharpness (NTSC 1084S) the
+peaking from none to twice: the manuals give only the direction of each
+knob, so the ranges are estimates.
+
+The TVs overscan: they scan the picture about 7% beyond the edges of the
+screen (Sony's "normal scan"; the service manuals only say "slight
+overscan"), so part of the border does not show. The monitors are set to
+show all of it.
 
 The model is in `src/crt.rs`, the shaders in `src/frontend/crt.wgsl`; it was
 built from published measurements, schematics and service manuals, not by
 comparison with VICE:
 
 - **VIC-II**: every color is a luma level and a chroma angle (Pepto's
-  "colodore" model, the one the palette comes from). The luma output rises
-  in about 1.5 pixels with a 12% overshoot, as measured on a real C64, so
-  thin bright lines lose some brightness and edges ring slightly. The chroma
-  phase differs by 13° between even and odd raster lines (measured on the
-  6569R5: 11-16°).
-- **C64 output**: the signal is sampled at four times the PAL subcarrier
-  (the C64's crystal, 17.73 MHz: 9 samples every 4 pixels). A C64 line is
-  283.5 subcarrier cycles, so the color artifacts are the same in every frame
-  (no dot crawl). The composite and RF outputs come out of the RF modulator,
-  whose luma network (Service Manual, modulator 251696: L2 ∥ 220 pF with
-  330 pF to ground) raises the luma by about 3 dB around 2 MHz and cuts it at
-  the subcarrier; it is taken as tuned to 4.43 MHz (its coil is adjustable).
-  Luma and chroma then share one signal, and fine luma detail near the
-  subcarrier turns into color fringes (cross-color) in the set.
-- **RF**: the modulator sends both sidebands of channel 36; in the TV the IF
-  filter (a PAL B/G SAW, EPCOS K2966M: Nyquist slope at 38.9 MHz, color
-  carrier 3 dB down, sound shelf 20 dB down) keeps the low frequencies flat
-  and rolls the luma off above about 4 MHz. With correct tuning the sound
-  carrier (5.5 MHz) stays about 45 dB below the picture and the noise of a
-  short cable about 50-60 dB: neither would show, and they are not modelled.
-- **Set**: the luma goes through the IF filter (RF), the trap (composite
-  signal) and the peaking of the set, if it has them, and the luma amplifier
-  limits the bandwidth (table above). The chroma, taken out by its band-pass
-  (composite signal), is limited to about 1.3 MHz or less, so colors bleed
-  horizontally, and the 64 µs delay line averages the chroma of each line
-  with the previous one, which cancels the odd-line phase error and halves
-  the vertical color resolution. The light of the three guns is balanced to
-  the set's white point.
-- **Picture tube**: the C64 draws 312 lines without interlace, so every
+  "colodore" model, the one the palette comes from; 5 lumas on the first
+  revisions). The luma output rises in about 1.5 pixels with a 12%
+  overshoot, as measured on a real C64, so thin bright lines lose some
+  brightness and edges ring slightly. The chroma phase differs by 13°
+  between even and odd raster lines on the PAL chips (measured on the
+  6569R5: 11-16°). The VIC-II's own AEC and PHI0 leak into its luma output:
+  the "jail bars", faint vertical stripes 8 pixels apart, the same on every
+  line and in the border (as measured on frame grabs of real C64s: on the
+  8565 a dark and a bright dot per character, about 3% peak to peak; on the
+  NMOS chips a broader pattern, about 2%). They show most on the sharp
+  monitors, hardly through RF; `crt bars=off` removes them, as the LumaFix64
+  mod does.
+- **C64 output**: the signal is sampled at four times the subcarrier (the
+  C64's crystal: 9 samples every 4 pixels on PAL, 7 on the others). The
+  composite and RF outputs come out of the RF modulator, whose luma network
+  (Service Manual, modulator 251696: L2 ∥ 220 pF with 330 pF to ground)
+  raises the luma by about 3 dB around 2 MHz and cuts it at the subcarrier;
+  it is taken as tuned to the subcarrier (its coil is adjustable). Luma and
+  chroma then share one signal, and fine luma detail near the subcarrier
+  turns into color fringes (cross-color) in the set.
+- **RF**: the modulator sends both sidebands; in the TV the IF filter keeps
+  the low frequencies flat and rolls the luma off above about 3.5-4 MHz (PAL
+  B/G: an EPCOS K2966M SAW, Nyquist slope at 38.9 MHz, color carrier 3 dB
+  down, sound shelf 20 dB down; NTSC and N: an EPCOS M1967M, 45.75 MHz,
+  color carrier 1 dB down, sound 19 dB down: the TVs' own SAWs are known
+  only by the makers' part numbers). With correct tuning the sound carrier
+  stays about 45 dB below the picture and the noise of a short cable about
+  50-60 dB: neither would show, and they are not modelled.
+- **Set**: the luma goes through the IF filter (RF), the comb filter or the
+  trap (composite signal) and the peaking of the set, if it has them, and the
+  luma amplifier limits the bandwidth (tables above). The chroma, taken out
+  by its band-pass or comb (composite signal), is limited to about 1.3 MHz
+  or less, so colors bleed horizontally; in PAL sets the delay line averages
+  the chroma of each line with the previous one, which cancels the odd-line
+  phase error and halves the vertical color resolution. The light of the
+  three guns is balanced to the set's white point, or is the phosphor's.
+- **Picture tube**: the C64 draws its lines without interlace, so every
   line is a separate beam with dark gaps between the lines; the beam widens
   with brightness (thin scanlines on dark colors, almost none on bright
-  ones). The light then goes through the slot mask, at its real size
-  relative to the picture, with a little halation in the glass. The C64
-  pixels have the PAL aspect (0.936: narrower than tall).
+  ones). The light then goes through the slot mask (or the Trinitron's
+  aperture grille), at its real size relative to the picture, with a little
+  halation in the glass. The C64 pixels have the aspect of the standard
+  (0.936 PAL: narrower than tall).
 
 On large areas of one color the result is the colodore palette, within one
-step out of 255 (checked by a regression test, which renders every color
-through the whole chain), so the colors do not change: only the edges, the fine
-detail and the texture do. The 1901 has them balanced to its 7500 K white;
-on the TV the subcarrier left by its shallow trap makes colored areas up to
-3 steps brighter. The width of the beam, the shape of the mask slots, the
-halation and the Q of the traps are estimates, chosen by comparing with
-photos of real 1084S monitors, and are the same for all the sets (their
-manuals say nothing about them); the 1901's mask is assumed to be a slot
-mask as well (in-line guns; the manual only gives the pitch). The mask of a
-real tube is dark between the phosphor stripes, with the stripes much
-brighter than white on average; a normal display cannot show that, so the
-mask is applied at half depth, and less on the brightest colors, which come
-out slightly darker (white is about 250 instead of 255). It shows best in
-fullscreen or at a large size: when the triads are smaller than about 3
-pixels of the display only their fine color stripes remain. The picture is
-shown whole, without the overscan of the real sets (a TV would cut part of
-the border), and flat.
+step out of 255 (checked by a test that renders every color through
+the whole chain of every color set), so the colors do not change: only the
+edges, the fine detail and the texture do. The 1901 and the Sony have them
+balanced to their colder white, the Sontec to illuminant C; on the TVs the
+subcarrier left by their traps makes colored areas up to 3 steps brighter.
+The width of the beam, the shape of the mask slots, the halation and the Q
+of the traps are estimates, chosen by comparing with photos of real 1084S
+monitors, and are the same for all the color sets (their manuals say
+nothing about them). The mask of a real tube is dark between the phosphor
+stripes, with the stripes much brighter than white on average; a normal
+display cannot show that, so the mask is applied at half depth, and less on
+the brightest colors, which come out slightly darker (white is about 250
+instead of 255). With `--hdr` (debugger `hdr on`), on a display with
+headroom above white (the EDR of Apple displays: the headroom is asked of
+the system about once a second) the mask is shown at its full depth, its
+stripes brighter than white, as far as the headroom allows; the picture up
+to white stays the same. It shows best in fullscreen or at a large size:
+when the triads are smaller than about 3 pixels of the display only their
+fine color stripes remain. The picture is flat.
 
 With `--blend` the GPU averages the light of the last two frames. The
-screenshot through the monitor is `screenshot file.png crt [height]` in the
+screenshot through the set is `screenshot file.png crt [height]` in the
 debugger (default 1136 pixels high). `c64term` has no CRT emulation.
 
 ### Window title and status bar
@@ -445,7 +546,8 @@ fullscreen):
   stops the machine);
 - second row: inserted tape (T), disk (D) and cartridge (C), with `*`
   when there are changes not yet written to the file; on the right the SID
-  (`6581x2` with the second one), `NTSC` on an NTSC machine, REU and, with
+  (`6581x2` with the second one), the VIC-II if not the 6569 (`NTSC`,
+  `NTSC R56A`, `NTSC 8562`, `PAL-N`, `8565`, `6569R1`), REU and, with
   several media on the command line, which one is inserted (`F8 2/3`);
 - third row: the emulator's latest message for a few seconds (long ones
   scroll), otherwise the key reminders.
@@ -466,8 +568,8 @@ they are mixed as in VICE.
 
 ## Emulation status
 
-Microcycle 6510 CPU with BA/AEC from the VIC, cycle-exact VIC-II 6569 (PAL)
-and 6567R8 (NTSC) ported from VICE's x64sc core (c/g/sprite accesses on the chip's cycles, the
+Microcycle 6510 CPU with BA/AEC from the VIC, cycle-exact VIC-II (the seven
+models of VICE: 6569, 6569R1, 8565, 6567R8, 6567R56A, 8562, 6572) ported from VICE's x64sc core (c/g/sprite accesses on the chip's cycles, the
 three BA cycles in which the c-access reads $FF as in FLI, borders, sprites
 with DMA, expansion and crunch, and the drawing pipeline: every register
 write takes effect on the same pixel as in VICE), open bus (reads of
@@ -665,15 +767,15 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 - Freezer and utility cartridges (see above).
 - Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
   expansions; NIB/P64 images not supported.
-- Video standard: PAL (6569) and NTSC (6567R8) only; no old NTSC (6567R56A,
-  64 cycles and 262 lines), PAL-N (Drean) or the grey dots of the 8565/8562.
-- Monitor: only the Commodore 1084S-P1, 1084S-D1, 1901 and the Philips
-  CP90 TV (PAL); no 1701/1702 PAL (their PAL schematics are not available),
-  for NTSC only the 1702 (no NTSC 1084S or TV), no tint control, no HDR output (it would allow the full
-  depth of the slot mask), no VIC-II "jail bars"; the peaking of the 1084S
-  and of the 1901's video output stage is not modelled (the manuals give no
-  values for it); on the TV no sound carrier, noise, fine tuning or
-  overscan.
+- VIC-II: no light pen (the registers read 0) and no C64C CIAs (6526A).
+- Monitor and TV: no 1701/1702 PAL (their PAL schematics are not
+  available) and no 1802 (its manual gives neither tube nor pitch); the
+  peaking of the PAL 1084S and of the 1901's video output stage is not
+  modelled (the manuals give no values for it); on the TVs no sound
+  carrier, noise or fine tuning (with a good signal they would not show),
+  no color killer or burst processing (the decoders lock to the burst
+  ideally); the picture tubes are flat, without geometry or convergence
+  errors.
 - Tape: no fine speed adjustment (in VICE it is 0 by default); buttons are
   pressed automatically only on KERNAL messages (otherwise there is the
   debugger's `tape` command); only the first file is loaded from T64s.

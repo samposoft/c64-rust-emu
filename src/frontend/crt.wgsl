@@ -3,7 +3,7 @@
 
 // Window drawing and CRT monitor emulation (model and constants in
 // src/crt.rs). The constants W, H, NS, PH, LUMA_TAPS, LUMA_FIRST, FIR_HALF,
-// SEP_HALF, FIRST_LINE, LINES, PAL, the offsets U_* into the parameters and
+// SEP_HALF, FIRST_LINE, LINES, PAL, LINE_FLIP, the offsets U_* into the parameters and
 // the gammas are prepended by frontend::gpu, for the machine's standard.
 // Signal passes run on NS samples per line (PH every 4 pixels: 9 PAL, 7
 // NTSC).
@@ -12,9 +12,10 @@
 // lines) except the last:
 //   vic      palette indices → VIC-II output: luma, chroma U/V, modulated chroma
 //   cable    composite and RF: the C64's composite signal (modulator luma network)
-//   separate input stage of the set: IF filter (RF), luma trap, peaking,
+//   tuner    RF: the TV's IF filter
+//   separate input stage of the set: comb filter or luma trap, peaking,
 //            chroma band-pass (composite signal)
-//   decode   PAL decoder of the monitor → light emitted by the tube (linear)
+//   decode   color decoder of the set → light emitted by the tube (linear)
 //   glow_h/v halation in the glass (separable gaussian)
 //   crt      per window pixel: beams of the lines, halation, slot mask
 
@@ -24,9 +25,17 @@
 //   8 triad pitch (window pixels), slot pitch (window pixels), stripe, bridge
 //  12 beam sigma dark, bright (lines), glow sigma (samples), glow sigma (lines)
 //  16 light white may lose to the mask, white point R, G, B
-//  20 parity of the frame (NTSC: the subcarrier phase alternates)
+//  20 parity of the frame (NTSC: the subcarrier phase alternates), knobs:
+//     brightness (drive offset, 0-255), contrast (gain), color (gain)
+//  24 tint: cos, sin of the hue rotation; HDR headroom (the brightest value
+//     the display takes, 1 = white in SDR), linear output (HDR)
+//  28 comb filter on, its shift of the previous line (samples), shift of the
+//     PAL delay line, monochrome (white point R, G, B = the phosphor)
+//  32 phase of the chroma path at the subcarrier (the decoder locks to the
+//     burst, which it turns as well)
 //  then the tables at U_PAL_Y, U_PAL_UV, U_LUMA, U_CHROMA, U_LUMA_LPF (FIR_HALF
-//  taps each side) and U_MOD, U_LUMA_IN, U_CHROMA_IN (SEP_HALF taps each side)
+//  taps each side), U_MOD, U_LUMA_IN, U_CHROMA_IN, U_IF, U_COMB (SEP_HALF taps
+//  each side) and U_BARS (jail bars, 8 pixels)
 @group(0) @binding(0) var<uniform> P: array<vec4<f32>, NV>;
 @group(0) @binding(1) var index_tex: texture_2d<u32>;
 @group(0) @binding(2) var sig_tex: texture_2d<f32>;
@@ -67,11 +76,32 @@ fn blit(v: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(textureLoad(image_tex, p, 0).rgb, 1.0);
 }
 
+// sRGB-encoded values → linear light
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+}
+
+// The same into an HDR target (extended linear sRGB)
+@fragment
+fn blit_linear(v: VOut) -> @location(0) vec4<f32> {
+    let size = vec2<f32>(textureDimensions(image_tex));
+    let p = vec2<i32>(clamp(floor(v.uv * size), vec2<f32>(0.0), size - 1.0));
+    return vec4<f32>(srgb_to_linear(textureLoad(image_tex, p, 0).rgb), 1.0);
+}
+
 // ── VIC-II ──────────────────────────────────────────────────────────────────
 
-// Sample n of line y of the input image of a signal pass
+// Sample n of line y of the input image of a signal pass. Beyond the ends
+// of the line (the border goes on) the nearest samples of the same
+// subcarrier phase (a whole number of cycles, 4 samples, away)
 fn sig(n: i32, y: i32) -> vec4<f32> {
-    return textureLoad(sig_tex, vec2<i32>(clamp(n, 0, NS - 1), y), 0);
+    var m = n;
+    if (m < 0) {
+        m = ((m % 4) + 4) % 4;
+    } else if (m >= NS) {
+        m = NS - 4 + (m - NS) % 4;
+    }
+    return textureLoad(sig_tex, vec2<i32>(m, y), 0);
 }
 
 fn color_at(x: i32, y: i32) -> u32 {
@@ -85,12 +115,18 @@ fn is_odd(y: i32) -> bool {
 }
 
 // sin and cos of the subcarrier at sample n: 4 samples per cycle, and a
-// line of 283.5 (PAL) or 227.5 (NTSC) cycles flips the phase from line to
-// line. Counting the lines from the start of the frame, an odd number of
-// lines per frame (NTSC, 263) makes the phase alternate between frames too
+// line of 283.5 (PAL) or 227.5 (NTSC, PAL-N) cycles flips the phase from
+// line to line (LINE_FLIP; not the 224 of the 6567R56A). Counting the lines
+// from the start of the frame, an odd number of lines per frame (NTSC, 263)
+// makes the phase alternate between frames too
 fn carrier(n: i32, y: i32) -> vec2<f32> {
+    return carrier_at(n, y, 0.0);
+}
+
+// The same turned by `phase`: the decoder's reference
+fn carrier_at(n: i32, y: i32, phase: f32) -> vec2<f32> {
     let lines = i32(pf(20u)) * LINES + y + FIRST_LINE;
-    let t = 0.5 * PI * (f32(n) + 0.5) + select(0.0, PI, (lines & 1) == 1);
+    let t = 0.5 * PI * (f32(n) + 0.5) + select(0.0, PI, LINE_FLIP && (lines & 1) == 1) + phase;
     return vec2<f32>(sin(t), cos(t));
 }
 
@@ -112,6 +148,9 @@ fn vic(v: VOut) -> @location(0) vec4<f32> {
         let c = color_at(p + LUMA_FIRST + j, y);
         luma += pf(U_LUMA + u32(phase * LUMA_TAPS + j)) * pf(U_PAL_Y + c);
     }
+    // Jail bars: the same on every line, one PHI0 cycle long (the
+    // character cells start at framebuffer x 41)
+    luma += pf(U_BARS + u32((p + 7) & 7));
     let odd = is_odd(y);
     let pal = P[U_PAL_UV / 4u + color_at(p, y)];
     let uv = select(pal.xy, pal.zw, odd);
@@ -134,13 +173,28 @@ fn cable(v: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s.xyz, luma + s.w);
 }
 
-// ── PAL decoder of the monitor ──────────────────────────────────────────────
+// The TV's IF filter on the composite signal (RF input)
+@fragment
+fn tuner(v: VOut) -> @location(0) vec4<f32> {
+    let n = i32(v.pos.x);
+    let y = i32(v.pos.y);
+    var w = 0.0;
+    for (var k = -SEP_HALF; k <= SEP_HALF; k++) {
+        w += pf(U_IF + u32(k + SEP_HALF)) * sig(n - k, y).w;
+    }
+    let s = sig(n, y);
+    return vec4<f32>(s.xyz, w);
+}
 
-// Input stage of the set. Luma: IF filter (RF), trap (composite signal),
-// peaking, as the monitor has them. Chroma: with luma/chroma the U/V of the
-// VIC as they are; with a composite signal the band-pass around the
-// subcarrier (after the IF filter with RF), with whatever luma falls in its
-// band (cross-color)
+// ── Color decoder of the set ────────────────────────────────────────────────
+
+// Input stage of the set. Luma: trap (composite signal), peaking, as the set
+// has them. Chroma: with luma/chroma the U/V of the VIC as they are; with a
+// composite signal the band-pass around the subcarrier, with whatever luma
+// falls in its band (cross-color). With a comb filter the chroma is the
+// band-pass of half the difference between the line and the previous one
+// through the 1H delay line (shifted by pf(29u) samples when the C64's line
+// is not as long as the delay), and the luma the signal without it
 @fragment
 fn separate(v: VOut) -> @location(0) vec4<f32> {
     let n = i32(v.pos.x);
@@ -148,6 +202,18 @@ fn separate(v: VOut) -> @location(0) vec4<f32> {
     let composite = pf(0u) > 0.5;
     var luma = 0.0;
     var chroma = 0.0;
+    if (composite && pf(28u) > 0.5) {
+        let off = i32(pf(29u));
+        let prev = max(y - 1, 0);
+        for (var k = -SEP_HALF; k <= SEP_HALF; k++) {
+            let i = u32(k + SEP_HALF);
+            let w = sig(n - k, y).w;
+            let d = 0.5 * (w - sig(n - k + off, prev).w);
+            luma += pf(U_LUMA_IN + i) * w - pf(U_COMB + i) * d;
+            chroma += pf(U_CHROMA_IN + i) * d;
+        }
+        return vec4<f32>(luma, chroma, 0.0, 0.0);
+    }
     for (var k = -SEP_HALF; k <= SEP_HALF; k++) {
         let s = sig(n - k, y);
         let i = u32(k + SEP_HALF);
@@ -172,8 +238,9 @@ fn decode(n: i32, y: i32) -> vec3<f32> {
         for (var k = -FIR_HALF; k <= FIR_HALF; k++) {
             let h = pf(U_CHROMA + u32(k + FIR_HALF));
             let c = sig(n - k, y).y;
-            yuv.y += h * 2.0 * c * carrier(n - k, y).x;
-            yuv.z += h * 2.0 * c * carrier(n - k, y).y;
+            let r = carrier_at(n - k, y, pf(32u));
+            yuv.y += h * 2.0 * c * r.x;
+            yuv.z += h * 2.0 * c * r.y;
         }
         yuv.z *= v_switch(y);
     } else {
@@ -191,18 +258,32 @@ fn decode_fs(v: VOut) -> @location(0) vec4<f32> {
     let y = i32(v.pos.y);
     let a = decode(n, y);
     // PAL delay line: the chroma averaged with the previous line (NTSC has
-    // none)
+    // none), shifted by pf(30u) samples when the C64's line is not as long
+    // as the delay line (the Drean on a PAL-N set)
     var b = a;
     if (PAL) {
-        b = decode(n, max(y - 1, 0));
+        b = decode(n + i32(pf(30u)), max(y - 1, 0));
     }
-    let luma = a.x * CONTRAST;
-    let u = (a.y + b.y) * 0.5 * CONTRAST;
-    let w = (a.z + b.z) * 0.5 * CONTRAST;
-    let rgb = clamp(vec3<f32>(luma + 1.140 * w, luma - 0.396 * u - 0.581 * w, luma + 2.029 * u),
+    let white = vec3<f32>(pf(17u), pf(18u), pf(19u));
+    if (pf(31u) > 0.5) {
+        // Monochrome: the luma of the composite signal (subcarrier
+        // included) on the phosphor
+        let level = clamp(a.x * CONTRAST * pf(22u) + pf(21u), 0.0, 255.0);
+        return vec4<f32>(white * pow(max(level / 255.0, 1e-6), TUBE_GAMMA), 1.0);
+    }
+    // Front-panel knobs: contrast on the whole video, color on the chroma,
+    // tint turning it, brightness on the black level
+    let gain = CONTRAST * pf(22u);
+    let luma = a.x * gain;
+    let u0 = (a.y + b.y) * 0.5 * gain * pf(23u);
+    let w0 = (a.z + b.z) * 0.5 * gain * pf(23u);
+    let tc = pf(24u);
+    let ts = pf(25u);
+    let u = u0 * tc - w0 * ts;
+    let w = u0 * ts + w0 * tc;
+    let rgb = clamp(vec3<f32>(luma + 1.140 * w, luma - 0.396 * u - 0.581 * w, luma + 2.029 * u) + pf(21u),
                     vec3<f32>(0.0), vec3<f32>(255.0));
     // Light of the three guns, balanced to the monitor's white point
-    let white = vec3<f32>(pf(17u), pf(18u), pf(19u));
     return vec4<f32>(white * pow(max(rgb / 255.0, vec3<f32>(1e-6)), vec3<f32>(TUBE_GAMMA)), 1.0);
 }
 
@@ -340,14 +421,32 @@ fn crt(v: VOut) -> @location(0) vec4<f32> {
     let g = pf(3u);
     c = (1.0 - g) * c + g * textureSampleLevel(glow_tex, lin_samp, q, 0.0).rgb;
     // The mask, as deep as the display allows: where its brightest
-    // stripes would go beyond white it is made shallower, so that the
-    // average light (the color) stays right; but not below the depth that
-    // costs white a share pf(16u) of its light (about depth·peak/π for a
-    // clipped cosine), because on the real tube the mask shows on white too
+    // stripes would go beyond the brightest value of the display (white, or
+    // the HDR headroom pf(26u)) it is made shallower, so that the average
+    // light (the color) stays right; but not below the depth that costs
+    // white a share pf(16u) of its light (about depth·peak/π for a clipped
+    // cosine), because on the real tube the mask shows on white too
+    let top = pf(26u);
+    if (pf(2u) <= 0.0) {
+        // No mask (monochrome tube)
+        c = clamp(c, vec3<f32>(0.0), vec3<f32>(top));
+        let e = pow(min(c, vec3<f32>(1.0)), vec3<f32>(1.0 / DISPLAY_GAMMA));
+        if (pf(27u) > 0.5) {
+            return vec4<f32>(select(srgb_to_linear(e), c, c > vec3<f32>(1.0)), 1.0);
+        }
+        return vec4<f32>(e, 1.0);
+    }
     let m = mask(rel);
-    let room = max(1.0 - c, vec3<f32>(0.0)) / max(c * (m.w - 1.0), vec3<f32>(1e-5));
+    let room = max(top - c, vec3<f32>(0.0)) / max(c * (m.w - 1.0), vec3<f32>(1e-5));
     let least = min(pf(2u), PI * pf(16u) / max(m.w - 1.0, 1e-5));
     let depth = min(vec3<f32>(pf(2u)), max(room, vec3<f32>(least)));
     c *= vec3<f32>(1.0) + depth * (m.rgb - vec3<f32>(1.0));
-    return vec4<f32>(pow(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / DISPLAY_GAMMA)), 1.0);
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(top));
+    let encoded = pow(min(c, vec3<f32>(1.0)), vec3<f32>(1.0 / DISPLAY_GAMMA));
+    if (pf(27u) > 0.5) {
+        // HDR: the same picture up to white (the display gamma of the model,
+        // as linear sRGB light), and the light beyond it as it is
+        return vec4<f32>(select(srgb_to_linear(encoded), c, c > vec3<f32>(1.0)), 1.0);
+    }
+    return vec4<f32>(encoded, 1.0);
 }

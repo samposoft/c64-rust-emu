@@ -527,6 +527,8 @@ impl Debugger {
         let v = &c64.bus.vic;
         let r = &v.regs;
         let mut s = String::new();
+        let _ = writeln!(s, "VIC-II {} ({}, {} cycles x {} lines)", v.chip.name(), v.standard.name(),
+            v.standard.cycles_per_line(), v.standard.raster_lines());
         let _ = writeln!(s, "raster line {} cycle {}  IRQ target line {}  frame {}",
             v.raster_line, v.cycle, v.raster_target(), c64.frame_count);
         let _ = writeln!(s, "$D011=${:02X}  RST8={} ECM={} BMM={} DEN={} RSEL={} YSCROLL={}",
@@ -795,7 +797,8 @@ impl Debugger {
   drive insert file  insert a D64/G64 without autoloading it
   drive trace on file | off   trace of the drive's instructions (PC, registers, cycle)
   blend [on|off]     frame blending: each frame mixed with the previous one, as on a 50 Hz CRT (interlace pictures)
-  crt [off | 1084s-p1 | 1084s-d1 | 1901 | tv | 1702] [lc | composite | rf]  CRT monitor emulation in the window (GPU): Commodore 1084S-P1 (1084s), 1084S-D1, 1901, the Philips CP90 TV (tv) for PAL, the 1702 for NTSC; luma/chroma, composite or RF input
+  hdr [on|off]       HDR output of the CRT emulation, on a display with headroom above white (Apple EDR): the slot mask at full depth
+  crt [off | SET | lc | composite | rf | knob=N | comb=on|off | bars=on|off]...  CRT emulation in the window (GPU): sets 1084s, 1084s-p1, 1084s-d1, 1901, cp90 (PAL), 1702, 1084s-p, kv1311 (NTSC), cnt4442 (PAL-N), tv (the TV of the standard), 1900 (monochrome); inputs; knobs brightness, contrast, color, tint, sharpness (-100..100); comb filter and VIC-II jail bars
   screenshot file [bar | crt [height]]  save the framebuffer as PNG (bar: with the window's status bar; crt: through the CRT emulation, default 1136 pixels high; file - = the PNG on the output)
   trace on [file] [from to] | trace off
   keys text          type text on the keyboard (\\n = RETURN, {name} = a key named as for key: {f1} {clr} {left}...)
@@ -1225,13 +1228,13 @@ impl Debugger {
                 write!(out, "{}", Self::reu(c64)).map_err(io)?;
             }
             "info" => {
-                writeln!(out, "frame {} instr {} cycles {} raster {}/{} prg_pending={} typing={} disk={} cart={} breakpoints={} watches={} trace={} video={}",
+                writeln!(out, "frame {} instr {} cycles {} raster {}/{} prg_pending={} typing={} disk={} cart={} breakpoints={} watches={} trace={} video={} vic={}",
                     c64.frame_count, self.instr_count, c64.cpu.total_cycles,
                     c64.bus.vic.raster_line, c64.bus.vic.cycle,
                     c64.prg_pending() as u8, c64.bus.keyboard.typing() as u8, c64.disk.is_some() as u8, c64.bus.cart.is_some() as u8,
                     self.breakpoints.len(), c64.bus.dbg_watch.len(),
                     self.trace.as_ref().map(|t| t.lines.to_string()).unwrap_or_else(|| "off".into()),
-                    c64.standard().name()).map_err(io)?;
+                    c64.standard().name().replace(' ', "-"), c64.chip().name()).map_err(io)?;
             }
 
             "blend" => {
@@ -1242,6 +1245,16 @@ impl Debugger {
                     Some(_) => return Err("usage: blend [on|off]".into()),
                 }
                 writeln!(out, "frame blending {}", if c64.blend() { "on" } else { "off" }).map_err(io)?;
+            }
+
+            "hdr" => {
+                match args.first().copied() {
+                    None => {}
+                    Some("on") => c64.set_hdr(true),
+                    Some("off") => c64.set_hdr(false),
+                    Some(_) => return Err("usage: hdr [on|off]".into()),
+                }
+                writeln!(out, "HDR output of the CRT emulation {}", if c64.hdr() { "on" } else { "off" }).map_err(io)?;
             }
 
             "crt" => {
@@ -1502,12 +1515,8 @@ fn parse_port(s: &str) -> Result<usize, String> {
 /// monitor of the machine's standard when it is off), `height` pixels high.
 #[cfg(feature = "gpu")]
 fn crt_screenshot(c64: &C64, height: usize) -> Result<(Vec<u32>, usize, usize), String> {
-    let default = match c64.standard() {
-        crate::timing::Standard::Pal => crate::crt::Model::C1084SP1,
-        crate::timing::Standard::Ntsc => crate::crt::Model::C1702,
-    };
-    let crt = c64.crt().unwrap_or(crate::crt::Crt::new(default));
-    crate::frontend::gpu::crt_image(c64.last_frame(), crt, height, c64.frame_count)
+    let crt = c64.crt().unwrap_or(crate::crt::Crt::default_for(c64.standard(), None));
+    crate::frontend::gpu::crt_image(c64.last_frame(), crt, c64.chip(), height, c64.frame_count)
 }
 
 #[cfg(not(feature = "gpu"))]

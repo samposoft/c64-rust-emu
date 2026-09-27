@@ -26,9 +26,12 @@
 use crate::mem::Bus;
 use crate::timing::Standard;
 
+mod chip;
 mod tables;
 
-/// Framebuffer width, the same for PAL and NTSC.
+pub use chip::Chip;
+
+/// Framebuffer width, the same for all standards.
 pub const WIDTH: usize = 403;
 /// Framebuffer height of PAL, the largest (NTSC: `Standard::fb_height`).
 pub const HEIGHT: usize = 284;
@@ -62,6 +65,27 @@ pub const C64_PALETTE: [u32; 16] = [
     0xFFA9FF9F, // 13 light green
     0xFF706DEB, // 14 light blue
     0xFFB2B2B2, // 15 light grey
+];
+
+/// Palette of the first revisions (6569R1, 6567R56A), with 5 lumas: the
+/// colodore model with Pepto's levels for them (`vic::Chip::luma`).
+pub const C64_PALETTE_OLD: [u32; 16] = [
+    0xFF000000, // 0  black
+    0xFFFFFFFF, // 1  white
+    0xFF6D2327, // 2  red
+    0xFFA0FEF8, // 3  cyan
+    0xFFBA62C4, // 4  purple
+    0xFF56AC4D, // 5  green
+    0xFF2E2C9B, // 6  blue
+    0xFFEDF171, // 7  yellow
+    0xFFBA784D, // 8  orange
+    0xFF553800, // 9  brown
+    0xFFC46C71, // 10 pink
+    0xFF373737, // 11 dark grey
+    0xFF868686, // 12 medium grey
+    0xFFA9FF9F, // 13 light green
+    0xFF7A77F8, // 14 light blue
+    0xFFE0E0E0, // 15 light grey
 ];
 
 // ── Cycle table (vicii-chip-model.c) ─────────────────────────────────────────
@@ -111,7 +135,8 @@ struct Cyc {
 fn table(standard: Standard) -> &'static [Cyc] {
     match standard {
         Standard::Pal => &tables::PAL,
-        Standard::Ntsc => &tables::NTSC,
+        Standard::Ntsc | Standard::PalN => &tables::NTSC,
+        Standard::NtscOld => &tables::NTSC_OLD,
     }
 }
 
@@ -236,7 +261,8 @@ pub struct Tick {
 
 /// Internal VIC-II state (the needed subset of `vicii_t`).
 pub struct VicState {
-    /// PAL or NTSC chip (`C64::set_standard`)
+    /// The chip (`C64::set_chip`) and its standard
+    pub chip: Chip,
     pub standard: Standard,
     /// Registers; $D019 holds the IRQ status (VICE's irq_status)
     pub regs: [u8; 64],
@@ -285,6 +311,7 @@ impl VicState {
         // At reset all VIC registers are 0 (DEN=0: border-colored screen, no
         // bad lines until the KERNAL programs them in CINT).
         Self {
+            chip: Chip::Mos6569,
             standard: Standard::Pal,
             regs: [0u8; 64],
             raster_line: 0,
@@ -561,13 +588,14 @@ fn g_fetch_addr(v: &VicState, mode: u8) -> u16 {
     a
 }
 
-/// g-access in display state (6569: previous cycle's mode for BMM).
+/// g-access in display state. NMOS: the previous cycle's mode for BMM;
+/// HMOS: the previous cycle's $D011 for all bits.
 fn fetch_graphics(bus: &mut Bus) -> u8 {
     let v = &bus.vic;
     let r11 = v.regs[0x11];
     let delay = v.reg11_delay;
-    let mut addr = g_fetch_addr(v, r11 | (delay & 0x20));
-    if (r11 ^ delay) & 0x20 != 0 {
+    let mut addr = if v.chip.hmos() { g_fetch_addr(v, delay) } else { g_fetch_addr(v, r11 | (delay & 0x20)) };
+    if !v.chip.hmos() && (r11 ^ delay) & 0x20 != 0 {
         // Switch from RAM to character ROM: the low address bits stay those
         // of the previous mode (6569)
         let from = g_fetch_addr(v, delay);
@@ -584,9 +612,11 @@ fn fetch_graphics(bus: &mut Bus) -> u8 {
     data
 }
 
-/// g-access in idle state: $3FFF, or $39FF with ECM.
+/// g-access in idle state: $3FFF, or $39FF with ECM (HMOS: ECM of the
+/// previous cycle).
 fn fetch_idle_gfx(bus: &mut Bus) -> u8 {
-    let addr = if bus.vic.regs[0x11] & 0x40 != 0 { 0x39FF } else { 0x3FFF };
+    let r11 = if bus.vic.chip.hmos() { bus.vic.reg11_delay } else { bus.vic.regs[0x11] };
+    let addr = if r11 & 0x40 != 0 { 0x39FF } else { 0x3FFF };
     bus.vic.gbuf = bus.vic_read(addr);
     bus.vic.gbuf
 }
@@ -813,7 +843,11 @@ pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
     Tick { ba_low, aec_low, frame_done }
 }
 
-// ── Drawing (vicii-draw-cycle.c, 6569 with color latency) ────────────────────
+// ── Drawing (vicii-draw-cycle.c) ─────────────────────────────────────────────
+//
+// The NMOS chips (6569, 6567, 6572: VICE's color_latency) and the HMOS ones
+// (8565, 8562) differ in when they latch the mode bits of $D011 and the
+// sprite multicolor bits, and in how they resolve colors (`draw_colors8`).
 
 fn draw_cycle(v: &mut VicState, fb: &mut [u32], tab: &[Cyc]) {
     let k = v.cycle;
@@ -885,6 +919,7 @@ fn skip_graphics8(v: &mut VicState, pc: &Cyc) {
 fn draw_graphics8(v: &mut VicState, pc: &Cyc) {
     let r11 = v.regs[0x11];
     let r16 = v.regs[0x16];
+    let hmos = v.chip.hmos();
     let d = &mut v.d;
     let new11 = (r11 & 0x60) >> 2;
     let new16 = (r16 & 0x10) >> 2;
@@ -907,9 +942,11 @@ fn draw_graphics8(v: &mut VicState, pc: &Cyc) {
         match i {
             4 => {
                 d.vmode16_pipe = (r16 & 0x10) >> 2;
-                d.vmode11_pipe |= (r11 & 0x60) >> 2; // rising edge
+                if !hmos {
+                    d.vmode11_pipe |= (r11 & 0x60) >> 2; // rising edge
+                }
             }
-            6 => d.vmode11_pipe &= (r11 & 0x60) >> 2, // falling edge
+            6 if !hmos => d.vmode11_pipe &= (r11 & 0x60) >> 2, // falling edge
             7 => {
                 if d.vmode16_pipe != 0 && d.vmode16_pipe2 == 0 {
                     d.gbuf_mc_flop = false;
@@ -919,6 +956,10 @@ fn draw_graphics8(v: &mut VicState, pc: &Cyc) {
             _ => {}
         }
         draw_graphics(d, i);
+    }
+    if hmos {
+        // The HMOS chips take the $D011 mode bits at the end of the cycle
+        d.vmode11_pipe = new11;
     }
     advance_pipes(v, pc);
 }
@@ -1028,6 +1069,7 @@ fn draw_graphics(d: &mut Draw, i: u8) {
 }
 
 fn draw_sprites8(v: &mut VicState, pc: &Cyc) {
+    let hmos = v.chip.hmos();
     let d = &mut v.d;
     let xpos = pc.xpos;
     let (dma0, dma2, dma2_num) = match pc.phi1 {
@@ -1062,20 +1104,22 @@ fn draw_sprites8(v: &mut VicState, pc: &Cyc) {
                     }
                 }
                 6 => {
+                    if hmos {
+                        update_sprite_mc_bits_hmos(d, v.regs[0x1C]);
+                    }
                     d.sprite_pri_bits = v.regs[0x1B];
                     d.sprite_expx_bits = v.regs[0x1D];
                 }
                 7 => {
-                    let next = v.regs[0x1C];
-                    let toggled = next ^ d.sprite_mc_bits;
-                    d.sbuf_mc_flops &= !toggled;
-                    d.sprite_mc_bits = next;
+                    if !hmos {
+                        update_sprite_mc_bits(d, v.regs[0x1C]);
+                    }
                     d.sprite_halt_bits &= !dma2;
                 }
                 _ => {}
             }
             trigger_sprites(d, xpos + i as u16, candidates);
-            draw_sprites(d, i as usize, &mut v.sprite_sprite_collisions,
+            draw_sprites(d, i as usize, hmos, &mut v.sprite_sprite_collisions,
                          &mut v.sprite_background_collisions);
         }
     } else {
@@ -1084,15 +1128,36 @@ fn draw_sprites8(v: &mut VicState, pc: &Cyc) {
         if dma2_num < 8 {
             d.sbuf_reg[dma2_num] = v.sprites[dma2_num].data;
         }
+        if hmos {
+            update_sprite_mc_bits_hmos(d, v.regs[0x1C]);
+        } else {
+            update_sprite_mc_bits(d, v.regs[0x1C]);
+        }
         d.sprite_pri_bits = v.regs[0x1B];
         d.sprite_expx_bits = v.regs[0x1D];
-        let next = v.regs[0x1C];
-        d.sbuf_mc_flops &= !(next ^ d.sprite_mc_bits);
-        d.sprite_mc_bits = next;
     }
     for s in 0..8 {
         d.sprite_x_pipe[s] = v.sprites[s].x;
     }
+}
+
+/// New sprite multicolor bits ($D01C), NMOS chips (at pixel 7): a sprite
+/// whose mode changed restarts its pair of bits.
+#[inline]
+fn update_sprite_mc_bits(d: &mut Draw, next: u8) {
+    d.sbuf_mc_flops &= !(next ^ d.sprite_mc_bits);
+    d.sprite_mc_bits = next;
+}
+
+/// HMOS chips (at pixel 6): the flop of a changed sprite toggles, unless
+/// between the two halves of an X-expanded pixel (VICE's
+/// update_sprite_mc_bits_8565 with SPRITESPLITPATCH).
+#[inline]
+fn update_sprite_mc_bits_hmos(d: &mut Draw, next: u8) {
+    let toggled = (next ^ d.sprite_mc_bits) & !d.sbuf_expx_flops;
+    d.sbuf_mc_flops ^= toggled;
+    d.sbuf_mc_flops |= toggled & !next;
+    d.sprite_mc_bits = next;
 }
 
 #[inline]
@@ -1114,7 +1179,7 @@ fn trigger_sprites(d: &mut Draw, xpos: u16, candidates: u8) {
 }
 
 #[inline]
-fn draw_sprites(d: &mut Draw, i: usize, ss: &mut u8, sb: &mut u8) {
+fn draw_sprites(d: &mut Draw, i: usize, hmos: bool, ss: &mut u8, sb: &mut u8) {
     if d.sprite_active_bits == 0 {
         return;
     }
@@ -1133,9 +1198,12 @@ fn draw_sprites(d: &mut Draw, i: usize, ss: &mut u8, sb: &mut u8) {
                             d.sbuf_pixel_reg[s] = ((d.sbuf_reg[s] >> 22) & 0x03) as u8;
                         }
                         d.sbuf_mc_flops ^= m;
-                    } else {
-                        // 6569: the hires pixel is always read (color latency)
+                    } else if !hmos || d.sbuf_mc_flops & m != 0 {
+                        // NMOS: the hires pixel is always read; HMOS: not
+                        // right after a switch from multicolor
                         d.sbuf_pixel_reg[s] = (((d.sbuf_reg[s] >> 23) & 0x01) << 1) as u8;
+                    } else {
+                        d.sbuf_mc_flops |= m;
                     }
                 }
                 if d.sbuf_expx_flops & m != 0 {
@@ -1200,18 +1268,30 @@ fn draw_border8(v: &mut VicState) {
 }
 
 /// Resolves colors (one cycle after drawing) and writes the 8 pixels of the
-/// previous drawing to the framebuffer.
+/// previous drawing to the framebuffer. The NMOS chips resolve each pixel
+/// while drawing the one before, so the first pixel after a color register
+/// write still has the old color; the HMOS chips resolve it in place, and
+/// the first pixel of the register being written is light grey (the grey
+/// dot).
 fn draw_colors8(v: &mut VicState, fb: &mut [u32]) {
     let d = &mut v.d;
     if d.last_color_reg != 0xFF {
         d.cregs[d.last_color_reg as usize] = d.last_color_value;
     }
     let mut out = [0u8; 8];
-    for i in 0..8 {
-        let li = (i + 1) & 7;
-        d.pixel_buffer[li] = d.cregs[d.pixel_buffer[li] as usize];
-        out[i] = d.pixel_buffer[i];
-        d.pixel_buffer[i] = d.render_buffer[i];
+    if v.chip.hmos() {
+        for i in 0..8 {
+            let c = d.pixel_buffer[i];
+            out[i] = if i == 0 && c == d.last_color_reg { 0x0F } else { d.cregs[c as usize] };
+            d.pixel_buffer[i] = d.render_buffer[i];
+        }
+    } else {
+        for i in 0..8 {
+            let li = (i + 1) & 7;
+            d.pixel_buffer[li] = d.cregs[d.pixel_buffer[li] as usize];
+            out[i] = d.pixel_buffer[i];
+            d.pixel_buffer[i] = d.render_buffer[i];
+        }
     }
     d.last_color_reg = v.last_color_reg;
     d.last_color_value = v.last_color_value;
@@ -1224,16 +1304,17 @@ fn draw_colors8(v: &mut VicState, fb: &mut [u32]) {
     let offs = 8 * ((v.cycle as i32 + n - 2) % n);
     let row = row * WIDTH;
     let fx = offs - 95;
+    let palette = v.chip.palette();
     if fx >= 0 && fx as usize + 8 <= WIDTH {
         let dst = &mut fb[row + fx as usize..row + fx as usize + 8];
         for (p, &c) in dst.iter_mut().zip(out.iter()) {
-            *p = C64_PALETTE[(c & 0x0F) as usize];
+            *p = palette[(c & 0x0F) as usize];
         }
     } else {
         for (i, &c) in out.iter().enumerate() {
             let x = fx + i as i32;
             if (0..WIDTH as i32).contains(&x) {
-                fb[row + x as usize] = C64_PALETTE[(c & 0x0F) as usize];
+                fb[row + x as usize] = palette[(c & 0x0F) as usize];
             }
         }
     }
@@ -1256,7 +1337,7 @@ impl_state!(Draw {
 });
 
 impl_state!(VicState {
-    standard, regs, raster_line, cycle, raster_irq_triggered, start_of_frame,
+    chip, standard, regs, raster_line, cycle, raster_irq_triggered, start_of_frame,
     allow_bad_lines, bad_line, idle_state, vc, vcbase, rc, vmli, vbuf, cbuf,
     gbuf, refresh_counter, prefetch_cycles, last_bus_phi2, last_read_phi1,
     reg11_delay, main_border, vborder, set_vborder, sprites, sprite_dma,

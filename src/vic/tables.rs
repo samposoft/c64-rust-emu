@@ -5,7 +5,8 @@
 // Converted to Rust and modified by SampoSoft in 2026; see CREDITS.md.
 
 //! Cycle tables of the VIC-II models, converted from VICE's `cycle_tab_pal`
-//! (6569) and `cycle_tab_ntsc` (6567R8) as `vicii_chip_model_set` combines
+//! (6569, 8565), `cycle_tab_ntsc` (6567R8, 8562, 6572) and
+//! `cycle_tab_ntsc_old` (6567R56A) as `vicii_chip_model_set` combines
 //! their phi1 and phi2 entries. Index: our cycle k = cycle % cycles per line
 //! (k = 0 is the last cycle of the line). xpos is the phi1 X rounded to 8.
 
@@ -147,6 +148,73 @@ pub(super) const NTSC: [Cyc; 65] = [
     Cyc { flags: 0, phi1: Phi1::SprDma1(2), xpos: 0x188, spr_ba: 0b00011100 }, // 64
 ];
 
+pub(super) const NTSC_OLD: [Cyc; 64] = [
+    Cyc { flags: 0, phi1: Phi1::SprDma1(2), xpos: 0x190, spr_ba: 0b00011100 }, // 64
+    Cyc { flags: 0, phi1: Phi1::SprPtr(3), xpos: 0x198, spr_ba: 0b00011000 }, // 1
+    Cyc { flags: 0, phi1: Phi1::SprDma1(3), xpos: 0x1a0, spr_ba: 0b00111000 }, // 2
+    Cyc { flags: 0, phi1: Phi1::SprPtr(4), xpos: 0x1a8, spr_ba: 0b00110000 }, // 3
+    Cyc { flags: 0, phi1: Phi1::SprDma1(4), xpos: 0x1b0, spr_ba: 0b01110000 }, // 4
+    Cyc { flags: 0, phi1: Phi1::SprPtr(5), xpos: 0x1b8, spr_ba: 0b01100000 }, // 5
+    Cyc { flags: 0, phi1: Phi1::SprDma1(5), xpos: 0x1c0, spr_ba: 0b11100000 }, // 6
+    Cyc { flags: 0, phi1: Phi1::SprPtr(6), xpos: 0x1c8, spr_ba: 0b11000000 }, // 7
+    Cyc { flags: 0, phi1: Phi1::SprDma1(6), xpos: 0x1d0, spr_ba: 0b11000000 }, // 8
+    Cyc { flags: 0, phi1: Phi1::SprPtr(7), xpos: 0x1d8, spr_ba: 0b10000000 }, // 9
+    Cyc { flags: 0, phi1: Phi1::SprDma1(7), xpos: 0x1e0, spr_ba: 0b10000000 }, // 10
+    Cyc { flags: 0, phi1: Phi1::Refresh, xpos: 0x1e8, spr_ba: 0b00000000 }, // 11
+    Cyc { flags: FETCH_BA, phi1: Phi1::Refresh, xpos: 0x1f0, spr_ba: 0b00000000 }, // 12
+    Cyc { flags: FETCH_BA, phi1: Phi1::Refresh, xpos: 0x1f8, spr_ba: 0b00000000 }, // 13
+    Cyc { flags: FETCH_BA|UPDATE_VC, phi1: Phi1::Refresh, xpos: 0x000, spr_ba: 0b00000000 }, // 14
+    Cyc { flags: VISIBLE|FETCH_BA|SPR_CRUNCH, phi1: Phi1::Refresh, xpos: 0x008, spr_ba: 0b00000000 }, // 15
+    Cyc { flags: VISIBLE|FETCH_BA|UPDATE_MCBASE, phi1: Phi1::FetchG, xpos: 0x010, spr_ba: 0b00000000 }, // 16
+    Cyc { flags: VISIBLE|FETCH_BA|BRD_L1, phi1: Phi1::FetchG, xpos: 0x018, spr_ba: 0b00000000 }, // 17
+    Cyc { flags: VISIBLE|FETCH_BA|BRD_L0, phi1: Phi1::FetchG, xpos: 0x020, spr_ba: 0b00000000 }, // 18
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x028, spr_ba: 0b00000000 }, // 19
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x030, spr_ba: 0b00000000 }, // 20
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x038, spr_ba: 0b00000000 }, // 21
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x040, spr_ba: 0b00000000 }, // 22
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x048, spr_ba: 0b00000000 }, // 23
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x050, spr_ba: 0b00000000 }, // 24
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x058, spr_ba: 0b00000000 }, // 25
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x060, spr_ba: 0b00000000 }, // 26
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x068, spr_ba: 0b00000000 }, // 27
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x070, spr_ba: 0b00000000 }, // 28
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x078, spr_ba: 0b00000000 }, // 29
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x080, spr_ba: 0b00000000 }, // 30
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x088, spr_ba: 0b00000000 }, // 31
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x090, spr_ba: 0b00000000 }, // 32
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x098, spr_ba: 0b00000000 }, // 33
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0a0, spr_ba: 0b00000000 }, // 34
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0a8, spr_ba: 0b00000000 }, // 35
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0b0, spr_ba: 0b00000000 }, // 36
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0b8, spr_ba: 0b00000000 }, // 37
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0c0, spr_ba: 0b00000000 }, // 38
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0c8, spr_ba: 0b00000000 }, // 39
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0d0, spr_ba: 0b00000000 }, // 40
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0d8, spr_ba: 0b00000000 }, // 41
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0e0, spr_ba: 0b00000000 }, // 42
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0e8, spr_ba: 0b00000000 }, // 43
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0f0, spr_ba: 0b00000000 }, // 44
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x0f8, spr_ba: 0b00000000 }, // 45
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x100, spr_ba: 0b00000000 }, // 46
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x108, spr_ba: 0b00000000 }, // 47
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x110, spr_ba: 0b00000000 }, // 48
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x118, spr_ba: 0b00000000 }, // 49
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x120, spr_ba: 0b00000000 }, // 50
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x128, spr_ba: 0b00000000 }, // 51
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x130, spr_ba: 0b00000000 }, // 52
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x138, spr_ba: 0b00000000 }, // 53
+    Cyc { flags: VISIBLE|FETCH_BA, phi1: Phi1::FetchG, xpos: 0x140, spr_ba: 0b00000000 }, // 54
+    Cyc { flags: 0, phi1: Phi1::FetchG, xpos: 0x148, spr_ba: 0b00000000 }, // 55
+    Cyc { flags: SPR_DMA|SPR_EXP|BRD_R0, phi1: Phi1::Idle, xpos: 0x150, spr_ba: 0b00000001 }, // 56
+    Cyc { flags: SPR_DMA|BRD_R1, phi1: Phi1::Idle, xpos: 0x158, spr_ba: 0b00000001 }, // 57
+    Cyc { flags: UPDATE_RC|SPR_DISP, phi1: Phi1::Idle, xpos: 0x160, spr_ba: 0b00000011 }, // 58
+    Cyc { flags: 0, phi1: Phi1::SprPtr(0), xpos: 0x168, spr_ba: 0b00000011 }, // 59
+    Cyc { flags: 0, phi1: Phi1::SprDma1(0), xpos: 0x170, spr_ba: 0b00000111 }, // 60
+    Cyc { flags: 0, phi1: Phi1::SprPtr(1), xpos: 0x178, spr_ba: 0b00000110 }, // 61
+    Cyc { flags: 0, phi1: Phi1::SprDma1(1), xpos: 0x180, spr_ba: 0b00001110 }, // 62
+    Cyc { flags: 0, phi1: Phi1::SprPtr(2), xpos: 0x188, spr_ba: 0b00001100 }, // 63
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,8 +262,7 @@ mod tests {
         }
         t
     }
-    
-    const CYCLES: [Cyc; 63] = build_cycles();
+
 
     #[test]
     fn pal_table_matches_the_formulas() {
@@ -217,5 +284,21 @@ mod tests {
         }
         assert_eq!(NTSC[59].phi1, Phi1::SprPtr(0));
         assert_eq!(NTSC[62].xpos, NTSC[63].xpos);
+    }
+
+    #[test]
+    fn ntsc_old_table() {
+        // As PAL from cycle 14 to 55, then one more idle cycle before the
+        // sprites (one less than the 6567R8): 512-pixel lines, no repeated X
+        for k in 14..=55 {
+            assert_eq!(NTSC_OLD[k].xpos, PAL[k].xpos, "cycle {k}");
+            assert_eq!(NTSC_OLD[k].phi1, PAL[k].phi1, "cycle {k}");
+        }
+        assert_eq!(NTSC_OLD[59].phi1, Phi1::SprPtr(0));
+        assert_eq!(NTSC_OLD[63].phi1, Phi1::SprPtr(2));
+        for k in 0..64 {
+            let next = NTSC_OLD[(k + 1) % 64].xpos;
+            assert_eq!(next, (NTSC_OLD[k].xpos + 8) % 512, "cycle {k}");
+        }
     }
 }
