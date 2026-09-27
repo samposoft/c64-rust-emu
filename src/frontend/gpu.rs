@@ -12,14 +12,15 @@ use std::sync::Arc;
 use winit::window::Window;
 
 use super::window::{layout, CrtView, Placement, Rect};
-use crate::crt::{self, Crt};
+use crate::crt::{self, Crt, Signal};
+use crate::timing::Standard;
 use crate::vic::{HEIGHT, WIDTH};
 
 const SHADER: &str = include_str!("crt.wgsl");
 
 /// Layout of the parameters (floats): the values that change with the
 /// window, then the tables of the model.
-const U_PAL_Y: usize = 20;
+const U_PAL_Y: usize = 24;
 const U_PAL_UV: usize = U_PAL_Y + 16;
 const U_LUMA: usize = U_PAL_UV + 64;
 const U_CHROMA: usize = U_LUMA + crt::LUMA_PHASES * crt::LUMA_TAPS;
@@ -32,18 +33,20 @@ const PARAMS: usize = U_CHROMA_IN + crt::SEP_LEN.next_multiple_of(4);
 /// Format of the intermediate images (signal, light, halation).
 const SIGNAL_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// The shader with the constants of the model in front.
-fn shader_source() -> String {
+/// The shader with the constants of the model for the signal of a standard
+/// in front.
+fn shader_source(sig: &Signal) -> String {
+    let std = sig.standard;
     format!(
-        "const W: i32 = {};\nconst H: i32 = {};\nconst NS: i32 = {};\n\
+        "const W: i32 = {};\nconst H: i32 = {};\nconst NS: i32 = {};\nconst PH: i32 = {};\n\
          const LUMA_TAPS: i32 = {};\nconst LUMA_FIRST: i32 = {};\nconst FIR_HALF: i32 = {};\nconst SEP_HALF: i32 = {};\n\
-         const ODD_BASE: i32 = {};\nconst NV: u32 = {};\n\
+         const FIRST_LINE: i32 = {};\nconst LINES: i32 = {};\nconst PAL: bool = {};\nconst NV: u32 = {};\n\
          const U_PAL_Y: u32 = {U_PAL_Y};\nconst U_PAL_UV: u32 = {U_PAL_UV};\nconst U_LUMA: u32 = {U_LUMA};\n\
          const U_CHROMA: u32 = {U_CHROMA};\nconst U_LUMA_LPF: u32 = {U_LUMA_LPF};\nconst U_MOD: u32 = {U_MOD};\n\
          const U_LUMA_IN: u32 = {U_LUMA_IN};\nconst U_CHROMA_IN: u32 = {U_CHROMA_IN};\n\
          const CONTRAST: f32 = {:?};\nconst TUBE_GAMMA: f32 = {:?};\nconst DISPLAY_GAMMA: f32 = {:?};\n{SHADER}",
-        WIDTH, HEIGHT, crt::SAMPLES, crt::LUMA_TAPS, crt::LUMA_FIRST, crt::FIR_HALF, crt::SEP_HALF,
-        crate::vic::FIRST_FB_LINE & 1, PARAMS / 4,
+        WIDTH, std.fb_height(), sig.samples, sig.phases, crt::LUMA_TAPS, crt::LUMA_FIRST, crt::FIR_HALF, crt::SEP_HALF,
+        std.first_fb_line(), std.raster_lines(), sig.pal(), PARAMS / 4,
         crt::CONTRAST as f32, crt::TUBE_GAMMA as f32, crt::DISPLAY_GAMMA as f32,
     )
 }
@@ -52,26 +55,61 @@ fn shader_source() -> String {
 /// monitor.
 fn tables(crt: Crt) -> Vec<f32> {
     let m = crt.model.monitor();
+    let sig = m.signal();
     let mut t = vec![0f32; PARAMS];
-    let (even, odd) = (crt::palette_yuv(false), crt::palette_yuv(true));
+    let (even, odd) = (crt::palette_yuv(false, &sig), crt::palette_yuv(true, &sig));
     for c in 0..16 {
         t[U_PAL_Y + c] = even[c][0] as f32;
         t[U_PAL_UV + 4 * c..U_PAL_UV + 4 * c + 4]
             .copy_from_slice(&[even[c][1], even[c][2], odd[c][1], odd[c][2]].map(|x| x as f32));
     }
-    for (phase, k) in crt::luma_kernels().iter().enumerate() {
+    for (phase, k) in crt::luma_kernels(&sig).iter().enumerate() {
         t[U_LUMA + phase * crt::LUMA_TAPS..][..crt::LUMA_TAPS].copy_from_slice(k);
     }
     t[U_CHROMA..][..crt::FIR_LEN].copy_from_slice(&crt::chroma_fir(m, crt.input));
     t[U_LUMA_LPF..][..crt::FIR_LEN].copy_from_slice(&crt::luma_fir(m, crt.input));
-    t[U_MOD..][..crt::SEP_LEN].copy_from_slice(&crt::modulator_fir());
+    t[U_MOD..][..crt::SEP_LEN].copy_from_slice(&crt::modulator_fir(&sig));
     t[U_LUMA_IN..][..crt::SEP_LEN].copy_from_slice(&crt::luma_input_fir(m, crt.input));
     t[U_CHROMA_IN..][..crt::SEP_LEN].copy_from_slice(&crt::chroma_input_fir(m, crt.input));
     t
 }
 
-struct Pipelines {
-    blit: wgpu::RenderPipeline,
+/// Render pipeline of the entry point `entry` of `module`.
+fn pipeline(device: &wgpu::Device, module: &wgpu::ShaderModule, entry: &str, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(entry),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            targets: &[Some(format.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn shader(device: &wgpu::Device, sig: &Signal) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("crt.wgsl"),
+        source: wgpu::ShaderSource::Wgsl(shader_source(sig).into()),
+    })
+}
+
+/// Pipelines and images of the CRT emulation for the signal of one
+/// standard (lines and samples per line differ).
+struct CrtSet {
+    sig: Signal,
     vic: wgpu::RenderPipeline,
     cable: wgpu::RenderPipeline,
     separate: wgpu::RenderPipeline,
@@ -79,27 +117,57 @@ struct Pipelines {
     glow_h: wgpu::RenderPipeline,
     glow_v: wgpu::RenderPipeline,
     crt: wgpu::RenderPipeline,
+    /// Palette indices of the frame (R8Uint).
+    index_tex: wgpu::Texture,
+    /// Signal of the VIC, after the cable and after the set's input stage,
+    /// light of the last two frames, halation.
+    sig_tex: wgpu::TextureView,
+    cab: wgpu::TextureView,
+    sep: wgpu::TextureView,
+    lin: [wgpu::TextureView; 2],
+    glow: [wgpu::TextureView; 2],
+}
+
+impl CrtSet {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, standard: Standard) -> CrtSet {
+        let sig = Signal::of(standard);
+        let module = shader(device, &sig);
+        let pipe = |entry: &str, format| pipeline(device, &module, entry, format);
+        let rows = standard.fb_height();
+        let image = || view(&texture(device, sig.samples, rows, SIGNAL_FORMAT, true));
+        CrtSet {
+            vic: pipe("vic", SIGNAL_FORMAT),
+            cable: pipe("cable", SIGNAL_FORMAT),
+            separate: pipe("separate", SIGNAL_FORMAT),
+            decode: pipe("decode_fs", SIGNAL_FORMAT),
+            glow_h: pipe("glow_h", SIGNAL_FORMAT),
+            glow_v: pipe("glow_v", SIGNAL_FORMAT),
+            crt: pipe("crt", format),
+            index_tex: texture(device, WIDTH, rows, wgpu::TextureFormat::R8Uint, false),
+            sig_tex: image(),
+            cab: image(),
+            sep: image(),
+            lin: [image(), image()],
+            glow: [image(), image()],
+            sig,
+        }
+    }
 }
 
 /// Renderer on a device, for targets of one format.
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipes: Pipelines,
+    format: wgpu::TextureFormat,
+    blit: wgpu::RenderPipeline,
+    /// CRT emulation for the standard of the last frame drawn with it.
+    crt: Option<CrtSet>,
     params: wgpu::Buffer,
     sampler: wgpu::Sampler,
-    /// Palette indices of the frame (R8Uint), and the frame and the bar as
-    /// they are (Bgra8Unorm: the bytes of the ARGB pixels).
-    index_tex: wgpu::Texture,
+    /// The frame and the bar as they are (Bgra8Unorm: the bytes of the ARGB
+    /// pixels).
     screen_tex: wgpu::Texture,
     bar_tex: wgpu::Texture,
-    /// Signal of the VIC, after the monitor's input stage, light of the last
-    /// two frames, halation.
-    sig: wgpu::TextureView,
-    cab: wgpu::TextureView,
-    sep: wgpu::TextureView,
-    lin: [wgpu::TextureView; 2],
-    glow: [wgpu::TextureView; 2],
     /// Values of the parameters, with the tables for `tables_for`.
     values: Vec<f32>,
     tables_for: Option<Crt>,
@@ -109,6 +177,11 @@ pub struct Renderer {
     done: Vec<u8>,
     done_crt: Option<Crt>,
     bytes: Vec<u8>,
+    /// Lines of `screen_tex`: those of the last frame (284 PAL, 253 NTSC).
+    screen_rows: usize,
+    /// CRT emulation asked for on a frame of another standard than its
+    /// monitor's: said once.
+    crt_warned: bool,
     cur: usize,
     /// `lin[cur ^ 1]` holds the previous frame.
     have_prev: bool,
@@ -135,43 +208,7 @@ fn view(t: &wgpu::Texture) -> wgpu::TextureView {
 
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, format: wgpu::TextureFormat) -> Renderer {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("crt.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(shader_source().into()),
-        });
-        let pipe = |entry: &str, format: wgpu::TextureFormat| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(entry),
-                layout: None,
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    targets: &[Some(format.into())],
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        let pipes = Pipelines {
-            blit: pipe("blit", format),
-            vic: pipe("vic", SIGNAL_FORMAT),
-            cable: pipe("cable", SIGNAL_FORMAT),
-            separate: pipe("separate", SIGNAL_FORMAT),
-            decode: pipe("decode_fs", SIGNAL_FORMAT),
-            glow_h: pipe("glow_h", SIGNAL_FORMAT),
-            glow_v: pipe("glow_v", SIGNAL_FORMAT),
-            crt: pipe("crt", format),
-        };
+        let blit = pipeline(&device, &shader(&device, &Signal::of(Standard::Pal)), "blit", format);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
             size: (PARAMS * 4) as u64,
@@ -183,24 +220,19 @@ impl Renderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let signal = || view(&texture(&device, crt::SAMPLES, HEIGHT, SIGNAL_FORMAT, true));
         let bar_h = super::status::BAR_HEIGHT;
         Renderer {
-            index_tex: texture(&device, WIDTH, HEIGHT, wgpu::TextureFormat::R8Uint, false),
             screen_tex: texture(&device, WIDTH, HEIGHT, wgpu::TextureFormat::Bgra8Unorm, false),
             bar_tex: texture(&device, WIDTH, bar_h, wgpu::TextureFormat::Bgra8Unorm, false),
-            sig: signal(),
-            cab: signal(),
-            sep: signal(),
-            lin: [signal(), signal()],
-            glow: [signal(), signal()],
-            pipes, params, sampler, device, queue,
+            blit, crt: None, format, params, sampler, device, queue,
             values: vec![0.0; PARAMS],
             tables_for: None,
             indices: Vec::new(),
             done: Vec::new(),
             done_crt: None,
             bytes: Vec::new(),
+            screen_rows: HEIGHT,
+            crt_warned: false,
             cur: 0,
             have_prev: false,
         }
@@ -250,20 +282,21 @@ impl Renderer {
     }
 
     /// Parameters for the CRT drawn in `screen` (window pixels).
-    fn set_params(&mut self, view: &CrtView, screen: &Rect) {
+    fn set_params(&mut self, view: &CrtView, screen: &Rect, rows: usize) {
         if self.tables_for != Some(view.crt) {
             self.values = tables(view.crt);
             self.tables_for = Some(view.crt);
         }
         let m = view.crt.model.monitor();
+        let sig = m.signal();
         // Window pixels per mm on the tube, from the line pitch
         let px_mm = screen.sy / m.line_pitch();
-        let samples_per_mm = crt::SAMPLES as f64 / WIDTH as f64 / m.pixel_width();
+        let samples_per_mm = sig.samples as f64 / WIDTH as f64 / m.pixel_width();
         let v = &mut self.values;
         let dynamic = [
             (view.crt.input != crt::Input::LumaChroma) as u8 as f64, view.blend as u8 as f64,
             crt::MASK_STRENGTH, m.glow.0,
-            screen.x, screen.y, screen.sx * WIDTH as f64, screen.sy * HEIGHT as f64,
+            screen.x, screen.y, screen.sx * WIDTH as f64, screen.sy * rows as f64,
             m.triad_pitch * px_mm, m.slot_pitch * px_mm, m.stripe, m.bridge,
             m.beam_sigma.0, m.beam_sigma.1, m.glow.1 * samples_per_mm, m.glow.1 / m.line_pitch(),
             crt::MASK_WHITE_LOSS,
@@ -272,12 +305,14 @@ impl Renderer {
         for (i, x) in dynamic.iter().chain(&white).enumerate() {
             v[i] = *x as f32;
         }
+        v[20] = (view.frame & 1) as f32;
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.queue.write_buffer(&self.params, 0, &bytes);
     }
 
-    /// Signal chain of a new frame (or of new settings) into `lin[cur]`.
-    fn run_signal(&mut self, encoder: &mut wgpu::CommandEncoder, screen: &[u32], crt: Crt) {
+    /// Signal chain of a new frame (or of new settings) into `lin[cur]` of
+    /// the CRT set.
+    fn run_signal(&mut self, encoder: &mut wgpu::CommandEncoder, screen: &[u32], crt: Crt, frame: u64) {
         self.indices.clear();
         let mut last = (u32::MAX, 0u8);
         for &p in screen {
@@ -287,6 +322,8 @@ impl Renderer {
             }
             self.indices.push(last.1);
         }
+        // The frame parity counts too: the NTSC subcarrier alternates
+        self.indices.push((frame & 1) as u8);
         let same_crt = self.done_crt == Some(crt);
         if self.indices == self.done && same_crt {
             return;
@@ -298,61 +335,90 @@ impl Renderer {
         }
         std::mem::swap(&mut self.indices, &mut self.done);
         self.done_crt = Some(crt);
+        let set = self.crt.as_ref().expect("CRT set");
+        let rows = screen.len() / WIDTH;
         self.queue.write_texture(
-            self.index_tex.as_image_copy(),
-            &self.done,
+            set.index_tex.as_image_copy(),
+            &self.done[..screen.len()],
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(WIDTH as u32), rows_per_image: None },
-            wgpu::Extent3d { width: WIDTH as u32, height: HEIGHT as u32, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: WIDTH as u32, height: rows as u32, depth_or_array_layers: 1 },
         );
         let params = self.params.as_entire_binding();
-        let index = view(&self.index_tex);
-        let p = &self.pipes;
-        let vic = self.bind(&p.vic, &[(0, params.clone()), (1, wgpu::BindingResource::TextureView(&index))]);
-        self.signal_pass(encoder, &p.vic, &vic, &self.sig);
-        let mut input = &self.sig;
+        let index = view(&set.index_tex);
+        let tv = wgpu::BindingResource::TextureView;
+        let vic = self.bind(&set.vic, &[(0, params.clone()), (1, tv(&index))]);
+        self.signal_pass(encoder, &set.vic, &vic, &set.sig_tex);
+        let mut input = &set.sig_tex;
         if crt.input != crt::Input::LumaChroma {
-            let cable = self.bind(&p.cable, &[(0, params.clone()), (2, wgpu::BindingResource::TextureView(&self.sig))]);
-            self.signal_pass(encoder, &p.cable, &cable, &self.cab);
-            input = &self.cab;
+            let cable = self.bind(&set.cable, &[(0, params.clone()), (2, tv(&set.sig_tex))]);
+            self.signal_pass(encoder, &set.cable, &cable, &set.cab);
+            input = &set.cab;
         }
-        let separate = self.bind(&p.separate, &[(0, params.clone()), (2, wgpu::BindingResource::TextureView(input))]);
-        self.signal_pass(encoder, &p.separate, &separate, &self.sep);
-        let decode = self.bind(&p.decode, &[(0, params.clone()), (2, wgpu::BindingResource::TextureView(&self.sep))]);
-        self.signal_pass(encoder, &p.decode, &decode, &self.lin[self.cur]);
-        let glow_h = self.bind(&p.glow_h, &[(0, params.clone()), (3, wgpu::BindingResource::TextureView(&self.lin[self.cur]))]);
-        self.signal_pass(encoder, &p.glow_h, &glow_h, &self.glow[0]);
-        let glow_v = self.bind(&p.glow_v, &[(0, params), (5, wgpu::BindingResource::TextureView(&self.glow[0]))]);
-        self.signal_pass(encoder, &p.glow_v, &glow_v, &self.glow[1]);
+        let separate = self.bind(&set.separate, &[(0, params.clone()), (2, tv(input))]);
+        self.signal_pass(encoder, &set.separate, &separate, &set.sep);
+        let decode = self.bind(&set.decode, &[(0, params.clone()), (2, tv(&set.sep))]);
+        self.signal_pass(encoder, &set.decode, &decode, &set.lin[self.cur]);
+        let glow_h = self.bind(&set.glow_h, &[(0, params.clone()), (3, tv(&set.lin[self.cur]))]);
+        self.signal_pass(encoder, &set.glow_h, &glow_h, &set.glow[0]);
+        let glow_v = self.bind(&set.glow_v, &[(0, params), (5, tv(&set.glow[0]))]);
+        self.signal_pass(encoder, &set.glow_v, &glow_v, &set.glow[1]);
     }
 
     /// Draws the screen (and the bar, if any) into `target`, `dw`×`dh`.
     pub fn render(&mut self, encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, dw: u32, dh: u32,
                   screen: &[u32], bar: Option<&[u32]>, crt: Option<CrtView>) -> Placement {
-        let placement = layout(dw as usize, dh as usize, bar.is_some(), crt.is_some());
+        let rows = screen.len() / WIDTH;
+        // The monitor decodes one standard: the frame must be of it (after
+        // loading a state of the other standard it is drawn as it is)
+        let crt = match crt {
+            Some(v) if v.crt.model.monitor().standard.fb_height() != rows => {
+                if !self.crt_warned {
+                    self.crt_warned = true;
+                    crate::notice!("WARN: the {} does not show this video standard: CRT emulation off.", v.crt.model.full_name());
+                }
+                None
+            }
+            c => c,
+        };
+        if rows != self.screen_rows {
+            self.screen_tex = texture(&self.device, WIDTH, rows, wgpu::TextureFormat::Bgra8Unorm, false);
+            self.screen_rows = rows;
+        }
+        let aspect = crt.map(|v| v.crt.model.monitor().signal().pixel_aspect());
+        let placement = layout(dw as usize, dh as usize, rows, bar.is_some(), aspect);
         let screen_group = match &crt {
             Some(v) => {
-                self.set_params(v, &placement.screen);
-                self.run_signal(encoder, screen, v.crt);
+                let standard = v.crt.model.monitor().standard;
+                if self.crt.as_ref().is_none_or(|set| set.sig.standard != standard) {
+                    self.crt = Some(CrtSet::new(&self.device, self.format, standard));
+                    self.done.clear();
+                    self.done_crt = None;
+                    self.have_prev = false;
+                }
+                self.set_params(v, &placement.screen, rows);
+                self.run_signal(encoder, screen, v.crt, v.frame);
+                let set = self.crt.as_ref().expect("CRT set");
                 let prev = if self.have_prev { self.cur ^ 1 } else { self.cur };
+                let tv = wgpu::BindingResource::TextureView;
                 let entries = [
                     (0, self.params.as_entire_binding()),
-                    (3, wgpu::BindingResource::TextureView(&self.lin[self.cur])),
-                    (4, wgpu::BindingResource::TextureView(&self.lin[prev])),
-                    (5, wgpu::BindingResource::TextureView(&self.glow[1])),
+                    (3, tv(&set.lin[self.cur])),
+                    (4, tv(&set.lin[prev])),
+                    (5, tv(&set.glow[1])),
                     (6, wgpu::BindingResource::Sampler(&self.sampler)),
                 ];
-                self.bind(&self.pipes.crt, &entries)
+                self.bind(&set.crt, &entries)
             }
             None => {
                 let tex = self.screen_tex.clone();
                 self.write_image(&tex, screen);
-                self.bind(&self.pipes.blit, &[(7, wgpu::BindingResource::TextureView(&view(&tex)))])
+                self.bind(&self.blit, &[(7, wgpu::BindingResource::TextureView(&view(&tex)))])
             }
         };
         let bar_group = bar.map(|pixels| {
             let tex = self.bar_tex.clone();
             self.write_image(&tex, pixels);
-            self.bind(&self.pipes.blit, &[(7, wgpu::BindingResource::TextureView(&view(&tex)))])
+            self.bind(&self.blit, &[(7, wgpu::BindingResource::TextureView(&view(&tex)))])
         });
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -376,13 +442,16 @@ impl Renderer {
             let y1 = (r.y + r.sy * rows as f64).min(dh as f64);
             pass.set_viewport(x0 as f32, y0 as f32, (x1 - x0).max(1.0) as f32, (y1 - y0).max(1.0) as f32, 0.0, 1.0);
         };
-        viewport(&mut pass, &placement.screen, HEIGHT);
-        pass.set_pipeline(if crt.is_some() { &self.pipes.crt } else { &self.pipes.blit });
+        viewport(&mut pass, &placement.screen, rows);
+        match (&crt, &self.crt) {
+            (Some(_), Some(set)) => pass.set_pipeline(&set.crt),
+            _ => pass.set_pipeline(&self.blit),
+        }
         pass.set_bind_group(0, &screen_group, &[]);
         pass.draw(0..3, 0..1);
         if let (Some(group), Some(r)) = (&bar_group, &placement.bar) {
             viewport(&mut pass, r, super::status::BAR_HEIGHT);
-            pass.set_pipeline(&self.pipes.blit);
+            pass.set_pipeline(&self.blit);
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -473,16 +542,23 @@ impl WindowRenderer {
 // ── Images ───────────────────────────────────────────────────────────────────
 
 /// The C64 screen through the CRT emulation, as an ARGB image `height`
-/// pixels high (width from the PAL pixel aspect). Creates a device of its
-/// own: for screenshots, not for every frame.
-pub fn crt_image(screen: &[u32], crt: Crt, height: usize) -> Result<(Vec<u32>, usize, usize), String> {
+/// pixels high (width from the pixel aspect of the standard), for frame
+/// number `frame` (its parity: the NTSC subcarrier alternates). Creates a
+/// device of its own: for screenshots, not for every frame.
+pub fn crt_image(screen: &[u32], crt: Crt, height: usize, frame: u64) -> Result<(Vec<u32>, usize, usize), String> {
+    let standard = crt.model.monitor().standard;
+    if screen.len() != standard.fb_len() {
+        return Err(format!("the {} does not show this video standard", crt.model.full_name()));
+    }
+    let rows = standard.fb_height();
+    let aspect = crt.model.monitor().signal().pixel_aspect();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         .map_err(|e| format!("no GPU: {e}"))?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
         .map_err(|e| e.to_string())?;
     let format = wgpu::TextureFormat::Bgra8Unorm;
-    let (w, h) = ((height as f64 * WIDTH as f64 * crt::PIXEL_ASPECT / HEIGHT as f64).round() as usize, height);
+    let (w, h) = ((height as f64 * WIDTH as f64 * aspect / rows as f64).round() as usize, height);
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size: wgpu::Extent3d { width: w as u32, height: h as u32, depth_or_array_layers: 1 },
@@ -503,7 +579,7 @@ pub fn crt_image(screen: &[u32], crt: Crt, height: usize) -> Result<(Vec<u32>, u
     let mut renderer = Renderer::new(device.clone(), queue.clone(), format);
     let mut encoder = device.create_command_encoder(&Default::default());
     renderer.render(&mut encoder, &view(&target), w as u32, h as u32, screen, None,
-                    Some(CrtView { crt, blend: false }));
+                    Some(CrtView { crt, blend: false, frame }));
     encoder.copy_texture_to_buffer(
         target.as_image_copy(),
         wgpu::TexelCopyBufferInfo {

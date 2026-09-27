@@ -5,8 +5,7 @@ use crate::{cpu::{Cpu, Flags}, mem::Bus, disk::D64, cart, reu::DmaCycle};
 use crate::snapshot::{impl_state, impl_state_enum, Reader, State, Writer};
 use std::path::{Path, PathBuf};
 
-pub const CLOCK_HZ: u64 = 985_248;
-pub const CYCLES_PER_FRAME: u32 = (CLOCK_HZ / 50) as u32; // PAL 50 Hz
+use crate::timing::Standard;
 
 /// Kind of queued PRG.
 #[derive(Clone, Copy, PartialEq)]
@@ -37,6 +36,8 @@ pub struct StepResult {
 }
 
 pub struct C64 {
+    /// PAL (default) or NTSC machine (`set_standard`).
+    standard: Standard,
     pub cpu: Cpu,
     pub bus: Bus,
     /// Last complete frame (background + sprites): the one to present.
@@ -97,6 +98,7 @@ impl C64 {
         Self {
             cpu: Cpu::new(),
             bus: Bus::new(),
+            standard: Standard::Pal,
             framebuffer: vec![0xFF000000; WIDTH * HEIGHT],
             work_fb: vec![0xFF000000; WIDTH * HEIGHT],
             blend: None,
@@ -133,6 +135,52 @@ impl C64 {
 
     pub fn blend(&self) -> bool {
         self.blend.is_some()
+    }
+
+    pub fn standard(&self) -> Standard {
+        self.standard
+    }
+
+    /// Video standard: PAL (VIC-II 6569, the default) or NTSC (6567R8),
+    /// with the clock, the raster and the framebuffer size (`fb_height`)
+    /// that go with it; the CIAs' TOD inputs (50 or 60 Hz mains), the SID,
+    /// the drive and the Datasette follow the clock. The machine is reset:
+    /// as changing the crystal and the VIC-II of a real C64.
+    pub fn set_standard(&mut self, standard: Standard) -> Result<(), String> {
+        self.standard = standard;
+        self.bus.vic.standard = standard;
+        let len = standard.fb_len();
+        self.framebuffer = vec![0xFF000000; len];
+        self.work_fb = vec![0xFF000000; len];
+        if let Some(prev) = &mut self.blend {
+            *prev = vec![0xFF000000; len];
+        }
+        self.frame_elapsed = 0;
+        self.apply_clocks()?;
+        self.reset();
+        Ok(())
+    }
+
+    /// Framebuffer height (the width is `vic::WIDTH`): 284 PAL, 253 NTSC.
+    pub fn fb_height(&self) -> usize {
+        self.standard.fb_height()
+    }
+
+    /// Gives the clock of the standard to the parts timed by it.
+    fn apply_clocks(&mut self) -> Result<(), String> {
+        let s = self.standard;
+        let hz = s.clock_hz();
+        self.bus.cia1.set_tod_input(hz, s.mains_hz());
+        self.bus.cia2.set_tod_input(hz, s.mains_hz());
+        self.bus.sid.set_clock(hz)?;
+        if let Some(sid2) = &mut self.bus.sid2 {
+            sid2.set_clock(hz)?;
+        }
+        if let Some(drive) = &mut self.bus.drive {
+            drive.set_c64_clock(hz);
+        }
+        self.bus.tape.set_clock(hz);
+        Ok(())
     }
 
     /// The last complete frame as the VIC drew it, also with frame
@@ -325,7 +373,12 @@ impl C64 {
     pub fn insert_tape_file(&mut self, path: &str) -> Result<bool, String> {
         let (tap, blank) = match std::fs::read(path) {
             Ok(data) => (crate::tape::Tap::from_bytes(&data).map_err(|e| format!("TAP error: {e}"))?, false),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (crate::tape::Tap::blank(), true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // As VICE, the header says the machine's video standard
+                let mut tap = crate::tape::Tap::blank();
+                tap.video = (self.standard == Standard::Ntsc) as u8;
+                (tap, true)
+            }
             Err(e) => return Err(format!("Cannot read {path}: {e}")),
         };
         self.replace_tape(tap, path.to_string());
@@ -464,7 +517,9 @@ impl C64 {
         const NAMES: [&str; 3] = ["dos1541.rom", "1541.rom", "dos1541-325302-01+901229-05.bin"];
         let rom = NAMES.iter().find_map(|n| std::fs::read(dir.join(n)).ok())
             .ok_or_else(|| format!("1541 ROM not found in {} ({})", dir.display(), NAMES.join(", ")))?;
-        self.bus.drive = Some(Box::new(crate::drive::Drive::new(&rom, 8)?));
+        let mut drive = Box::new(crate::drive::Drive::new(&rom, 8)?);
+        drive.set_c64_clock(self.standard.clock_hz());
+        self.bus.drive = Some(drive);
         Ok(())
     }
 
@@ -713,6 +768,7 @@ impl C64 {
         fresh.dbg = std::mem::take(&mut self.dbg);
         // Audio belongs to the frontend: it stays as it was, also for the
         // second SID of the state
+        fresh.apply_clocks()?;
         let rate = self.bus.sid.audio_rate();
         fresh.bus.sid.inherit_audio(rate)?;
         if let Some(sid2) = &mut fresh.bus.sid2 {
@@ -877,7 +933,7 @@ impl C64 {
         }
 
         self.frame_elapsed += elapsed;
-        let frame_done = self.frame_elapsed >= CYCLES_PER_FRAME;
+        let frame_done = self.frame_elapsed >= self.standard.slice_cycles();
         if frame_done {
             self.frame_elapsed = 0;
             self.end_of_frame();
@@ -1042,6 +1098,7 @@ impl C64 {
             return Err(format!("invalid second SID address: ${base:04X} ($D420-$D7E0 or $DE00-$DFE0, in steps of $20)"));
         }
         let mut sid2 = Box::new(crate::sid::Sid::new());
+        sid2.set_clock(self.standard.clock_hz())?;
         sid2.set_model(self.bus.sid.model(), self.bus.sid.digiboost());
         sid2.set_audio(self.bus.sid.audio_rate())?;
         sid2.sync_sampling(&self.bus.sid);
@@ -1109,11 +1166,13 @@ impl C64 {
     }
 
     /// Tape load: the tape has been moving without stopping for at least
-    /// `TAPE_LOAD_CYCLES`. Many games turn the motor on for a few frames
-    /// when they set $01 to $00 to read the RAM under the I/O: the tape
-    /// moves in bursts but it is not a load.
+    /// a second. Many games turn the motor on for a few frames when they
+    /// set $01 to $00 to read the RAM under the I/O: the tape moves in
+    /// bursts but it is not a load; a load keeps the motor on for tens of
+    /// seconds.
     pub fn tape_loading(&self) -> bool {
-        self.bus.tape.moving_since().is_some_and(|t| self.bus.cycle - t >= TAPE_LOAD_CYCLES)
+        let second = self.standard.clock_hz();
+        self.bus.tape.moving_since().is_some_and(|t| self.bus.cycle - t >= second)
     }
 }
 
@@ -1130,11 +1189,6 @@ pub struct LoadDetector {
 /// Frames of drive silence before returning to real speed: covers the
 /// short pauses of a load, such as track changes.
 pub const LOAD_HOLD_FRAMES: u32 = 25;
-
-/// Continuous tape movement that counts as a load: one second.
-/// A load keeps the motor on for tens of seconds; motor bursts in games
-/// last a few frames.
-pub const TAPE_LOAD_CYCLES: u64 = CLOCK_HZ;
 
 impl LoadDetector {
     pub fn new() -> Self {
@@ -1164,7 +1218,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 18;
+const STATE_VERSION: u32 = 19;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
@@ -1198,7 +1252,7 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
 // Excluded: the audio buffer (rewritten every frame), the debugger hooks,
 // frame blending and the CRT emulation (display settings).
 impl_state!(C64 {
-    cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
+    standard, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
     disk, disk_path, disk_autoload, tape_path, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
     autoload_run,
     frame_elapsed, frame_count,

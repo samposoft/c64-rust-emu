@@ -4,9 +4,11 @@
 // Daniel Kahlin, Ettore Perazzoli, Andreas Boose.
 // Ported to Rust and modified by SampoSoft in 2026; see CREDITS.md.
 
-//! Cycle-exact VIC-II 6569 (PAL): a port of the x64sc core of VICE 3.10
-//! (`src/viciisc`: vicii-cycle.c, vicii-fetch.c, vicii-draw-cycle.c,
-//! vicii-mem.c, vicii-chip-model.c).
+//! Cycle-exact VIC-II 6569 (PAL) and 6567R8 (NTSC): a port of the x64sc
+//! core of VICE 3.10 (`src/viciisc`: vicii-cycle.c, vicii-fetch.c,
+//! vicii-draw-cycle.c, vicii-mem.c, vicii-chip-model.c). The two chips
+//! differ in cycles per line (63, 65), raster lines (312, 263) and the
+//! cycle table (`tables.rs`); see `crate::timing`.
 //!
 //! `cycle` does what VICE's `vicii_cycle()` does: it completes the phi2
 //! accesses of the cycle just ended (after the CPU access), moves to the next
@@ -22,13 +24,19 @@
 //! changes color from X = 8W - 111.
 
 use crate::mem::Bus;
+use crate::timing::Standard;
 
+mod tables;
+
+/// Framebuffer width, the same for PAL and NTSC.
 pub const WIDTH: usize = 403;
+/// Framebuffer height of PAL, the largest (NTSC: `Standard::fb_height`).
 pub const HEIGHT: usize = 284;
 
-// The 403×284 framebuffer is centred on the 320×200 display area: VIC X
+// The framebuffer is centred horizontally on the 320×200 display area: VIC X
 // coordinate (0-503) becomes fb_x = X + 17 (X=24, left border in 40 columns,
 // lands at fb_x 41), with X ≥ 400 wrapped to the left (end of previous line).
+/// First PAL framebuffer line of the 320×200 display area.
 pub const DISPLAY_Y: usize = (HEIGHT - 200) / 2; // 42
 /// First framebuffer column of the 320×200 display area.
 pub const DISPLAY_X: usize = 41;
@@ -36,7 +44,6 @@ pub const DISPLAY_X: usize = 41;
 /// First PAL raster line mapped into the framebuffer: line 51 (start of the
 /// 25-row display) lands at fb_y = DISPLAY_Y.
 pub const FIRST_FB_LINE: u16 = 51 - DISPLAY_Y as u16; // 9
-const LAST_FB_LINE: u16 = FIRST_FB_LINE + HEIGHT as u16 - 1; // 292
 
 pub const C64_PALETTE: [u32; 16] = [
     0xFF000000, // 0  black
@@ -57,10 +64,11 @@ pub const C64_PALETTE: [u32; 16] = [
     0xFFB2B2B2, // 15 light grey
 ];
 
-// ── Cycle table (vicii-chip-model.c, 6569) ───────────────────────────────────
+// ── Cycle table (vicii-chip-model.c) ─────────────────────────────────────────
 //
-// Index: our cycle k (0-62). k = Bauer cycle 1-62, k = 0 is cycle 63.
-// RASTER advances at cycle 1, as in VICE (raster_cycle 0).
+// Index: our cycle k (0 to cycles per line - 1). k = Bauer cycle 1 onwards,
+// k = 0 is the last cycle (63 PAL, 65 NTSC). RASTER advances at cycle 1, as
+// in VICE (raster_cycle 0).
 
 /// Cycles 15-54: c-access in phi2; drawing in the next cycle latches graphics.
 const VISIBLE: u16 = 1 << 0;
@@ -80,7 +88,7 @@ const BRD_R1: u16 = 1 << 12; // 57: with CSEL=1
 
 /// VIC access in phi1. Sprites: pointer (phi1) + DMA 0 (phi2) in the first
 /// cycle, DMA 1 (phi1) + DMA 2 (phi2) in the second.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Phi1 {
     Idle,
     Refresh,
@@ -89,7 +97,7 @@ enum Phi1 {
     SprDma1(u8),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 struct Cyc {
     flags: u16,
     phi1: Phi1,
@@ -99,48 +107,14 @@ struct Cyc {
     spr_ba: u8,
 }
 
-const fn build_cycles() -> [Cyc; 63] {
-    let mut t = [Cyc { flags: 0, phi1: Phi1::Idle, xpos: 0, spr_ba: 0 }; 63];
-    let ptr = [58u16, 60, 62, 1, 3, 5, 7, 9];
-    let mut k = 0;
-    while k < 63 {
-        let b: u16 = if k == 0 { 63 } else { k as u16 };
-        let mut f = 0u16;
-        if b >= 15 && b <= 54 { f |= VISIBLE; }
-        if b >= 12 && b <= 54 { f |= FETCH_BA; }
-        if b == 14 { f |= UPDATE_VC; }
-        if b == 15 { f |= SPR_CRUNCH; }
-        if b == 16 { f |= UPDATE_MCBASE; }
-        if b == 17 { f |= BRD_L1; }
-        if b == 18 { f |= BRD_L0; }
-        if b == 55 { f |= SPR_DMA; }
-        if b == 56 { f |= SPR_DMA | SPR_EXP | BRD_R0; }
-        if b == 57 { f |= BRD_R1; }
-        if b == 58 { f |= SPR_DISP | UPDATE_RC; }
-        let mut phi1 = Phi1::Idle;
-        if b >= 16 && b <= 55 { phi1 = Phi1::FetchG; }
-        if b >= 11 && b <= 15 { phi1 = Phi1::Refresh; }
-        let mut spr_ba = 0u8;
-        let mut n = 0;
-        while n < 8 {
-            if b == ptr[n] { phi1 = Phi1::SprPtr(n as u8); }
-            if b == ptr[n] % 63 + 1 { phi1 = Phi1::SprDma1(n as u8); }
-            // BA: 3 cycles of warning plus the two access cycles, from cycle 55+2n
-            let first = 55 + 2 * n as u16;
-            let mut i = 0;
-            while i < 5 {
-                if b == (first - 1 + i) % 63 + 1 { spr_ba |= 1 << n; }
-                i += 1;
-            }
-            n += 1;
-        }
-        t[k] = Cyc { flags: f, phi1, xpos: (400 + 8 * (b - 1)) % 504, spr_ba };
-        k += 1;
+/// Cycle table of the chip.
+fn table(standard: Standard) -> &'static [Cyc] {
+    match standard {
+        Standard::Pal => &tables::PAL,
+        Standard::Ntsc => &tables::NTSC,
     }
-    t
 }
 
-const CYCLES: [Cyc; 63] = build_cycles();
 
 // ── Drawing color codes (vicii-draw-cycle.c) ─────────────────────────────────
 //
@@ -256,12 +230,14 @@ pub struct Tick {
     pub ba_low: bool,
     /// The VIC uses the bus in phi2 (c-access or sprite DMA): CPU stalled
     pub aec_low: bool,
-    /// The frame is complete (last pixel of line 311 drawn)
+    /// The picture is complete (end of `Standard::frame_end_line`)
     pub frame_done: bool,
 }
 
 /// Internal VIC-II state (the needed subset of `vicii_t`).
 pub struct VicState {
+    /// PAL or NTSC chip (`C64::set_standard`)
+    pub standard: Standard,
     /// Registers; $D019 holds the IRQ status (VICE's irq_status)
     pub regs: [u8; 64],
     pub raster_line: u16,
@@ -309,6 +285,7 @@ impl VicState {
         // At reset all VIC registers are 0 (DEN=0: border-colored screen, no
         // bad lines until the KERNAL programs them in CINT).
         Self {
+            standard: Standard::Pal,
             regs: [0u8; 64],
             raster_line: 0,
             cycle: 1,
@@ -402,7 +379,7 @@ impl VicState {
                 for n in 0..8 {
                     let b = 1u8 << n;
                     if val & b == 0 && !self.sprites[n].exp_flop {
-                        if CYCLES[self.cycle as usize].flags & SPR_CRUNCH != 0 {
+                        if table(self.standard)[self.cycle as usize].flags & SPR_CRUNCH != 0 {
                             let s = &mut self.sprites[n];
                             s.mc = (0x2A & (s.mcbase & s.mc)) | (0x15 & (s.mcbase | s.mc));
                         }
@@ -462,7 +439,7 @@ impl VicState {
     }
 
     /// True in the cycle where RASTER moves to a new line: cycle 1, but cycle
-    /// 2 for line 0 (in VICE line 311 lasts one extra cycle).
+    /// 2 for line 0 (in VICE the last line lasts one extra cycle).
     pub fn line_start(&self) -> bool {
         self.cycle == if self.raster_line == 0 { 2 } else { 1 }
     }
@@ -654,16 +631,19 @@ fn sprite_dma_1(bus: &mut Bus, n: usize) -> u8 {
 /// `cpu_pc` is used for the c-access in the first three BA cycles, when the
 /// bus still belongs to the CPU (the VIC reads $FF and color nibble RAM[PC]).
 pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
+    let standard = bus.vic.standard;
+    let tab = table(standard);
+    let n = standard.cycles_per_line();
     // Phi2 of the cycle just ended, after the CPU access: sprite DMA
-    match CYCLES[bus.vic.cycle as usize].phi1 {
+    match tab[bus.vic.cycle as usize].phi1 {
         Phi1::SprPtr(n) => sprite_dma_phi2(bus, n as usize, 16),
         Phi1::SprDma1(n) => sprite_dma_phi2(bus, n as usize, 0),
         _ => {}
     }
 
-    let k = (bus.vic.cycle + 1) % 63;
+    let k = (bus.vic.cycle + 1) % n;
     bus.vic.cycle = k;
-    let c = CYCLES[k as usize];
+    let c = tab[k as usize];
 
     // Phi1. Every access reads memory: the CPU sees the byte on the open bus.
     bus.vic.last_read_phi1 = match c.phi1 {
@@ -690,7 +670,7 @@ pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
 
     let can_ss = v.sprite_sprite_collisions == 0;
     let can_sb = v.sprite_background_collisions == 0;
-    draw_cycle(v, fb);
+    draw_cycle(v, fb, tab);
     match v.clear_collisions {
         0x1E => {
             v.sprite_sprite_collisions = 0;
@@ -714,8 +694,10 @@ pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
     // End of line and start of the next
     let mut frame_done = false;
     if k == 1 {
-        if v.raster_line == 311 {
+        if v.raster_line == standard.raster_lines() - 1 {
             v.start_of_frame = true;
+        }
+        if v.raster_line == standard.frame_end_line() {
             frame_done = true;
         }
         // DEN in the first cycle of the line after $30; no bad lines from $F7
@@ -833,13 +815,14 @@ pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
 
 // ── Drawing (vicii-draw-cycle.c, 6569 with color latency) ────────────────────
 
-fn draw_cycle(v: &mut VicState, fb: &mut [u32]) {
+fn draw_cycle(v: &mut VicState, fb: &mut [u32], tab: &[Cyc]) {
     let k = v.cycle;
     if k == 2 {
         v.dbuf_line = if v.start_of_frame { 0 } else { v.raster_line };
     }
     // Drawing uses the flags of the previous cycle (cycle_flags_pipe)
-    let pc = CYCLES[((k + 62) % 63) as usize];
+    let n = tab.len() as u16;
+    let pc = tab[((k + n - 1) % n) as usize];
     // Fast path: 8 pixels all border, no sprite to draw and an empty graphics
     // pipeline. The result is the same as full drawing, which here would only
     // update the pipeline state.
@@ -1234,14 +1217,12 @@ fn draw_colors8(v: &mut VicState, fb: &mut [u32]) {
     d.last_color_value = v.last_color_value;
     v.last_color_reg = 0xFF;
 
-    let line = v.dbuf_line;
-    if !(FIRST_FB_LINE..=LAST_FB_LINE).contains(&line) {
-        return;
-    }
+    let Some(row) = v.standard.fb_row(v.dbuf_line) else { return };
     // Position in VICE's line buffer (reset at cycle 2), mapped to the VIC X
     // of the pixels: X = 8·(drawing cycle) - 120 + i
-    let offs = 8 * ((v.cycle as i32 + 61) % 63);
-    let row = (line - FIRST_FB_LINE) as usize * WIDTH;
+    let n = v.standard.cycles_per_line() as i32;
+    let offs = 8 * ((v.cycle as i32 + n - 2) % n);
+    let row = row * WIDTH;
     let fx = offs - 95;
     if fx >= 0 && fx as usize + 8 <= WIDTH {
         let dst = &mut fb[row + fx as usize..row + fx as usize + 8];
@@ -1275,7 +1256,7 @@ impl_state!(Draw {
 });
 
 impl_state!(VicState {
-    regs, raster_line, cycle, raster_irq_triggered, start_of_frame,
+    standard, regs, raster_line, cycle, raster_irq_triggered, start_of_frame,
     allow_bad_lines, bad_line, idle_state, vc, vcbase, rc, vmli, vbuf, cbuf,
     gbuf, refresh_counter, prefetch_cycles, last_bus_phi2, last_read_phi1,
     reg11_delay, main_border, vborder, set_vborder, sprites, sprite_dma,

@@ -168,9 +168,12 @@ impl M93c86 {
         }
         self.shift = (self.shift << 1) | self.di as u32;
         self.count += 1;
-        let opcode = (self.shift >> (self.count - 3).min(31)) & 3;
+        // The two opcode bits follow the start bit: complete from bit 3 on,
+        // they are needed only once the address (13) or the data (29) is in
+        let opcode = || (self.shift >> (self.count - 3)) & 3;
         match self.count {
             13 => {
+                let opcode = opcode();
                 let addr = (self.shift & 0x3FF) as u16;
                 match opcode {
                     0b10 => {
@@ -197,6 +200,7 @@ impl M93c86 {
                 }
             }
             29 => {
+                let opcode = opcode();
                 let addr = ((self.shift >> 16) & 0x3FF) as u16;
                 let value = self.shift as u16;
                 if self.write_enabled {

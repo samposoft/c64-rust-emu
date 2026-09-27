@@ -53,8 +53,10 @@ pub struct Status {
     /// Port driven by the keyboard.
     pub keyboard_port: JoyPort,
     pub gamepad: bool,
-    /// Emulated frames per second (50 at real speed).
+    /// Emulated frames per second (50 PAL, 60 NTSC at real speed).
     pub fps: f32,
+    /// Frames per second at real speed: 50 PAL, 60 NTSC.
+    pub nominal_fps: f32,
     /// Load turbo (or maximum speed in the debugger).
     pub turbo: bool,
     /// Emulation paused (debugger).
@@ -96,6 +98,9 @@ impl Status {
         if c64.bus.sid2.is_some() {
             config += "x2";
         }
+        if c64.standard() == crate::timing::Standard::Ntsc {
+            config += " NTSC";
+        }
         if let Some(reu) = &c64.bus.reu {
             config += &format!(" REU{}", if reu.kb() >= 1024 { format!("{}M", reu.kb() / 1024) } else { reu.kb().to_string() });
         }
@@ -118,7 +123,8 @@ impl Status {
             mouse_captured: false,
             keyboard_port: JoyPort::Two,
             gamepad: false,
-            fps: 50.0,
+            fps: c64.standard().mains_hz() as f32,
+            nominal_fps: c64.standard().mains_hz() as f32,
             turbo: false,
             paused: false,
             media: None,
@@ -163,7 +169,7 @@ impl Status {
     }
 
     fn speed_text(&self) -> String {
-        let pct = (self.fps * 2.0).round() as u32; // 50 frame/s = 100%
+        let pct = (self.fps * 100.0 / self.nominal_fps).round() as u32;
         if self.paused {
             "PAUSED".into()
         } else if self.turbo {
@@ -221,12 +227,13 @@ fn shorten(s: &str, max: usize) -> String {
 pub struct SpeedMeter {
     since: Instant,
     frames: u32,
-    fps: f32,
+    /// None until the first measure.
+    fps: Option<f32>,
 }
 
 impl SpeedMeter {
     pub fn new() -> Self {
-        Self { since: Instant::now(), frames: 0, fps: 50.0 }
+        Self { since: Instant::now(), frames: 0, fps: None }
     }
 
     /// To be called on every emulated frame.
@@ -234,13 +241,14 @@ impl SpeedMeter {
         self.frames += 1;
         let t = self.since.elapsed();
         if t >= Duration::from_millis(500) {
-            self.fps = self.frames as f32 / t.as_secs_f32();
+            self.fps = Some(self.frames as f32 / t.as_secs_f32());
             self.frames = 0;
             self.since = Instant::now();
         }
     }
 
-    pub fn fps(&self) -> f32 {
+    /// Frames per second measured, None before the first half second.
+    pub fn fps(&self) -> Option<f32> {
         self.fps
     }
 }

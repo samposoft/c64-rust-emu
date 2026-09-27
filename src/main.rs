@@ -139,7 +139,7 @@ impl App {
     /// a click in the window.
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
         let at = self.placement.to_image_signed(self.cursor.0, self.cursor.1);
-        match self.capture.button(button, pressed, at, self.session.analog()) {
+        match self.capture.button(button, pressed, at, self.session.analog(), self.placement.rows) {
             Pointer::Capture => {
                 let Some(w) = &self.window else { return };
                 if self.capture.capture(w) {
@@ -159,7 +159,7 @@ impl App {
     fn pointer_moved(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
         let at = self.placement.to_image_signed(x, y);
-        if let Some((x, y)) = self.capture.paddles_at(at, self.session.analog()) {
+        if let Some((x, y)) = self.capture.paddles_at(at, self.session.analog(), self.placement.rows) {
             self.session.point_paddles(x, y);
         }
     }

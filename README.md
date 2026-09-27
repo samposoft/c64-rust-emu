@@ -1,8 +1,8 @@
 # c64
 
-Commodore 64 emulator in Rust: 6510 CPU with illegal opcodes, cycle-exact
-VIC-II, SID, CIA, 1541 drive, Datasette, REU, keyboard, joystick, paddles,
-1351 mouse, PRG/D64/G64/TAP/T64/CRT.
+Commodore 64 emulator in Rust: PAL or NTSC machine, 6510 CPU with illegal
+opcodes, cycle-exact VIC-II, SID, CIA, 1541 drive, Datasette, REU,
+keyboard, joystick, paddles, 1351 mouse, PRG/D64/G64/TAP/T64/CRT.
 The frontend uses only pure Rust crates (`winit`, `wgpu`, `softbuffer`,
 `cpal`, `gilrs`): no external libraries to install, a single executable on
 macOS, Linux and Windows. The window is drawn on the GPU, which also
@@ -34,6 +34,7 @@ cargo build --release
 ./target/release/c64 --crt 1084s-d1 prg/game.d64           # as on the 1084S-D1 (Daewoo)
 ./target/release/c64 --crt 1901 prg/game.d64               # as on the 1901 (Thomson)
 ./target/release/c64 --rf prg/game.d64                     # on a home TV through the RF modulator
+./target/release/c64 --ntsc prg/game.d64                   # an NTSC C64 (American, 60 Hz) instead of PAL
 ./target/release/c64 --composite prg/game.d64              # the same monitor through composite video
 ./target/release/c64mcp                                    # MCP server for Claude, see below
 ```
@@ -269,24 +270,74 @@ the previous one, which is what the eye sees on the CRT; screenshots are
 blended too. Moving objects leave a half-bright trail, so it is off by
 default. `demo/earthrise` is an IFLI picture made for it.
 
+### PAL and NTSC: `--ntsc`
+
+The emulator is a PAL C64 (the European one) by default; `--ntsc` makes it
+an NTSC C64 (the American and Japanese one), in all the frontends and in the
+debugger. The two differ only in the crystal and in the VIC-II; ROMs, SID,
+CIAs and the 1541 are the same, and the KERNAL tells the two apart at boot
+(it writes the result at $02A6: 1 PAL, 0 NTSC) from the number of raster
+lines:
+
+| | PAL | NTSC |
+|---|---|---|
+| VIC-II | 6569 | 6567R8 |
+| Clock | 985,248 Hz | 1,022,730 Hz |
+| Raster | 312 lines × 63 cycles | 263 lines × 65 cycles |
+| Frames per second | 50.12 | 59.83 |
+| Visible lines (screen) | 284 | 253 |
+| CIA TOD input (mains) | 50 Hz | 60 Hz |
+
+The 6567R8 is ported from VICE as the 6569 (the cycle table is converted
+from VICE's `vicii-chip-model.c`, `src/vic/tables.rs`): on its 65 cycles the
+sprites are fetched two cycles later and the line is 520 pixels long; the
+extra cycles fall in the right border and the retrace, so the 320×200
+display is where it is on PAL, with lower top and bottom borders. The screen
+shows lines 22-262 and then lines 0-11 of the next frame, which an NTSC
+monitor shows below them (the vertical retrace is in lines 12-21), as VICE
+does. The SID runs at the NTSC clock (the notes are 3.8% higher than PAL
+with the same values, as on the real machine), the drive and the Datasette
+follow the clock; TAP pulses are played as they are, as VICE does, and new
+tapes are marked NTSC. Programs written for PAL run as on a real NTSC C64:
+those that count on 63 cycles per line (demos, many European games) break
+their raster effects, and those timed by frames run 20% faster.
+
+It is checked against VICE with `x64sc -model ntsc`: the boot matches it
+instruction by instruction and cycle by cycle (1.4 million instructions after
+the RAM test), and the VIC test programs give the same screen, pixel for
+pixel, and the same raster, IRQ and stolen-cycle timings. On an NTSC C64 the CRT emulation (`--crt`) shows the Commodore 1702,
+the NTSC monitor of the C64 (see below).
+
 ### Monitor and TV: `--crt`
 
 `--crt 1084s` (in the debugger `crt 1084s`, `crt off`) shows the screen as
 a real monitor does, emulating on the GPU the analog path from the VIC-II
 to the picture tube; `--rf` (`crt tv`) shows it on a home TV connected to
-the C64's antenna socket. Four sets, from their service manuals:
+the C64's antenna socket. Five sets, from their service manuals:
 
-| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `cp90` (or `tv`) |
-|---|---|---|---|---|
-| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) |
-| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna), composite (SCART) |
-| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm |
-| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed); with RF the IF filter |
-| Luma peaking | none documented | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | none documented |
-| Luma trap (composite, RF) | full | full | none | shallow: -6 dB |
-| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | band-pass, Q about 3 |
-| PAL decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | TDA3561A, 64 µs delay line |
-| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) |
+| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `cp90` (or `tv`) | `1702` |
+|---|---|---|---|---|---|
+| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) | Commodore monitor, JVC chassis (1984) |
+| Standard | PAL | PAL | PAL | PAL | NTSC (`--ntsc`) |
+| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna), composite (SCART) | luma/chroma, composite |
+| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm | 370FVB22, 13", in-line guns, vertical stripes, 0.64 mm |
+| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed); with RF the IF filter | not given (4.2 MHz, NTSC's, assumed) |
+| Luma peaking | none documented | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | none documented | fixed peaking coils, response not given |
+| Luma trap (composite, RF) | full | full | none | shallow: -6 dB | full, 3.58 MHz |
+| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | band-pass, Q about 3 | band-pass amplifier (Q about 3 assumed) |
+| Color decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | TDA3561A, 64 µs delay line | HA11247, NTSC: no delay line |
+| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) | not given (D65 assumed) |
+
+A monitor decodes one standard, as the real ones: the PAL sets go with the
+PAL C64, the 1702 with the NTSC one (`--ntsc --crt 1702`, or just `--ntsc
+--crt lc`); the other pairs are refused (the picture would be in black and
+white). The NTSC signal has its own subcarrier (3.58 MHz: 7 samples every 4
+pixels) and no delay line; the 263 lines of a frame end half a subcarrier
+cycle off, so in composite the color fringes alternate from frame to frame
+(the dot crawl of NTSC), where on PAL they stand still. The chroma of the
+6567 is assumed to be that of the 6569 (no measurements were found; NTSC
+monitors have a tint control), and the C64's modulator network is tuned to
+3.58 MHz. The NTSC pixel is narrower (aspect 0.75).
 
 The monitors are connected by default through their separate luma/chroma
 inputs (the 3-RCA cable, like S-Video), the TV through RF; `--composite`
@@ -390,12 +441,12 @@ fullscreen):
   the keyboard), or the paddle and mouse icons with their buttons (the
   mouse is lit while the host mouse is captured), and the gamepad icon if
   there is one; on the right the speed
-  (`100% 50fps`, `TURBO 850%` during loads, `PAUSED` when the remote monitor
+  (`100% 50fps`, 60 fps on NTSC, `TURBO 850%` during loads, `PAUSED` when the remote monitor
   stops the machine);
 - second row: inserted tape (T), disk (D) and cartridge (C), with `*`
   when there are changes not yet written to the file; on the right the SID
-  (`6581x2` with the second one), REU and, with several media on the command
-  line, which one is inserted (`F8 2/3`);
+  (`6581x2` with the second one), `NTSC` on an NTSC machine, REU and, with
+  several media on the command line, which one is inserted (`F8 2/3`);
 - third row: the emulator's latest message for a few seconds (long ones
   scroll), otherwise the key reminders.
 
@@ -415,8 +466,8 @@ they are mixed as in VICE.
 
 ## Emulation status
 
-Microcycle 6510 CPU with BA/AEC from the VIC, cycle-exact VIC-II 6569
-ported from VICE's x64sc core (c/g/sprite accesses on the chip's cycles, the
+Microcycle 6510 CPU with BA/AEC from the VIC, cycle-exact VIC-II 6569 (PAL)
+and 6567R8 (NTSC) ported from VICE's x64sc core (c/g/sprite accesses on the chip's cycles, the
 three BA cycles in which the c-access reads $FF as in FLI, borders, sprites
 with DMA, expansion and crunch, and the drawing pipeline: every register
 write takes effect on the same pixel as in VICE), open bus (reads of
@@ -614,9 +665,11 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 - Freezer and utility cartridges (see above).
 - Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
   expansions; NIB/P64 images not supported.
+- Video standard: PAL (6569) and NTSC (6567R8) only; no old NTSC (6567R56A,
+  64 cycles and 262 lines), PAL-N (Drean) or the grey dots of the 8565/8562.
 - Monitor: only the Commodore 1084S-P1, 1084S-D1, 1901 and the Philips
   CP90 TV (PAL); no 1701/1702 PAL (their PAL schematics are not available),
-  no NTSC sets (the C64 here is PAL), no HDR output (it would allow the full
+  for NTSC only the 1702 (no NTSC 1084S or TV), no tint control, no HDR output (it would allow the full
   depth of the slot mask), no VIC-II "jail bars"; the peaking of the 1084S
   and of the 1901's video output stage is not modelled (the manuals give no
   values for it); on the TV no sound carrier, noise, fine tuning or

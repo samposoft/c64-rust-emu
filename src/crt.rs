@@ -34,19 +34,85 @@
 
 use std::f64::consts::PI;
 
+use crate::timing::Standard;
 use crate::vic::{C64_PALETTE, WIDTH};
 
-/// PAL color subcarrier, Hz.
-pub const FSC: f64 = 4_433_618.75;
-/// Sampling rate of the video signal: 4 samples per subcarrier cycle.
-pub const SAMPLE_RATE: f64 = 4.0 * FSC;
-/// Pixel clock of the PAL C64: the crystal (4 × FSC) × 4/9.
-pub const DOT_CLOCK: f64 = SAMPLE_RATE * 4.0 / 9.0;
-/// Signal samples per framebuffer line: 9 every 4 pixels.
-pub const SAMPLES: usize = (WIDTH * 9 + 3) / 4;
-/// Width over height of a C64 pixel on a PAL screen: the square-pixel rate
-/// of PAL (7.375 MHz for 384 pixels in 52 µs) over the dot clock.
-pub const PIXEL_ASPECT: f64 = 7_375_000.0 / DOT_CLOCK;
+/// The video signal of a C64: its color subcarrier and the sampling, at 4
+/// samples per subcarrier cycle, that is at the frequency of the C64's
+/// crystal, from which the pixel clock is divided.
+///
+/// | | PAL | NTSC |
+/// |---|---|---|
+/// | Subcarrier | 4.43361875 MHz | 3.579545 MHz |
+/// | Crystal (4 × subcarrier) | 17.734475 MHz | 14.318182 MHz |
+/// | Pixel clock | crystal × 4/9 | crystal × 4/7 |
+/// | Samples every 4 pixels | 9 | 7 |
+/// | Subcarrier cycles per line | 283.5 (504 pixels) | 227.5 (520 pixels) |
+///
+/// In both the phase of the subcarrier flips from line to line; a PAL frame
+/// (312 lines) is a whole number of cycles, so the color artifacts stand
+/// still, while an NTSC frame (263 lines) ends half a cycle off, so they
+/// alternate from frame to frame (the dot crawl of NTSC).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Signal {
+    pub standard: Standard,
+    /// Color subcarrier, Hz.
+    pub fsc: f64,
+    /// Sampling rate, Hz: 4 × fsc.
+    pub sample_rate: f64,
+    /// Samples every 4 pixels: 9 PAL, 7 NTSC.
+    pub phases: usize,
+    /// Samples per framebuffer line.
+    pub samples: usize,
+}
+
+impl Signal {
+    pub fn of(standard: Standard) -> Signal {
+        let (fsc, phases) = match standard {
+            Standard::Pal => (4_433_618.75, 9),
+            Standard::Ntsc => (315e6 / 88.0, 7),
+        };
+        Signal { standard, fsc, sample_rate: 4.0 * fsc, phases, samples: (WIDTH * phases + 3) / 4 }
+    }
+
+    /// PAL: V switched on alternate lines and averaged by the delay line.
+    pub fn pal(&self) -> bool {
+        self.standard == Standard::Pal
+    }
+
+    /// Pixel clock, Hz.
+    pub fn dot_clock(&self) -> f64 {
+        self.sample_rate * 4.0 / self.phases as f64
+    }
+
+    /// Width over height of a C64 pixel on the screen: the square-pixel
+    /// rate of the standard (PAL 7.375 MHz, NTSC 6.136 MHz, for 320-pixel
+    /// lines) over the pixel clock: 0.936 PAL, 0.75 NTSC.
+    pub fn pixel_aspect(&self) -> f64 {
+        let square = match self.standard {
+            Standard::Pal => 7_375_000.0,
+            Standard::Ntsc => 135e6 / 22.0,
+        };
+        square / self.dot_clock()
+    }
+
+    /// Active part of a line, seconds: 52 µs PAL, 52.66 µs NTSC.
+    pub fn active_line(&self) -> f64 {
+        match self.standard {
+            Standard::Pal => 52e-6,
+            Standard::Ntsc => 52.66e-6,
+        }
+    }
+
+    /// Lines of a field that fill the picture height: 288 PAL (576 active
+    /// lines), 242.5 NTSC (485).
+    pub fn picture_lines(&self) -> f64 {
+        match self.standard {
+            Standard::Pal => 288.0,
+            Standard::Ntsc => 242.5,
+        }
+    }
+}
 
 /// Luma overshoot of the VIC-II on a black to white step (measured, Jam on
 /// Toads: 1.05 V white, peak about 1.14 V over 0.32 V black).
@@ -118,11 +184,13 @@ pub enum Model {
     C1901,
     /// Philips 15CE1510 color TV (CP90 chassis, 1988).
     PhilipsCp90,
+    /// Commodore 1702 (JVC chassis, NTSC, 1984).
+    C1702,
 }
 
 impl Model {
     /// Names accepted by `parse`, for help and error messages.
-    pub const NAMES: &'static str = "1084s-p1 (or 1084s), 1084s-d1, 1901, cp90 (or tv)";
+    pub const NAMES: &'static str = "1084s-p1 (or 1084s), 1084s-d1, 1901, cp90 (or tv) for PAL; 1702 for NTSC";
 
     pub fn parse(s: &str) -> Option<Model> {
         match s.to_ascii_lowercase().as_str() {
@@ -130,6 +198,7 @@ impl Model {
             "1084s-d1" | "1084sd1" => Some(Model::C1084SD1),
             "1901" => Some(Model::C1901),
             "cp90" | "tv" | "15ce1510" => Some(Model::PhilipsCp90),
+            "1702" => Some(Model::C1702),
             _ => None,
         }
     }
@@ -141,6 +210,7 @@ impl Model {
             Model::C1084SD1 => "1084S-D1",
             Model::C1901 => "1901",
             Model::PhilipsCp90 => "CP90",
+            Model::C1702 => "1702",
         }
     }
 
@@ -151,6 +221,7 @@ impl Model {
             Model::C1084SD1 => "Commodore 1084S-D1",
             Model::C1901 => "Commodore 1901",
             Model::PhilipsCp90 => "Philips 15CE1510 TV (CP90 chassis)",
+            Model::C1702 => "Commodore 1702",
         }
     }
 
@@ -160,6 +231,7 @@ impl Model {
             Model::C1084SD1 => &C1084S_D1,
             Model::C1901 => &C1901,
             Model::PhilipsCp90 => &PHILIPS_CP90,
+            Model::C1702 => &C1702,
         }
     }
 }
@@ -181,13 +253,18 @@ impl Crt {
     /// The settings `crt` (None: off) changed by `arg`: `off`, a model
     /// (keeping the input if the model has it, otherwise its default one) or
     /// an input (`lc`, `composite`, `rf`; turning the emulation on with the
-    /// 1084S-P1, or the TV for RF).
-    pub fn apply(crt: Option<Crt>, arg: &str) -> Result<Option<Crt>, String> {
+    /// monitor of the machine's `standard`: the 1084S-P1 for PAL, the 1702
+    /// for NTSC, or the TV for RF).
+    pub fn apply(crt: Option<Crt>, arg: &str, standard: Standard) -> Result<Option<Crt>, String> {
         if arg == "off" {
             return Ok(None);
         }
         if let Some(input) = Input::parse(arg) {
-            let default = if input == Input::Rf { Model::PhilipsCp90 } else { Model::C1084SP1 };
+            let default = match (input, standard) {
+                (Input::Rf, _) => Model::PhilipsCp90,
+                (_, Standard::Pal) => Model::C1084SP1,
+                (_, Standard::Ntsc) => Model::C1702,
+            };
             return Ok(Some(Crt { input, ..crt.unwrap_or(Crt::new(default)) }));
         }
         let model = Model::parse(arg)
@@ -196,9 +273,18 @@ impl Crt {
         Ok(Some(Crt { model, input: input.unwrap_or(Crt::new(model).input) }))
     }
 
-    /// Error if the model does not have the input.
-    pub fn check(&self) -> Result<(), String> {
-        let inputs = self.model.monitor().inputs;
+    /// Error if the model does not have the input, or does not decode the
+    /// color of the machine's `standard` (a PAL monitor shows an NTSC C64 in
+    /// black and white, and vice versa).
+    pub fn check(&self, standard: Standard) -> Result<(), String> {
+        let m = self.model.monitor();
+        if m.standard != standard {
+            let other = if standard == Standard::Ntsc { "1702" } else { "1084s, 1084s-d1, 1901 or tv" };
+            let a = |s: Standard| if s == Standard::Ntsc { "an NTSC" } else { "a PAL" };
+            return Err(format!("the {} is {} monitor: with {} C64 use {other}",
+                self.model.full_name(), a(m.standard), a(standard)));
+        }
+        let inputs = m.inputs;
         if inputs.contains(&self.input) {
             return Ok(());
         }
@@ -216,6 +302,8 @@ impl Crt {
 /// Physical data of a monitor.
 #[derive(Debug)]
 pub struct Monitor {
+    /// Color standard it decodes: its C64 must be of the same standard.
+    pub standard: Standard,
     /// Picture on the screen (the active part of the PAL signal), mm.
     pub screen_width: f64,
     pub screen_height: f64,
@@ -271,6 +359,7 @@ pub struct Trap {
 /// PAL decoder with a 64 µs delay line and an adjustable 4.43 MHz
 /// "chrominance suppression" trap, used in composite mode only.
 pub static C1084S_P1: Monitor = Monitor {
+    standard: Standard::Pal,
     // M34: 34 cm visible diagonal, 4:3
     screen_width: 272.0,
     screen_height: 204.0,
@@ -301,6 +390,7 @@ pub static C1084S_P1: Monitor = Monitor {
 /// TDA3507. The estimates are those of the P1: the manual gives nothing
 /// about the beam, the slots or the trap.
 pub static C1084S_D1: Monitor = Monitor {
+    standard: Standard::Pal,
     screen_width: 260.0,
     screen_height: 186.0,
     triad_pitch: 0.41,
@@ -331,6 +421,7 @@ pub static C1084S_D1: Monitor = Monitor {
 /// pattern. The manual gives neither the picture size nor the bandwidth:
 /// those are the P1's, as the estimates.
 pub static C1901: Monitor = Monitor {
+    standard: Standard::Pal,
     screen_width: 272.0,
     screen_height: 204.0,
     triad_pitch: 0.43,
@@ -365,6 +456,7 @@ pub static C1901: Monitor = Monitor {
 /// white point are not in the manual: the band-pass has the Q of the
 /// TDA356x application circuit (10.7 µH ∥ 120 pF from 1 kΩ: about 3).
 pub static PHILIPS_CP90: Monitor = Monitor {
+    standard: Standard::Pal,
     screen_width: 284.5,
     screen_height: 213.4,
     triad_pitch: 0.52,
@@ -384,6 +476,39 @@ pub static PHILIPS_CP90: Monitor = Monitor {
     white_point: None,
 };
 
+/// Commodore 1702 (service manual 314004-01, JVC chassis, NTSC; the 1701 is
+/// the same monitor): 13" viewable, in-line guns (tube 370FVB22), "vertical
+/// stripe, 0.64 mm pitch" (1701/1702 user's guides); inputs luminance,
+/// chrominance (rear) and composite (front). The luma has a 3.58 MHz trap
+/// (T201, adjusted from the composite input for the least subcarrier: used
+/// in composite mode only, as the 1802 manual says) and fixed peaking coils
+/// whose response the manual does not give; the chroma goes through the
+/// band-pass amplifier of the HA11247 decoder (no delay line: NTSC). Picture
+/// size, bandwidth, the Q of the trap and of the band-pass and the white
+/// point are not in the manual: estimates (NTSC video bandwidth 4.2 MHz, Q
+/// of the TDA356x application circuits).
+pub static C1702: Monitor = Monitor {
+    standard: Standard::Ntsc,
+    // 13" (330 mm) viewable, 4:3
+    screen_width: 264.0,
+    screen_height: 198.0,
+    triad_pitch: 0.64,
+    stripe: 0.25,
+    slot_pitch: 0.8,
+    bridge: 0.12,
+    beam_sigma: (0.26, 0.42),
+    glow: (0.05, 2.0),
+    inputs: &[Input::LumaChroma, Input::Composite],
+    if_filter: None,
+    luma_bandwidth: [4_200_000.0, 4_200_000.0],
+    luma_peaking: None,
+    luma_trap: Some(Trap { q: 2.0, depth: 0.0 }),
+    chroma_q: 3.0,
+    chroma_bandpass: true,
+    chroma_bandwidth: 1_300_000.0,
+    white_point: None,
+};
+
 /// IF response of a PAL B/G intercarrier SAW filter, EPCOS K2966M
 /// (datasheet: picture carrier 38.9 MHz on the Nyquist slope, -5.6 dB;
 /// color carrier 34.47 MHz, -3.1 dB; sound shelf 33.4-32.4 MHz, about -20
@@ -396,27 +521,36 @@ pub static SAW_BG: [(f64, f64); 13] = [
 ];
 
 impl Monitor {
-    /// Width of a C64 pixel on the screen, mm: the 52 µs of active line
-    /// fill the width of the picture.
-    pub fn pixel_width(&self) -> f64 {
-        self.screen_width / (52e-6 * DOT_CLOCK)
+    /// The signal it decodes.
+    pub fn signal(&self) -> Signal {
+        Signal::of(self.standard)
     }
 
-    /// Distance between two lines, mm: 288 lines (half of the 576 active
-    /// lines of PAL) fill the height of the picture.
+    /// Width of a C64 pixel on the screen, mm: the active line fills the
+    /// width of the picture.
+    pub fn pixel_width(&self) -> f64 {
+        let s = self.signal();
+        self.screen_width / (s.active_line() * s.dot_clock())
+    }
+
+    /// Distance between two lines, mm: the lines of a field (288 PAL,
+    /// 242.5 NTSC) fill the height of the picture.
     pub fn line_pitch(&self) -> f64 {
-        self.screen_height / 288.0
+        self.screen_height / self.signal().picture_lines()
     }
 }
 
 // ── Colors ───────────────────────────────────────────────────────────────────
 
 /// Luma and chroma of the 16 colors, in Pepto's units (luma 0-256), on
-/// even or odd raster lines. The two lines have the chroma rotated by
+/// even or odd raster lines. PAL: the two lines have the chroma rotated by
 /// ∓ODD_LINE_PHASE/2, with the amplitude raised so that their average (the
-/// PAL delay line) is exactly the colodore vector.
-pub fn palette_yuv(odd_line: bool) -> [[f64; 3]; 16] {
-    let half = (ODD_LINE_PHASE / 2.0).to_radians();
+/// PAL delay line) is exactly the colodore vector. NTSC: the colodore
+/// vector on every line (the 6567 is assumed to have the chroma of the
+/// 6569: no measurements of its phases were found, and NTSC monitors have
+/// a tint control).
+pub fn palette_yuv(odd_line: bool, sig: &Signal) -> [[f64; 3]; 16] {
+    let half = if sig.pal() { (ODD_LINE_PHASE / 2.0).to_radians() } else { 0.0 };
     let turn = if odd_line { half } else { -half };
     std::array::from_fn(|i| {
         let y = 8.0 * LUMA[i] as f64;
@@ -534,7 +668,7 @@ impl SecondOrder {
     }
 }
 
-/// Phases of the samples within the pixels: 9 samples every 4 pixels.
+/// Largest number of sample phases within 4 pixels (PAL: 9).
 pub const LUMA_PHASES: usize = 9;
 /// Pixels that contribute to a luma sample: from LUMA_FIRST (the past) to
 /// LUMA_FIRST + LUMA_TAPS - 1 (the future, through the delay compensation).
@@ -542,17 +676,17 @@ pub const LUMA_TAPS: usize = 12;
 pub const LUMA_FIRST: i32 = -9;
 
 /// Weights of the pixels around a sample in the luma output of the VIC-II,
-/// for each of the 9 sample phases. Sample n lies in pixel
-/// floor((n + 0.5) × 4/9) and its phase is n mod 9; weight j multiplies
+/// for each of the sample phases (9 PAL, 7 NTSC). Sample n lies in pixel
+/// floor((n + 0.5) × 4/phases) and its phase is n mod phases; weight j multiplies
 /// pixel p + LUMA_FIRST + j. The response is shifted so that a step
 /// reaches half height at the pixel boundary (the monitor's luma delay line
 /// aligns luma and chroma).
-pub fn luma_kernels() -> [[f32; LUMA_TAPS]; LUMA_PHASES] {
+pub fn luma_kernels(sig: &Signal) -> Vec<[f32; LUMA_TAPS]> {
     let r = SecondOrder::vic_luma();
     let t50 = r.time_to(0.5);
     let s = |x: f64| r.step(x + t50);
-    std::array::from_fn(|phase| {
-        let pos = (phase as f64 + 0.5) * 4.0 / 9.0;
+    (0..sig.phases).map(|phase| {
+        let pos = (phase as f64 + 0.5) * 4.0 / sig.phases as f64;
         let tau = pos - pos.floor();
         let w: [f64; LUMA_TAPS] = std::array::from_fn(|i| {
             let j = (LUMA_FIRST + i as i32) as f64;
@@ -560,7 +694,7 @@ pub fn luma_kernels() -> [[f32; LUMA_TAPS]; LUMA_PHASES] {
         });
         let sum: f64 = w.iter().sum();
         w.map(|x| (x / sum) as f32)
-    })
+    }).collect()
 }
 
 // ── Monitor filters ──────────────────────────────────────────────────────────
@@ -577,14 +711,15 @@ pub const SEP_LEN: usize = 2 * SEP_HALF + 1;
 /// real part of `resp(f)` e^(j2πfτ), `f` in Hz: with a magnitude, zero phase;
 /// with a complex response and its low-frequency delay `tau`, the response
 /// with that delay taken away. Unity gain at DC.
-fn fir_from_response(half: usize, resp: impl Fn(f64) -> (f64, f64), tau: f64) -> Vec<f64> {
+fn fir_from_response(sig: &Signal, half: usize, resp: impl Fn(f64) -> (f64, f64), tau: f64) -> Vec<f64> {
+    let fs = sig.sample_rate;
     const M: usize = 4096;
     let taps = |k: i64| -> f64 {
         let sum: f64 = (0..M)
             .map(|i| {
-                let f = (i as f64 + 0.5) * SAMPLE_RATE / 2.0 / M as f64;
+                let f = (i as f64 + 0.5) * fs / 2.0 / M as f64;
                 let (re, im) = resp(f);
-                let w = 2.0 * PI * f * (k as f64 / SAMPLE_RATE + tau);
+                let w = 2.0 * PI * f * (k as f64 / fs + tau);
                 re * w.cos() - im * w.sin()
             })
             .sum();
@@ -600,8 +735,8 @@ fn fir_from_response(half: usize, resp: impl Fn(f64) -> (f64, f64), tau: f64) ->
 }
 
 /// Symmetric FIR (zero phase) of FIR_LEN taps with magnitude `mag(f)`.
-fn zero_phase_fir(mag: impl Fn(f64) -> f64) -> [f32; FIR_LEN] {
-    let h = fir_from_response(FIR_HALF, |f| (mag(f), 0.0), 0.0);
+fn zero_phase_fir(sig: &Signal, mag: impl Fn(f64) -> f64) -> [f32; FIR_LEN] {
+    let h = fir_from_response(sig, FIR_HALF, |f| (mag(f), 0.0), 0.0);
     std::array::from_fn(|i| h[i] as f32)
 }
 
@@ -609,7 +744,7 @@ fn zero_phase_fir(mag: impl Fn(f64) -> f64) -> [f32; FIR_LEN] {
 /// bandwidth for the input.
 pub fn luma_fir(m: &Monitor, input: Input) -> [f32; FIR_LEN] {
     let fc = m.luma_bandwidth[(input != Input::LumaChroma) as usize];
-    zero_phase_fir(|f| 1.0 / (1.0 + (f / fc).powi(4)).sqrt())
+    zero_phase_fir(&m.signal(), |f| 1.0 / (1.0 + (f / fc).powi(4)).sqrt())
 }
 
 /// Low-pass of the demodulated chroma: second-order Butterworth magnitude
@@ -621,9 +756,10 @@ pub fn chroma_fir(m: &Monitor, input: Input) -> [f32; FIR_LEN] {
     let fc = m.chroma_bandwidth;
     let band = m.chroma_bandpass && input == Input::LumaChroma;
     let q = m.chroma_q;
-    zero_phase_fir(|f| {
+    let sig = m.signal();
+    zero_phase_fir(&sig, |f| {
         let lp = 1.0 / (1.0 + (f / fc).powi(4)).sqrt();
-        if band { lp / (1.0 + (2.0 * q * f / FSC).powi(2)).sqrt() } else { lp }
+        if band { lp / (1.0 + (2.0 * q * f / sig.fsc).powi(2)).sqrt() } else { lp }
     })
 }
 
@@ -632,9 +768,10 @@ pub fn chroma_fir(m: &Monitor, input: Input) -> [f32; FIR_LEN] {
 /// subcarrier, from its complex response: gain and phase of the circuit,
 /// without the warping of a bilinear transform (the subcarrier is only a
 /// quarter of the sampling rate).
-fn notch_section(b1: f64, a1: f64) -> Vec<f64> {
-    fir_from_response(SEP_HALF, move |f| {
-        let x = f / FSC;
+fn notch_section(sig: &Signal, b1: f64, a1: f64) -> Vec<f64> {
+    let fsc = sig.fsc;
+    fir_from_response(sig, SEP_HALF, move |f| {
+        let x = f / fsc;
         let (nr, ni) = (1.0 - x * x, b1 * x);
         let (dr, di) = (1.0 - x * x, a1 * x);
         let d = dr * dr + di * di;
@@ -643,14 +780,14 @@ fn notch_section(b1: f64, a1: f64) -> Vec<f64> {
 }
 
 /// Luma trap: notch of Q with gain `depth` at the subcarrier.
-fn trap(t: Trap) -> Vec<f64> {
-    notch_section(t.depth / t.q, 1.0 / t.q)
+fn trap(sig: &Signal, t: Trap) -> Vec<f64> {
+    notch_section(sig, t.depth / t.q, 1.0 / t.q)
 }
 
 /// Chroma band-pass of Q at the subcarrier: the signal minus a full notch
 /// of the same Q (for a second-order circuit the two are complementary).
-fn band_pass(q: f64) -> Vec<f64> {
-    let mut h = notch_section(0.0, 1.0 / q);
+fn band_pass(sig: &Signal, q: f64) -> Vec<f64> {
+    let mut h = notch_section(sig, 0.0, 1.0 / q);
     for x in h.iter_mut() {
         *x = -*x;
     }
@@ -660,8 +797,8 @@ fn band_pass(q: f64) -> Vec<f64> {
 
 /// Luma peaking of time constant `tau`: 2(1 + sτ) / (2 + sτ), unity gain at
 /// DC and 2 at high frequencies, from its complex response.
-fn peaking(tau: f64) -> Vec<f64> {
-    fir_from_response(SEP_HALF, move |f| {
+fn peaking(sig: &Signal, tau: f64) -> Vec<f64> {
+    fir_from_response(sig, SEP_HALF, move |f| {
         let wt = 2.0 * PI * f * tau;
         // 2(1 + jwt) / (2 + jwt)
         let d = 4.0 + wt * wt;
@@ -673,7 +810,7 @@ fn peaking(tau: f64) -> Vec<f64> {
 /// sidebands (no vestigial filter), which reach the IF at 38.9 MHz ∓ f;
 /// the synchronous demodulator adds them, and the Nyquist slope makes the
 /// sum flat at low frequencies.
-fn if_response(points: &[(f64, f64)]) -> Vec<f64> {
+fn if_response(sig: &Signal, points: &[(f64, f64)]) -> Vec<f64> {
     let at = |mhz: f64| -> f64 {
         let (first, last) = (points[0], points[points.len() - 1]);
         let db = if mhz <= first.0 {
@@ -688,7 +825,7 @@ fn if_response(points: &[(f64, f64)]) -> Vec<f64> {
         10f64.powf(db / 20.0)
     };
     let video = |f: f64| at(38.9 - f / 1e6) + at(38.9 + f / 1e6);
-    fir_from_response(SEP_HALF, |f| (video(f), 0.0), 0.0)
+    fir_from_response(sig, SEP_HALF, |f| (video(f), 0.0), 0.0)
 }
 
 /// Luma of the C64's composite and RF output: the luma network in the RF
@@ -699,8 +836,8 @@ fn if_response(points: &[(f64, f64)]) -> Vec<f64> {
 /// with C3), as it has to be to keep the chroma band clean (the drawn
 /// 10 µH would put the notch at 3.4 MHz). Complex response from the nodal
 /// equations; the delay at low frequencies is taken away.
-fn modulator_luma() -> Vec<f64> {
-    let l2 = 1.0 / ((2.0 * PI * FSC).powi(2) * 220e-12);
+fn modulator_luma(sig: &Signal) -> Vec<f64> {
+    let l2 = 1.0 / ((2.0 * PI * sig.fsc).powi(2) * 220e-12);
     // Complex arithmetic on (re, im)
     type C = (f64, f64);
     let add = |a: C, b: C| (a.0 + b.0, a.1 + b.1);
@@ -729,7 +866,7 @@ fn modulator_luma() -> Vec<f64> {
     // Delay at low frequencies: from the phase at 100 kHz
     let p = norm(1e5);
     let tau = -p.1.atan2(p.0) / (2.0 * PI * 1e5);
-    fir_from_response(SEP_HALF, norm, tau)
+    fir_from_response(sig, SEP_HALF, norm, tau)
 }
 
 /// Convolution of two kernels whose tap 0 is at index `a0` and `b0`, cut to
@@ -749,28 +886,29 @@ fn convolve(a: &[f64], a0: usize, b: &[f64], b0: usize) -> Vec<f64> {
 
 /// The C64's luma for a composite signal (composite and RF output), as a
 /// kernel of SEP_LEN taps around the sample.
-pub fn modulator_fir() -> [f32; SEP_LEN] {
-    let h = modulator_luma();
+pub fn modulator_fir(sig: &Signal) -> [f32; SEP_LEN] {
+    let h = modulator_luma(sig);
     std::array::from_fn(|i| h[i] as f32)
 }
 
 /// Luma input of the monitor, SEP_LEN taps around the sample: the IF
 /// filter (RF), the trap (composite signal), the peaking.
 pub fn luma_input_fir(m: &Monitor, input: Input) -> [f32; SEP_LEN] {
+    let sig = m.signal();
     let mut h = vec![0f64; SEP_LEN];
     h[SEP_HALF] = 1.0;
     if input == Input::Rf {
         if let Some(points) = m.if_filter {
-            h = convolve(&h, SEP_HALF, &if_response(points), SEP_HALF);
+            h = convolve(&h, SEP_HALF, &if_response(&sig, points), SEP_HALF);
         }
     }
     if input != Input::LumaChroma {
         if let Some(t) = m.luma_trap {
-            h = convolve(&h, SEP_HALF, &trap(t), SEP_HALF);
+            h = convolve(&h, SEP_HALF, &trap(&sig, t), SEP_HALF);
         }
     }
     if let Some(tau) = m.luma_peaking {
-        h = convolve(&h, SEP_HALF, &peaking(tau), SEP_HALF);
+        h = convolve(&h, SEP_HALF, &peaking(&sig, tau), SEP_HALF);
     }
     let dc: f64 = h.iter().sum();
     std::array::from_fn(|i| (h[i] / dc) as f32)
@@ -780,10 +918,11 @@ pub fn luma_input_fir(m: &Monitor, input: Input) -> [f32; SEP_LEN] {
 /// IF filter (RF) and the band-pass, with unity gain at the subcarrier (the
 /// burst sets the chroma gain: ACC).
 pub fn chroma_input_fir(m: &Monitor, input: Input) -> [f32; SEP_LEN] {
-    let mut h = band_pass(m.chroma_q);
+    let sig = m.signal();
+    let mut h = band_pass(&sig, m.chroma_q);
     if input == Input::Rf {
         if let Some(points) = m.if_filter {
-            h = convolve(&h, SEP_HALF, &if_response(points), SEP_HALF);
+            h = convolve(&h, SEP_HALF, &if_response(&sig, points), SEP_HALF);
         }
     }
     // Gain at FSC = SAMPLE_RATE/4, where the taps weigh 1, 0, -1, 0... and
@@ -802,6 +941,13 @@ pub fn chroma_input_fir(m: &Monitor, input: Input) -> [f32; SEP_LEN] {
 mod tests {
     use super::*;
 
+    /// The PAL signal, for the tests of the PAL monitors.
+    const FSC: f64 = 4_433_618.75;
+    const SAMPLE_RATE: f64 = 4.0 * FSC;
+    fn pal() -> Signal {
+        Signal::of(Standard::Pal)
+    }
+
     /// Gain of a FIR centered on its middle tap at `f` Hz (magnitude).
     fn gain(h: &[f32], f: f64) -> f64 {
         let mid = (h.len() / 2) as f64;
@@ -816,7 +962,7 @@ mod tests {
     fn flat_colors_are_colodore() {
         // Through the delay line (average of an even and an odd line) the
         // model gives back exactly the palette of the VIC
-        let (even, odd) = (palette_yuv(false), palette_yuv(true));
+        let (even, odd) = (palette_yuv(false, &pal()), palette_yuv(true, &pal()));
         for i in 0..16 {
             let avg: [f64; 3] = std::array::from_fn(|k| (even[i][k] + odd[i][k]) / 2.0);
             let rgb = yuv_to_rgb(avg[0], avg[1], avg[2]).map(|c| to_display(to_light(c)).round() as u32);
@@ -827,7 +973,7 @@ mod tests {
 
     #[test]
     fn odd_lines_turn_the_hue() {
-        let (even, odd) = (palette_yuv(false), palette_yuv(true));
+        let (even, odd) = (palette_yuv(false, &pal()), palette_yuv(true, &pal()));
         let angle = |c: [f64; 3]| c[2].atan2(c[1]).to_degrees();
         for i in [2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14] {
             let d = (angle(odd[i]) - angle(even[i]) + 360.0) % 360.0;
@@ -837,14 +983,22 @@ mod tests {
 
     #[test]
     fn signal_timing() {
-        assert!((DOT_CLOCK - 7_881_988.9).abs() < 1.0);
-        assert_eq!(SAMPLES, 907);
+        let p = pal();
+        assert!((p.dot_clock() - 7_881_988.9).abs() < 1.0);
+        assert_eq!(p.samples, 907);
         // 504 pixels per line = 283.5 subcarrier cycles
-        assert!((504.0 * FSC / DOT_CLOCK - 283.5).abs() < 1e-9);
-        assert!((PIXEL_ASPECT - 0.9357).abs() < 1e-4);
+        assert!((504.0 * p.fsc / p.dot_clock() - 283.5).abs() < 1e-9);
+        assert!((p.pixel_aspect() - 0.9357).abs() < 1e-4);
+        // NTSC: 8.18 MHz, 7 samples every 4 pixels, 520 pixels per line =
+        // 227.5 subcarrier cycles, pixel aspect 0.75
+        let n = Signal::of(Standard::Ntsc);
+        assert!((n.dot_clock() - 8_181_818.2).abs() < 1.0);
+        assert_eq!(n.samples, 706);
+        assert!((520.0 * n.fsc / n.dot_clock() - 227.5).abs() < 1e-9);
+        assert!((n.pixel_aspect() - 0.75).abs() < 1e-6);
         // The monitor geometry agrees with the PAL pixel aspect
         let m = &C1084S_P1;
-        assert!((m.pixel_width() / m.line_pitch() - PIXEL_ASPECT).abs() < 0.005);
+        assert!((m.pixel_width() / m.line_pitch() - p.pixel_aspect()).abs() < 0.005);
     }
 
     #[test]
@@ -859,7 +1013,7 @@ mod tests {
 
     #[test]
     fn luma_kernels_step_through_the_pixels() {
-        let k = luma_kernels();
+        let k = luma_kernels(&pal());
         for phase in &k {
             let sum: f32 = phase.iter().sum();
             assert!((sum - 1.0).abs() < 1e-5);
@@ -948,8 +1102,9 @@ mod tests {
     fn models() {
         assert_eq!(Model::parse("1084S"), Some(Model::C1084SP1));
         assert_eq!(Model::parse("1084s-d1"), Some(Model::C1084SD1));
-        assert_eq!(Model::parse("1702"), None);
-        for model in [Model::C1084SP1, Model::C1084SD1, Model::C1901, Model::PhilipsCp90] {
+        assert_eq!(Model::parse("1702"), Some(Model::C1702));
+        assert_eq!(Model::parse("1703"), None);
+        for model in [Model::C1084SP1, Model::C1084SD1, Model::C1901, Model::PhilipsCp90, Model::C1702] {
             assert_eq!(Model::parse(model.name()), Some(model));
         }
     }
@@ -988,7 +1143,7 @@ mod tests {
     #[test]
     fn if_filter() {
         // Both sidebands through the Nyquist slope: flat at low frequencies
-        let h: Vec<f32> = if_response(&SAW_BG).iter().map(|&x| x as f32).collect();
+        let h: Vec<f32> = if_response(&pal(), &SAW_BG).iter().map(|&x| x as f32).collect();
         for f in [100e3, 500e3, 1e6, 2e6, 3e6] {
             let g = gain(&h, f);
             assert!((g - 1.0).abs() < 0.1, "{f}: {g}");
@@ -1008,7 +1163,7 @@ mod tests {
         // The C64's luma in its composite output: flat at low frequencies,
         // a notch at the subcarrier, a bump near 2 MHz (nodal analysis:
         // +2.9 dB)
-        let h = modulator_fir();
+        let h = modulator_fir(&pal());
         assert!((gain(&h, 100e3) - 1.0).abs() < 0.02);
         assert!(gain(&h, FSC) < 0.05);
         let bump = gain(&h, 2e6);
@@ -1017,28 +1172,35 @@ mod tests {
 
     #[test]
     fn settings() {
-        let tv = Crt::apply(None, "rf").unwrap().unwrap();
+        let tv = Crt::apply(None, "rf", Standard::Pal).unwrap().unwrap();
         assert_eq!((tv.model, tv.input), (Model::PhilipsCp90, Input::Rf));
         // A monitor after the TV: the RF input goes, luma/chroma comes
-        let m = Crt::apply(Some(tv), "1901").unwrap().unwrap();
+        let m = Crt::apply(Some(tv), "1901", Standard::Pal).unwrap().unwrap();
         assert_eq!((m.model, m.input), (Model::C1901, Input::LumaChroma));
         // Composite is kept across models
-        let c = Crt::apply(Crt::apply(None, "composite").unwrap(), "tv").unwrap().unwrap();
+        let c = Crt::apply(Crt::apply(None, "composite", Standard::Pal).unwrap(), "tv", Standard::Pal).unwrap().unwrap();
         assert_eq!((c.model, c.input), (Model::PhilipsCp90, Input::Composite));
-        assert_eq!(Crt::apply(Some(c), "off").unwrap(), None);
-        assert!(Crt::apply(None, "1702").is_err());
+        assert_eq!(Crt::apply(Some(c), "off", Standard::Pal).unwrap(), None);
+        assert!(Crt::apply(None, "1703", Standard::Pal).is_err());
         // RF on a monitor is caught by check
-        let bad = Crt::apply(Crt::apply(None, "1084s").unwrap(), "rf").unwrap().unwrap();
-        assert!(bad.check().is_err());
+        let bad = Crt::apply(Crt::apply(None, "1084s", Standard::Pal).unwrap(), "rf", Standard::Pal).unwrap().unwrap();
+        assert!(bad.check(Standard::Pal).is_err());
+        // The monitor follows the machine: 1702 on NTSC, and a PAL monitor
+        // on an NTSC C64 is refused
+        let ntsc = Crt::apply(None, "lc", Standard::Ntsc).unwrap().unwrap();
+        assert_eq!(ntsc.model, Model::C1702);
+        assert!(ntsc.check(Standard::Ntsc).is_ok());
+        assert!(Crt::new(Model::C1084SP1).check(Standard::Ntsc).is_err());
+        assert!(ntsc.check(Standard::Pal).is_err());
     }
 
     #[test]
     fn inputs() {
         assert!(Crt::new(Model::PhilipsCp90).input == Input::Rf);
         assert!(Crt::new(Model::C1901).input == Input::LumaChroma);
-        assert!(Crt { model: Model::C1084SP1, input: Input::Rf }.check().is_err());
-        assert!(Crt { model: Model::PhilipsCp90, input: Input::LumaChroma }.check().is_err());
-        assert!(Crt { model: Model::PhilipsCp90, input: Input::Composite }.check().is_ok());
+        assert!(Crt { model: Model::C1084SP1, input: Input::Rf }.check(Standard::Pal).is_err());
+        assert!(Crt { model: Model::PhilipsCp90, input: Input::LumaChroma }.check(Standard::Pal).is_err());
+        assert!(Crt { model: Model::PhilipsCp90, input: Input::Composite }.check(Standard::Pal).is_ok());
     }
 
     #[test]

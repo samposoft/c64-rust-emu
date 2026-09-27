@@ -14,7 +14,7 @@ printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 ```
 
 Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.d64/.g64...]` (with
-several files the first is loaded, `swap` moves to the next ones), `--version`, `--roms DIR`, `-x script`, `-e "cmd; cmd"`
+several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--roms DIR`, `-x script`, `-e "cmd; cmd"`
 (repeatable), `--no-stdin`, `--window`, `--audio`, `--reu KB` (REU from 128 to
 16384 KB), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
 `--sid 6581|8580|8580d` (SID model, default 6581; `8580d` is the 8580 with
@@ -45,7 +45,7 @@ decimal.
 |---|---|
 | `break addr`, `delete addr\|all`, `breaks` | breakpoint on PC |
 | `watch a [b]`, `watchr`, `watchw`, `unwatch a\|all`, `watches` | watchpoint on CPU read/write in [a,b]; stops after the accessing instruction, reporting address, value and PC |
-| `rbreak line\|off` | stop at cycle 0 of the raster line (every frame) |
+| `rbreak line\|off` | stop at cycle 0 of the raster line (every frame; 0-311 PAL, 0-262 NTSC) |
 | `irqbreak on\|off`, `nmibreak on\|off` | stop on the first instruction of every ISR |
 | `kilbreak on\|off` | stop on a KIL/JAM opcode (default on) |
 
@@ -64,9 +64,9 @@ decimal.
 | `sid 6581\|8580\|8580d` | changes the SID model (`8580d`: with digiboost) |
 | `sid2 [addr\|off]` | second SID: state; with an address (`$D420`-`$D7E0`, `$DE00`-`$DFE0`, in steps of `$20`) it attaches it, as just powered on; `off` removes it |
 | `blend [on\|off]` | frame blending: the framebuffer (window and screenshots) becomes the average, in linear light, of the last two frames, as the eye sees a 50 Hz CRT; for pictures that alternate two frames (interlace, IFLI). Off by default, `--blend` turns it on |
-| `crt [off\|1084s-p1\|1084s-d1\|1901\|tv] [lc\|composite\|rf]` | CRT emulation of the window (`--window`, or the `c64` window through the remote monitor), on the GPU: `1084s-p1` (or `1084s`) is the Commodore 1084S-P1, `1084s-d1` the 1084S-D1, `1901` the 1901, `tv` (or `cp90`) the Philips CP90 TV; `lc` the luma/chroma input (the monitors' default), `composite` the composite one, `rf` the TV's antenna input (its default). An input turns the emulation on if it is off, a set keeps the input if it has it. Without arguments it shows the setting. See "Monitor and TV" in README.md |
-| `screenshot file.png [bar \| crt [height]]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316); with `crt` the screen through the monitor emulation (the one set with `crt`, otherwise the 1084S-P1 with luma/chroma), `height` pixels high (284-2272, default 1136) with the PAL pixel aspect; it needs a GPU. With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
-| `info` | frames, instructions, cycles, PRG waiting to be injected (`prg_pending`), keys still to type (`typing`), state of file/break/watch/trace |
+| `crt [off\|1084s-p1\|1084s-d1\|1901\|tv\|1702] [lc\|composite\|rf]` | CRT emulation of the window (`--window`, or the `c64` window through the remote monitor), on the GPU: `1084s-p1` (or `1084s`) is the Commodore 1084S-P1, `1084s-d1` the 1084S-D1, `1901` the 1901, `tv` (or `cp90`) the Philips CP90 TV, all PAL; `1702` the NTSC Commodore 1702 (with `--ntsc`); `lc` the luma/chroma input (the monitors' default), `composite` the composite one, `rf` the TV's antenna input (its default). An input turns the emulation on if it is off, a set keeps the input if it has it. Without arguments it shows the setting. See "Monitor and TV" in README.md |
+| `screenshot file.png [bar \| crt [height]]` | saves the framebuffer (403×284); with `bar` also the window's status bar below it (403×316); with `crt` the screen through the monitor emulation (the one set with `crt`, otherwise the 1084S-P1 with luma/chroma, or the 1702 on NTSC), `height` pixels high (284-2272, default 1136) with the PAL pixel aspect; it needs a GPU. With `-` as the file the PNG goes to the output, for the [remote monitor](#remote-monitor) |
+| `info` | frames, instructions, cycles, PRG waiting to be injected (`prg_pending`), keys still to type (`typing`), state of file/break/watch/trace, video standard (`video=PAL` or `NTSC`) |
 
 | Input | |
 |---|---|

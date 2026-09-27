@@ -19,7 +19,6 @@ use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use std::time::Instant;
 
-use crate::frontend::FRAME;
 
 /// Hook for a frontend (the `c64dbg --window` window): receives every frame
 /// completed while running, and the state after every command.
@@ -272,7 +271,7 @@ impl Debugger {
             self.loading = self.loads.update(c64);
             let paced = self.realtime && !(self.load_turbo && self.loading);
             if paced {
-                self.pace();
+                self.pace(crate::frontend::frame(c64));
             } else {
                 self.pace_next = None;
             }
@@ -352,11 +351,11 @@ impl Debugger {
 
     /// Waits for the frame deadline at real speed. If far behind (execution
     /// just resumed after a pause) it restarts from now.
-    fn pace(&mut self) {
+    fn pace(&mut self, frame: std::time::Duration) {
         let now = Instant::now();
         let target = match self.pace_next {
-            Some(t) if now < t + FRAME * 10 => t + FRAME,
-            _ => now + FRAME,
+            Some(t) if now < t + frame * 10 => t + frame,
+            _ => now + frame,
         };
         if target > now {
             std::thread::sleep(target - now);
@@ -686,18 +685,18 @@ impl Debugger {
     }
 
     pub fn sid(c64: &C64) -> String {
-        Self::sid_chip(&c64.bus.sid)
+        Self::sid_chip(&c64.bus.sid, c64.standard().clock_hz())
     }
 
     /// Second SID: address and state, or how to attach one.
     pub fn sid2(c64: &C64) -> String {
         match &c64.bus.sid2 {
-            Some(sid) => format!("second SID at ${:04X}\n{}", c64.bus.sid2_base, Self::sid_chip(sid)),
+            Some(sid) => format!("second SID at ${:04X}\n{}", c64.bus.sid2_base, Self::sid_chip(sid, c64.standard().clock_hz())),
             None => "second SID: none ('sid2 d420' to attach one)\n".into(),
         }
     }
 
-    fn sid_chip(sid: &crate::sid::Sid) -> String {
+    fn sid_chip(sid: &crate::sid::Sid, clock_hz: u64) -> String {
         let r = &sid.registers;
         let mut s = String::new();
         for v in 0..3usize {
@@ -705,7 +704,7 @@ impl Debugger {
             let freq = r[b] as u16 | ((r[b + 1] as u16) << 8);
             let pw = (r[b + 2] as u16 | ((r[b + 3] as u16) << 8)) & 0x0FFF;
             let ctrl = r[b + 4];
-            let hz = freq as f64 * 985248.0 / 16777216.0;
+            let hz = freq as f64 * clock_hz as f64 / 16777216.0;
             let mut wave = Vec::new();
             if ctrl & 0x10 != 0 { wave.push("tri"); }
             if ctrl & 0x20 != 0 { wave.push("saw"); }
@@ -796,7 +795,7 @@ impl Debugger {
   drive insert file  insert a D64/G64 without autoloading it
   drive trace on file | off   trace of the drive's instructions (PC, registers, cycle)
   blend [on|off]     frame blending: each frame mixed with the previous one, as on a 50 Hz CRT (interlace pictures)
-  crt [off | 1084s-p1 | 1084s-d1 | 1901 | tv] [lc | composite | rf]  CRT monitor emulation in the window (GPU): Commodore 1084S-P1 (1084s), 1084S-D1, 1901, or the Philips CP90 TV (tv); luma/chroma, composite or RF input
+  crt [off | 1084s-p1 | 1084s-d1 | 1901 | tv | 1702] [lc | composite | rf]  CRT monitor emulation in the window (GPU): Commodore 1084S-P1 (1084s), 1084S-D1, 1901, the Philips CP90 TV (tv) for PAL, the 1702 for NTSC; luma/chroma, composite or RF input
   screenshot file [bar | crt [height]]  save the framebuffer as PNG (bar: with the window's status bar; crt: through the CRT emulation, default 1136 pixels high; file - = the PNG on the output)
   trace on [file] [from to] | trace off
   keys text          type text on the keyboard (\\n = RETURN, {name} = a key named as for key: {f1} {clr} {left}...)
@@ -965,7 +964,8 @@ impl Debugger {
                 match args.first() {
                     Some(&"off") => { c64.dbg.raster_break = None; }
                     Some(l) => {
-                        let l = parse_dec(l).filter(|v| *v < 312).ok_or("raster line 0-311")?;
+                        let lines = c64.standard().raster_lines() as u64;
+                        let l = parse_dec(l).filter(|v| *v < lines).ok_or(format!("raster line 0-{}", lines - 1))?;
                         c64.dbg.raster_break = Some(l as u16);
                     }
                     None => return Err("usage: rbreak line|off".into()),
@@ -1225,12 +1225,13 @@ impl Debugger {
                 write!(out, "{}", Self::reu(c64)).map_err(io)?;
             }
             "info" => {
-                writeln!(out, "frame {} instr {} cycles {} raster {}/{} prg_pending={} typing={} disk={} cart={} breakpoints={} watches={} trace={}",
+                writeln!(out, "frame {} instr {} cycles {} raster {}/{} prg_pending={} typing={} disk={} cart={} breakpoints={} watches={} trace={} video={}",
                     c64.frame_count, self.instr_count, c64.cpu.total_cycles,
                     c64.bus.vic.raster_line, c64.bus.vic.cycle,
                     c64.prg_pending() as u8, c64.bus.keyboard.typing() as u8, c64.disk.is_some() as u8, c64.bus.cart.is_some() as u8,
                     self.breakpoints.len(), c64.bus.dbg_watch.len(),
-                    self.trace.as_ref().map(|t| t.lines.to_string()).unwrap_or_else(|| "off".into())).map_err(io)?;
+                    self.trace.as_ref().map(|t| t.lines.to_string()).unwrap_or_else(|| "off".into()),
+                    c64.standard().name()).map_err(io)?;
             }
 
             "blend" => {
@@ -1246,10 +1247,10 @@ impl Debugger {
             "crt" => {
                 let mut crt = c64.crt();
                 for a in args {
-                    crt = crate::crt::Crt::apply(crt, a)?;
+                    crt = crate::crt::Crt::apply(crt, a, c64.standard())?;
                 }
                 if let Some(c) = crt {
-                    c.check()?;
+                    c.check(c64.standard())?;
                 }
                 c64.set_crt(crt);
                 match crt {
@@ -1261,12 +1262,13 @@ impl Debugger {
             "screenshot" => {
                 const USAGE: &str = "usage: screenshot file.png [bar | crt [height]]";
                 let path = args.first().ok_or(USAGE)?;
+                let fb_h = c64.fb_height();
                 match args.get(1).copied() {
                     // The PNG itself on the output: for the remote monitor
-                    None if *path == "-" => out.write_all(&crate::png::encode_argb(&c64.framebuffer, WIDTH, HEIGHT)).map_err(io)?,
+                    None if *path == "-" => out.write_all(&crate::png::encode_argb(&c64.framebuffer, WIDTH, fb_h)).map_err(io)?,
                     None => {
-                        crate::png::write_argb(path, &c64.framebuffer, WIDTH, HEIGHT).map_err(io)?;
-                        writeln!(out, "screenshot saved: {path} ({WIDTH}x{HEIGHT})").map_err(io)?;
+                        crate::png::write_argb(path, &c64.framebuffer, WIDTH, fb_h).map_err(io)?;
+                        writeln!(out, "screenshot saved: {path} ({WIDTH}x{fb_h})").map_err(io)?;
                     }
                     Some("bar") => {
                         // With the status bar below, as in the window
@@ -1278,7 +1280,7 @@ impl Debugger {
                         bar.render(&s);
                         let mut img = c64.framebuffer.clone();
                         img.extend_from_slice(bar.pixels());
-                        let h = HEIGHT + BAR_HEIGHT;
+                        let h = fb_h + BAR_HEIGHT;
                         crate::png::write_argb(path, &img, WIDTH, h).map_err(io)?;
                         writeln!(out, "screenshot saved: {path} ({WIDTH}x{h}, with the status bar)").map_err(io)?;
                     }
@@ -1497,11 +1499,15 @@ fn parse_port(s: &str) -> Result<usize, String> {
 }
 
 /// The last frame through the CRT emulation (the current settings, or the
-/// default monitor when it is off), `height` pixels high.
+/// monitor of the machine's standard when it is off), `height` pixels high.
 #[cfg(feature = "gpu")]
 fn crt_screenshot(c64: &C64, height: usize) -> Result<(Vec<u32>, usize, usize), String> {
-    let crt = c64.crt().unwrap_or(crate::crt::Crt::new(crate::crt::Model::C1084SP1));
-    crate::frontend::gpu::crt_image(c64.last_frame(), crt, height)
+    let default = match c64.standard() {
+        crate::timing::Standard::Pal => crate::crt::Model::C1084SP1,
+        crate::timing::Standard::Ntsc => crate::crt::Model::C1702,
+    };
+    let crt = c64.crt().unwrap_or(crate::crt::Crt::new(default));
+    crate::frontend::gpu::crt_image(c64.last_frame(), crt, height, c64.frame_count)
 }
 
 #[cfg(not(feature = "gpu"))]

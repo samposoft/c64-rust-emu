@@ -21,14 +21,17 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use crate::c64::{C64, CLOCK_HZ, CYCLES_PER_FRAME};
+use crate::c64::C64;
 use crate::keyboard::HostKey;
 use crate::ring;
 
-/// Duration of an emulation frame (`CYCLES_PER_FRAME` cycles at the PAL
-/// clock): slightly less than 20 ms, so the machine runs at exactly
-/// 985,248 Hz and the audio comes out at the right rate.
-pub const FRAME: Duration = Duration::from_nanos(1_000_000_000 * CYCLES_PER_FRAME as u64 / CLOCK_HZ);
+/// Duration of an emulation frame of `c64`: a time slice of 1/50 s (PAL)
+/// or 1/60 s (NTSC) of emulated cycles at the machine's clock, slightly
+/// less than the nominal time, so the machine runs at exactly its clock and
+/// the audio comes out at the right rate (`timing::Standard::slice`).
+pub fn frame(c64: &C64) -> Duration {
+    c64.standard().slice()
+}
 
 // ── Audio ────────────────────────────────────────────────────────────────────
 

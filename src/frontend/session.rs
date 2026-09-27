@@ -15,7 +15,7 @@ use crate::sid::Model;
 
 use super::remote::RemoteMonitor;
 use super::status::{Click, SpeedMeter, Status};
-use super::{apply_host_key, set_joy_port, AudioOut, Gamepad, JoyPort, FRAME};
+use super::{apply_host_key, set_joy_port, AudioOut, Gamepad, JoyPort};
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -46,17 +46,22 @@ pub struct MachineOptions {
     pub remote: Option<PathBuf>,
     /// Frame blending (`--blend`, `C64::set_blend`).
     pub blend: bool,
-    /// CRT monitor emulation in the window (`--crt`, `--composite`).
-    pub crt: Option<crate::crt::Crt>,
+    /// CRT monitor emulation in the window: the arguments of `--crt`,
+    /// `--composite` and `--rf`, in order (`crt`: resolved with the
+    /// machine's standard, which may come later on the command line).
+    pub crt_args: Vec<String>,
+    /// Video standard (`--ntsc`; PAL by default).
+    pub standard: crate::timing::Standard,
 }
 
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt MONITOR] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
+        "[--version] [--ntsc] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt MONITOR] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
+  --ntsc       an NTSC C64 (VIC-II 6567R8, 1.023 MHz, 60 Hz, 263 lines) instead of PAL
   --roms DIR   directory of kernal.rom, basic.rom, chargen.rom and dos1541.rom (default:
                roms/ next to the executable or in a directory above it, else ./roms)
   --reu KB     attach a REU (128, 256, 512 ... 16384 KB)
@@ -75,8 +80,8 @@ impl MachineOptions {
                the VIC-II and the picture tube of MONITOR, with the luma/chroma input:
                1084s-p1 (or 1084s: Commodore 1084S-P1, Philips), 1084s-d1 (Daewoo),
                1901 (Thomson), or the TV cp90 (or tv: Philips 15CE1510) through the RF
-               modulator; off by default, window only
-  --composite  connect the monitor through composite video (implies --crt 1084s)
+               modulator; with --ntsc the 1702; off by default, window only
+  --composite  connect the monitor through composite video (implies --crt 1084s, or 1702)
   --rf         connect a TV to the RF output, channel 36 (implies --crt tv)
   --remote     remote monitor: debugger commands from other programs (c64mcp, the
                MCP server for Claude) on a Unix socket, macOS and Linux only
@@ -99,6 +104,8 @@ impl MachineOptions {
                 None => { eprintln!("--reu needs the size in KB (128, 256, 512 ... 16384)"); std::process::exit(2); }
             },
             "--no-drive" => self.no_drive = true,
+            "--ntsc" => self.standard = crate::timing::Standard::Ntsc,
+            "--pal" => self.standard = crate::timing::Standard::Pal,
             "--sid" => match rest.next().as_deref().and_then(parse_sid_model) {
                 Some(m) => self.sid = Some(m),
                 None => { eprintln!("--sid needs the model: 6581, 8580 or 8580d (8580 with digiboost)"); std::process::exit(2); }
@@ -119,9 +126,8 @@ impl MachineOptions {
                     "--rf" => Some("rf".to_string()),
                     _ => rest.next(),
                 };
-                match value.map(|v| crate::crt::Crt::apply(self.crt, &v.to_ascii_lowercase())) {
-                    Some(Ok(crt)) => self.crt = crt,
-                    Some(Err(e)) => { eprintln!("--crt: {e}"); std::process::exit(2); }
+                match value {
+                    Some(v) => self.crt_args.push(v.to_ascii_lowercase()),
                     None => { eprintln!("--crt needs the monitor: {} (or off)", crate::crt::Model::NAMES); std::process::exit(2); }
                 }
             }
@@ -142,6 +148,19 @@ impl MachineOptions {
         }
     }
 
+    /// CRT emulation asked for on the command line, for the machine's
+    /// standard.
+    pub fn crt(&self) -> Result<Option<crate::crt::Crt>, String> {
+        let mut crt = None;
+        for a in &self.crt_args {
+            crt = crate::crt::Crt::apply(crt, a, self.standard).map_err(|e| format!("--crt: {e}"))?;
+        }
+        if let Some(c) = crt {
+            c.check(self.standard).map_err(|e| format!("--crt: {e}"))?;
+        }
+        Ok(crt)
+    }
+
     /// The files after the first must be tapes or disks: they are swapped
     /// while the machine is running.
     pub fn check_media(&self) -> Result<(), String> {
@@ -159,6 +178,7 @@ impl MachineOptions {
     /// the error is an invalid REU size.
     pub fn build(&self) -> Result<C64, String> {
         let mut c64 = C64::new();
+        c64.set_standard(self.standard)?;
         let roms = self.roms_dir.clone().unwrap_or_else(C64::default_roms_dir);
         for w in c64.load_roms_from_dir(&roms) {
             eprintln!("WARN: {w}");
@@ -169,10 +189,7 @@ impl MachineOptions {
         }
         c64.set_sid2(self.sid2)?;
         c64.set_blend(self.blend);
-        if let Some(crt) = self.crt {
-            crt.check()?;
-        }
-        c64.set_crt(self.crt);
+        c64.set_crt(self.crt()?);
         if self.tape_sound {
             c64.bus.tape.set_sound(Some(crate::tape::SOUND_VOLUME_DEFAULT));
         }
@@ -372,7 +389,7 @@ impl Session {
             None => (self.screen(), None),
             Some(crt) => {
                 let fb = if self.paused() { self.c64.live_framebuffer() } else { self.c64.last_frame() };
-                (fb, Some(super::window::CrtView { crt, blend: self.c64.blend() }))
+                (fb, Some(super::window::CrtView { crt, blend: self.c64.blend(), frame: self.c64.frame_count }))
             }
         }
     }
@@ -401,7 +418,7 @@ impl Session {
         let mut s = Status::of(&self.c64);
         s.keyboard_port = self.joy_port;
         s.gamepad = self.gamepad.connected();
-        s.fps = self.speed.fps();
+        if let Some(fps) = self.speed.fps() { s.fps = fps; }
         s.turbo = self.loading;
         s.paused = self.paused();
         s.media = (self.media.len() > 1).then(|| (self.media_pos + 1, self.media.len()));
@@ -534,13 +551,14 @@ impl Session {
     /// frame while paused.
     pub fn run_due_frames(&mut self) -> bool {
         let polled = self.poll_remote();
+        let frame = super::frame(&self.c64);
         if self.paused() {
             // Awake every frame, to serve the remote monitor
-            self.next_frame = Instant::now() + FRAME;
+            self.next_frame = Instant::now() + frame;
             return polled;
         }
         if self.loading {
-            let until = Instant::now() + FRAME;
+            let until = Instant::now() + frame;
             while self.loading && Instant::now() < until {
                 if !self.step_frame() { break; }
             }
@@ -549,13 +567,13 @@ impl Session {
         }
         let now = Instant::now();
         // If we are far behind (hidden window, sleep) restart from now
-        if now.duration_since(self.next_frame) > FRAME * 10 {
+        if now.duration_since(self.next_frame) > frame * 10 {
             self.next_frame = now;
         }
         let mut ran = 0;
         while Instant::now() >= self.next_frame && ran < 3 && !self.loading {
             let done = self.step_frame();
-            self.next_frame += FRAME;
+            self.next_frame += frame;
             ran += 1;
             if !done { break; }
         }

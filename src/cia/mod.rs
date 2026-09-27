@@ -12,8 +12,6 @@
 //! Timers and ICR follow the chip's behaviour as modelled by VICE
 //! (ciatimer.h, ciacore.c; written from the description, not copied).
 
-/// PAL cycles per period of the 50 Hz mains (TOD input).
-const TOD_TICK_CYCLES: u32 = 985_248 / 50;
 
 // ── Timer ────────────────────────────────────────────────────────────────────
 
@@ -197,6 +195,9 @@ pub struct CiaState {
     /// Clock stopped from the hours write until the tenths write.
     pub tod_stopped: bool,
     tod_cycles: u32,
+    /// Cycles per period of the mains, the TOD input: 50 Hz (PAL) or 60
+    /// Hz (NTSC), `set_tod_input`.
+    tod_tick_cycles: u32,
     tod_prescale: u8,
 
     /// Serial data register and output shift state.
@@ -234,6 +235,7 @@ impl CiaState {
             tod_latch: None,
             tod_stopped: false,
             tod_cycles: 0,
+            tod_tick_cycles: crate::timing::Standard::Pal.clock_hz() as u32 / 50,
             tod_prescale: 0,
             sdr: 0,
             sdr_shifting: false,
@@ -245,10 +247,19 @@ impl CiaState {
     /// RES line (C64 reset): registers, timers, interrupts, serial port and
     /// TOD as after power-on, as VICE's ciacore_reset, which also stops the
     /// TOD until the tenths are written; the cycle counter goes on.
+    /// Frequency of the mains at the TOD input (50 or 60 Hz) with the CPU
+    /// clock `clock_hz`: the TOD counts one tenth of a second every 5 or 6
+    /// periods, according to CRA bit 7.
+    pub fn set_tod_input(&mut self, clock_hz: u64, mains_hz: u32) {
+        self.tod_tick_cycles = (clock_hz / mains_hz as u64) as u32;
+    }
+
     pub fn reset(&mut self) {
-        let clock = self.clock;
+        let (clock, tod_tick_cycles) = (self.clock, self.tod_tick_cycles);
         *self = Self::new();
         self.clock = clock;
+        // The mains at the TOD pin is part of the board, not of the chip
+        self.tod_tick_cycles = tod_tick_cycles;
         self.tod_stopped = true;
     }
 
@@ -509,7 +520,7 @@ impl CiaState {
 
         // TOD
         self.tod_cycles += 1;
-        if self.tod_cycles >= TOD_TICK_CYCLES {
+        if self.tod_cycles >= self.tod_tick_cycles {
             self.tod_cycles = 0;
             if !self.tod_stopped { self.tod_tick(); }
         }
@@ -553,4 +564,4 @@ impl_state!(CiaState {
     clock, icr_read_clock,
     tod, tod_alarm, tod_latch, tod_stopped, tod_cycles, tod_prescale,
     sdr, sdr_shifting, sdr_pending, sdr_count,
-});
+} skip { tod_tick_cycles });

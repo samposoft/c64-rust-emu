@@ -105,7 +105,7 @@ mod app {
                 other => opts.parse_arg(other, &mut args),
             }
         }
-        if opts.crt.take().is_some() {
+        if !std::mem::take(&mut opts.crt_args).is_empty() {
             eprintln!("WARN: the CRT emulation (--crt, --composite) is only in the window (c64, c64dbg --window).");
         }
 
@@ -119,7 +119,7 @@ mod app {
         };
         let caps = term.detect(graphics);
         let size = term.size();
-        let area = Area::fullscreen(size);
+        let area = Area::fullscreen(size, session.c64.fb_height());
         let screen = match caps.graphics {
             Some(t) => Screen::Kitty(KittyScreen::new(t, area)),
             None => Screen::Blocks(BlockScreen::new(caps.truecolor, area)),
@@ -216,7 +216,7 @@ mod app {
             self.area = match self.mode {
                 Mode::Fullscreen => {
                     term::clear(&mut self.out, self.caps.truecolor);
-                    Area::fullscreen(self.size)
+                    Area::fullscreen(self.size, self.session.c64.fb_height())
                 }
                 Mode::Inline => self.reserve_inline(),
             };
@@ -239,7 +239,7 @@ mod app {
         /// clears them with the terminal colors. After a resize the area is
         /// found again from the cursor, parked on the status line.
         fn reserve_inline(&mut self) -> Area {
-            let mut area = Area::inline(self.size, self.caps.graphics.is_some(), 0);
+            let mut area = Area::inline(self.size, self.caps.graphics.is_some(), 0, self.session.c64.fb_height());
             let total = area.rows + 1;
 
             let out = std::mem::take(&mut self.out);

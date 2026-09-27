@@ -24,6 +24,7 @@ are compared with it cycle by cycle by regression tests.
 | Module here | VICE sources | Authors (from the file headers) |
 |---|---|---|
 | `src/vic/mod.rs` (VIC-II, cycle-exact) | `src/viciisc/vicii-cycle.c`, `vicii-fetch.c`, `vicii-draw-cycle.c`, `vicii-mem.c`, `vicii-chip-model.c` | Hannu Nuotio, Daniel Kahlin, Ettore Perazzoli, Andreas Boose |
+| `src/vic/tables.rs` (cycle tables of the 6569 and 6567R8) | `src/viciisc/vicii-chip-model.c` | Hannu Nuotio, Daniel Kahlin |
 | `src/tape.rs` (Datasette, TAP, T64) | `src/datasette/datasette.c`, `src/tape/tap.c`, `src/tape/t64.c` | Andreas Boose, Andreas Matthies, Marco van den Heuvel, David Hansel, Ettore Perazzoli, Compyx |
 | `src/tape.rs` (PCG random generator for the azimuth error) | `src/lib.c` | Andreas Boose, Marco van den Heuvel |
 | `src/drive/mod.rs` (1541 disk rotation and read/write circuit) | `src/drive/rotation.c` | Andreas Boose, Istvan Fabian, Benjamin 'BeRo' Rosseaux, Peter Rittwage |
@@ -36,6 +37,7 @@ their comments and checked against VICE by the tests:
 
 | Module here | VICE sources | Authors (from the file headers) |
 |---|---|---|
+| `src/timing.rs` (PAL and NTSC clocks, raster and mains frequency) | `src/c64/c64.h`, `src/c64/c64.c` (`machine_change_timing`) | the VICE Team |
 | `src/cia/mod.rs` (CIA 6526 timers and interrupts; written from the description, not copied) | `src/core/ciacore.c`, `src/core/ciatimer.c` | Andre Fachat, Ettore Perazzoli, Andreas Boose, Alexander Bluhm, Olaf Seibert |
 | `src/drive/via.rs` (VIA 6522 of the 1541) | `src/core/viacore.c` | Andre Fachat, Andreas Boose, Olaf Seibert |
 | `src/drive/gcr.rs` (D64 to GCR tracks) | `src/gcr.c`, `src/diskimage/fsimage-gcr.c` | Andreas Boose, Daniel Sladic, Kajtar Zsolt |
@@ -83,7 +85,9 @@ for this emulator; no code was copied. Its figures come from:
   the response of a PAL B/G IF filter; the TDA3562A datasheet's application
   circuit for the chroma band-pass of a TV decoder;
 - the C64 Service Manual, for the luma network of the RF modulator
-  (schematics 251025 and 251696).
+  (schematics 251025 and 251696);
+- the Commodore 1701/1702 service manual (314004-01) and the PAL 1701/1702
+  user's guides, for the NTSC monitor.
 
 The ways of drawing the beam (energy-conserving gaussian integrated over
 the pixel, wider when brighter) and the slot mask follow ideas described

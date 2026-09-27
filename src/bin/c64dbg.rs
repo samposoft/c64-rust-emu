@@ -419,18 +419,21 @@ impl WindowLink {
     fn publish(&mut self, c64: &C64, paused: bool) {
         // With the CRT emulation the frame as the VIC drew it: the GPU
         // does the blending
-        let crt = c64.crt().map(|crt| CrtView { crt, blend: c64.blend() });
+        let crt = c64.crt().map(|crt| CrtView { crt, blend: c64.blend(), frame: c64.frame_count });
         let fb = match (paused, crt) {
             (true, _) => c64.live_framebuffer(),
             (false, Some(_)) => c64.last_frame(),
             (false, None) => &c64.framebuffer[..],
         };
-        self.shared.fb.lock().unwrap().copy_from_slice(fb);
+        let mut shared = self.shared.fb.lock().unwrap();
+        shared.clear();
+        shared.extend_from_slice(fb);
+        drop(shared);
         *self.shared.crt.lock().unwrap() = crt;
         let mut s = Status::of(c64);
         s.keyboard_port = self.joy_port;
         s.gamepad = self.gamepad.connected();
-        s.fps = self.speed.fps();
+        if let Some(fps) = self.speed.fps() { s.fps = fps; }
         s.turbo = !self.realtime;
         s.paused = paused;
         s.message = c64::notice::latest();
@@ -545,7 +548,7 @@ impl DbgWindow {
     /// on the bar (see `MouseCapture::button`).
     fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
         let at = self.placement.to_image_signed(self.cursor.0, self.cursor.1);
-        match self.capture.button(button, pressed, at, self.analog()) {
+        match self.capture.button(button, pressed, at, self.analog(), self.placement.rows) {
             Pointer::Capture => {
                 let Some(w) = &self.window else { return };
                 if self.capture.capture(w) {
@@ -565,7 +568,7 @@ impl DbgWindow {
     fn pointer_moved(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
         let at = self.placement.to_image_signed(x, y);
-        if let Some((x, y)) = self.capture.paddles_at(at, self.analog()) {
+        if let Some((x, y)) = self.capture.paddles_at(at, self.analog(), self.placement.rows) {
             let _ = self.input.send(Input::PaddlePointer(x, y));
         }
     }

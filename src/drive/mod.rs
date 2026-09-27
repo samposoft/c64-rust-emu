@@ -63,9 +63,8 @@ const CYCLES_PER_REVOLUTION: u64 = 200_000;
 const ATTACH_DELAY: u64 = 1_800_000;
 const DETACH_DELAY: u64 = 600_000;
 const ATTACH_DETACH_DELAY: u64 = 1_200_000;
-/// Frequencies: drive at 1 MHz, PAL C64 at 985248 Hz.
+/// The drive's clock: 1 MHz (the C64's is set by `Drive::set_c64_clock`).
 const DRIVE_HZ: u32 = 1_000_000;
-const C64_HZ: u32 = 985_248;
 
 /// Mechanics and read/write circuit.
 pub struct Mechanics {
@@ -617,15 +616,23 @@ impl CpuBus for DriveBus {
 pub struct Drive {
     pub cpu: Cpu,
     pub bus: DriveBus,
-    /// C64 time not yet covered by the drive (units: 1/(C64_HZ*DRIVE_HZ)
+    /// C64 time not yet covered by the drive (units: 1/(c64_hz*DRIVE_HZ)
     /// of a second, scaled): positive if the next drive cycle starts
     /// before the end of the current C64 cycle.
     frac: i32,
+    /// C64 clock, Hz: PAL 985248, NTSC 1022730.
+    c64_hz: u32,
     /// Drive instruction trace (debugger): PC and cycle of each one.
     pub trace: Option<Box<dyn FnMut(&Cpu, &DriveBus, u64)>>,
 }
 
 impl Drive {
+    /// Clock of the C64 it is connected to (PAL or NTSC), Hz: the drive
+    /// runs 1,000,000 cycles for every `c64_hz` of the C64.
+    pub fn set_c64_clock(&mut self, c64_hz: u64) {
+        self.c64_hz = c64_hz as u32;
+    }
+
     /// Drive with the DOS ROM (16 KB) and number `device` (8-11).
     pub fn new(rom: &[u8], device: u8) -> Result<Drive, String> {
         if rom.len() != 0x4000 {
@@ -648,6 +655,7 @@ impl Drive {
                 activity: 0,
             },
             frac: 0,
+            c64_hz: crate::timing::Standard::Pal.clock_hz() as u32,
             trace: None,
         };
         d.reset();
@@ -703,7 +711,7 @@ impl Drive {
     pub fn run_c64_cycle(&mut self, atn: bool, clk: bool, data: bool) {
         self.frac += DRIVE_HZ as i32;
         while self.frac > 0 {
-            self.frac -= C64_HZ as i32;
+            self.frac -= self.c64_hz as i32;
             self.cycle();
         }
         let b = &mut self.bus;
@@ -784,7 +792,7 @@ impl_state!(DriveBus {
     ram, rom, via1, via2, mech, last_data, c64_atn, c64_clk, c64_data, device, clk,
 } skip { activity });
 
-impl_state!(Drive { cpu, bus, frac } skip { trace });
+impl_state!(Drive { cpu, bus, frac } skip { trace, c64_hz });
 
 impl Default for Drive {
     fn default() -> Self {

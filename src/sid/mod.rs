@@ -33,7 +33,6 @@ use extfilt::ExternalFilter;
 use filter::{Filter, ModelFilter};
 use wave::WaveformGenerator;
 
-use crate::c64::CLOCK_HZ;
 
 /// Chip model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -109,6 +108,8 @@ const FIR_GAIN: f64 = 0.97;
 /// for the fractional sample positions (reSID, SAMPLE_RESAMPLE).
 struct Fir {
     rate: u32,
+    /// CPU clock the filter was built for, Hz.
+    clock_hz: u64,
     cycles_per_sample: i32,
     n: usize,
     res: usize,
@@ -133,8 +134,8 @@ fn i0(x: f64) -> f64 {
 }
 
 impl Fir {
-    fn new(rate: u32) -> Result<Self, String> {
-        let clock_freq = CLOCK_HZ as f64;
+    fn new(rate: u32, clock_hz: u64) -> Result<Self, String> {
+        let clock_freq = clock_hz as f64;
         let sample_freq = rate as f64;
         let pass_freq = rate as f64 * PASSBAND_PERCENT / 200.0;
         if (FIR_N * clock_freq / sample_freq) as i32 >= RINGSIZE as i32 {
@@ -175,7 +176,7 @@ impl Fir {
                 table[(fir_offset as i32 + j) as usize] = val.round() as i16;
             }
         }
-        Ok(Self { rate, cycles_per_sample, n: fir_n, res: fir_res, table })
+        Ok(Self { rate, clock_hz, cycles_per_sample, n: fir_n, res: fir_res, table })
     }
 }
 
@@ -248,6 +249,8 @@ pub struct Sid {
     pub raw_capture: Option<Vec<i16>>,
     /// Audio just switched back on: the next cycle realigns the output stage.
     resume: bool,
+    /// CPU clock, Hz: the SID runs at it (`set_clock`).
+    clock_hz: u64,
 }
 
 impl Sid {
@@ -270,6 +273,7 @@ impl Sid {
             tables: None,
             raw_capture: None,
             resume: false,
+            clock_hz: crate::timing::Standard::Pal.clock_hz(),
         };
         sid.set_model(Model::Mos6581, false);
         sid
@@ -277,6 +281,19 @@ impl Sid {
 
     pub fn model(&self) -> Model {
         self.model
+    }
+
+    /// CPU clock (PAL or NTSC), for the resampling to the audio rate: with
+    /// audio on, the filter is rebuilt.
+    pub fn set_clock(&mut self, clock_hz: u64) -> Result<(), String> {
+        self.clock_hz = clock_hz;
+        match &self.fir {
+            Some(f) => {
+                let rate = f.rate;
+                self.set_audio(Some(rate))
+            }
+            None => Ok(()),
+        }
     }
 
     pub fn digiboost(&self) -> bool {
@@ -334,10 +351,10 @@ impl Sid {
         match rate {
             None => self.fir = None,
             Some(rate) => {
-                if self.fir.as_ref().is_some_and(|f| f.rate == rate) {
+                if self.fir.as_ref().is_some_and(|f| f.rate == rate && f.clock_hz == self.clock_hz) {
                     return Ok(());
                 }
-                let fir = Fir::new(rate)?;
+                let fir = Fir::new(rate, self.clock_hz)?;
                 if self.tables.is_none() {
                     self.load_tables();
                 }
@@ -359,7 +376,8 @@ impl Sid {
     /// After restoring a snapshot into this SID: audio at the rate of the
     /// previous machine, without emulating the pending cycles.
     pub fn inherit_audio(&mut self, rate: Option<u32>) -> Result<(), String> {
-        self.fir = rate.map(Fir::new).transpose()?;
+        let clock = self.clock_hz;
+        self.fir = rate.map(|r| Fir::new(r, clock)).transpose()?;
         if self.fir.is_some() {
             self.load_tables();
         }
@@ -606,7 +624,7 @@ impl_state!(Voice { wave, env });
 impl_state!(Sid {
     registers, model, digiboost, voices, filter, extfilt, bus_value, bus_value_ttl, pending,
     sample_offset, sample_index, ring, samples,
-} skip { fir, tables, raw_capture, resume });
+} skip { fir, tables, raw_capture, resume, clock_hz });
 
 #[cfg(test)]
 mod tests {
@@ -618,17 +636,22 @@ mod tests {
 
     #[test]
     fn one_second_gives_rate_samples() {
-        for rate in [44_100, 48_000] {
-            let mut sid = Sid::new();
-            sid.set_audio(Some(rate)).unwrap();
-            let mut buf = Vec::new();
-            for _ in 0..50 {
-                run(&mut sid, CLOCK_HZ as u32 / 50);
+        // A second of the PAL or NTSC clock gives the audio rate
+        for standard in [crate::timing::Standard::Pal, crate::timing::Standard::Ntsc] {
+            let clock = standard.clock_hz() as u32;
+            for rate in [44_100, 48_000] {
+                let mut sid = Sid::new();
+                sid.set_clock(clock as u64).unwrap();
+                sid.set_audio(Some(rate)).unwrap();
+                let mut buf = Vec::new();
+                for _ in 0..50 {
+                    run(&mut sid, clock / 50);
+                    sid.take_samples(&mut buf);
+                }
+                run(&mut sid, clock % 50);
                 sid.take_samples(&mut buf);
+                assert!((buf.len() as i64 - rate as i64).abs() <= 1, "{rate}: {}", buf.len());
             }
-            run(&mut sid, CLOCK_HZ as u32 % 50);
-            sid.take_samples(&mut buf);
-            assert!((buf.len() as i64 - rate as i64).abs() <= 1, "{rate}: {}", buf.len());
         }
     }
 

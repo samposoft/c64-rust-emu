@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Write;
 
-use crate::vic::{HEIGHT, WIDTH};
+use crate::vic::WIDTH;
 
 use super::TermSize;
 
@@ -67,36 +67,39 @@ pub struct Area {
     pub cell: Option<(usize, usize)>,
     /// Screen centered in the area; otherwise at the top left.
     pub centered: bool,
+    /// Lines of the C64 screen: 284 PAL, 253 NTSC.
+    pub fb_rows: usize,
 }
 
 impl Area {
-    /// The whole window except the last row, which is left to the status line.
-    pub fn fullscreen(size: TermSize) -> Self {
+    /// The whole window except the last row, which is left to the status
+    /// line, for a C64 screen of `fb_rows` lines.
+    pub fn fullscreen(size: TermSize, fb_rows: usize) -> Self {
         let cell = (size.xpix > 0 && size.ypix > 0).then(|| {
             ((size.xpix / size.cols.max(1)).max(1), (size.ypix / size.rows.max(1)).max(1))
         });
-        Self { row: 0, rows: size.rows.saturating_sub(1).max(1), cols: size.cols.max(1), cell, centered: true }
+        Self { row: 0, rows: size.rows.saturating_sub(1).max(1), cols: size.cols.max(1), cell, centered: true, fb_rows }
     }
 
     /// Rows reserved below the prompt starting at `row`: those the screen
     /// needs ([`inline_rows`]), with the screen at the top left.
-    pub fn inline(size: TermSize, graphics: bool, row: usize) -> Self {
-        Self { row, rows: inline_rows(size, graphics), centered: false, ..Self::fullscreen(size) }
+    pub fn inline(size: TermSize, graphics: bool, row: usize, fb_rows: usize) -> Self {
+        Self { row, rows: inline_rows(size, graphics, fb_rows), centered: false, ..Self::fullscreen(size, fb_rows) }
     }
 }
 
 /// Rows for the screen in inline mode: those of the image at the largest
 /// integer scale that fits the window (at most 3×, like the pixels sent),
 /// not the whole window. The status line comes on top.
-pub fn inline_rows(size: TermSize, graphics: bool) -> usize {
-    let full = Area::fullscreen(size);
+pub fn inline_rows(size: TermSize, graphics: bool, fb_rows: usize) -> usize {
+    let full = Area::fullscreen(size, fb_rows);
     if !graphics {
         return BlockLayout::new(full).ys.len().div_ceil(2);
     }
     let (cw, ch) = full.cell.unwrap_or(GUESS_CELL);
-    let fit = (full.cols * cw / WIDTH).min(full.rows * ch / HEIGHT);
+    let fit = (full.cols * cw / WIDTH).min(full.rows * ch / fb_rows);
     if fit == 0 { return full.rows; }
-    (HEIGHT * fit.min(MAX_SEND_SCALE)).div_ceil(ch).min(full.rows)
+    (fb_rows * fit.min(MAX_SEND_SCALE)).div_ceil(ch).min(full.rows)
 }
 
 /// Where and how the image is placed in the terminal.
@@ -123,18 +126,18 @@ pub fn kitty_placement(area: Area, max_scale: usize) -> Placement {
     let (cols, rows) = (area.cols, area.rows);
     let (cw, ch) = area.cell.unwrap_or(GUESS_CELL);
     let (aw, ah) = (cols * cw, rows * ch);
-    let fit = (aw / WIDTH).min(ah / HEIGHT);
+    let fit = (aw / WIDTH).min(ah / area.fb_rows);
 
     if area.cell.is_some() && (1..=max_scale).contains(&fit) {
-        let (ox, oy) = if area.centered { ((aw - WIDTH * fit) / 2, (ah - HEIGHT * fit) / 2) } else { (0, 0) };
+        let (ox, oy) = if area.centered { ((aw - WIDTH * fit) / 2, (ah - area.fb_rows * fit) / 2) } else { (0, 0) };
         return Placement {
             col: ox / cw, row: area.row + oy / ch, x_off: ox % cw, y_off: oy % ch, scale: fit, cells: None,
         };
     }
     // Integer scale if possible, otherwise the largest that fits
-    let f = if fit >= 1 { fit as f64 } else { (aw as f64 / WIDTH as f64).min(ah as f64 / HEIGHT as f64) };
+    let f = if fit >= 1 { fit as f64 } else { (aw as f64 / WIDTH as f64).min(ah as f64 / area.fb_rows as f64) };
     let c = ((WIDTH as f64 * f / cw as f64).round() as usize).clamp(1, cols);
-    let r = ((HEIGHT as f64 * f / ch as f64).round() as usize).clamp(1, rows);
+    let r = ((area.fb_rows as f64 * f / ch as f64).round() as usize).clamp(1, rows);
     let (col, row) = if area.centered { ((cols - c) / 2, (rows - r) / 2) } else { (0, 0) };
     Placement {
         col,
@@ -199,10 +202,11 @@ impl KittyScreen {
 
         let pl = self.placement;
         let k = pl.scale;
-        let (w, h) = (WIDTH * k, HEIGHT * k);
+        let lines = fb.len() / WIDTH;
+        let (w, h) = (WIDTH * k, lines * k);
         self.rgb.clear();
         self.rgb.reserve(w * h * 3);
-        for y in 0..HEIGHT {
+        for y in 0..lines {
             let start = self.rgb.len();
             for &px in &fb[y * WIDTH..(y + 1) * WIDTH] {
                 let rgb = [(px >> 16) as u8, (px >> 8) as u8, px as u8];
@@ -317,15 +321,15 @@ impl BlockLayout {
         let (cols, rows) = (area.cols, area.rows);
         // Cells are about 1:2, so a half block is roughly square
         let (pw, ph) = (cols, rows * 2);
-        let (out_w, out_h, step): (usize, usize, f64) = if pw >= WIDTH && ph >= HEIGHT {
-            let m = (pw / WIDTH).min(ph / HEIGHT);
-            (WIDTH * m, HEIGHT * m, 1.0 / m as f64)
+        let (out_w, out_h, step): (usize, usize, f64) = if pw >= WIDTH && ph >= area.fb_rows {
+            let m = (pw / WIDTH).min(ph / area.fb_rows);
+            (WIDTH * m, area.fb_rows * m, 1.0 / m as f64)
         } else {
-            let s = (WIDTH as f64 / pw as f64).max(HEIGHT as f64 / ph as f64);
-            ((WIDTH as f64 / s) as usize, (HEIGHT as f64 / s) as usize, s)
+            let s = (WIDTH as f64 / pw as f64).max(area.fb_rows as f64 / ph as f64);
+            ((WIDTH as f64 / s) as usize, (area.fb_rows as f64 / s) as usize, s)
         };
         let xs = (0..out_w).map(|x| ((x as f64 * step) as usize).min(WIDTH - 1)).collect();
-        let ys = (0..out_h).map(|y| ((y as f64 * step) as usize).min(HEIGHT - 1)).collect();
+        let ys = (0..out_h).map(|y| ((y as f64 * step) as usize).min(area.fb_rows - 1)).collect();
         let out_rows = out_h.div_ceil(2);
         let (col, row) = if area.centered { ((cols - out_w) / 2, rows.saturating_sub(out_rows) / 2) } else { (0, 0) };
         Self { col, row: area.row + row, xs, ys }
@@ -416,6 +420,7 @@ fn ansi256(rgb: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vic::HEIGHT;
 
     #[test]
     fn base64_matches_rfc4648() {
@@ -430,7 +435,7 @@ mod tests {
     fn native_placement_is_centered_to_the_pixel() {
         // 150×60 cells of 10×20 pixels: area 1500×1180, fits 3×
         let size = TermSize { cols: 150, rows: 60, xpix: 1500, ypix: 1200 };
-        let p = kitty_placement(Area::fullscreen(size), 3);
+        let p = kitty_placement(Area::fullscreen(size, HEIGHT), 3);
         assert_eq!(p.cells, None);
         assert_eq!(p.scale, 3);
         let ox = (1500 - WIDTH * 3) / 2;
@@ -441,7 +446,7 @@ mod tests {
     #[test]
     fn large_window_is_scaled_by_the_terminal() {
         let size = TermSize { cols: 300, rows: 100, xpix: 3000, ypix: 2000 };
-        let p = kitty_placement(Area::fullscreen(size), 3);
+        let p = kitty_placement(Area::fullscreen(size, HEIGHT), 3);
         assert_eq!(p.scale, 3);
         // Integer 6×: 2418×1704 pixels = 242×85 cells
         assert_eq!(p.cells, Some((242, 85)));
@@ -449,25 +454,25 @@ mod tests {
 
     #[test]
     fn small_window_and_unknown_pixels_still_fit() {
-        let p = kitty_placement(Area::fullscreen(TermSize { cols: 40, rows: 24, xpix: 320, ypix: 384 }), 3);
+        let p = kitty_placement(Area::fullscreen(TermSize { cols: 40, rows: 24, xpix: 320, ypix: 384 }, HEIGHT), 3);
         let (c, r) = p.cells.unwrap();
         assert!(c <= 40 && r <= 23 && p.scale == 1);
-        let p = kitty_placement(Area::fullscreen(TermSize { cols: 120, rows: 40, xpix: 0, ypix: 0 }), 3);
+        let p = kitty_placement(Area::fullscreen(TermSize { cols: 120, rows: 40, xpix: 0, ypix: 0 }, HEIGHT), 3);
         assert!(p.cells.is_some());
     }
 
     #[test]
     fn block_layout_fits_the_terminal() {
-        let l = BlockLayout::new(Area::fullscreen(TermSize { cols: 200, rows: 50, xpix: 0, ypix: 0 }));
+        let l = BlockLayout::new(Area::fullscreen(TermSize { cols: 200, rows: 50, xpix: 0, ypix: 0 }, HEIGHT));
         assert!(l.col + l.xs.len() <= 200 && l.row + l.ys.len().div_ceil(2) <= 49);
-        let l = BlockLayout::new(Area::fullscreen(TermSize { cols: 900, rows: 300, xpix: 0, ypix: 0 }));
+        let l = BlockLayout::new(Area::fullscreen(TermSize { cols: 900, rows: 300, xpix: 0, ypix: 0 }, HEIGHT));
         assert_eq!(l.xs.len(), WIDTH * 2); // enlarged 2× without blurring
     }
 
     #[test]
     fn block_screen_redraws_only_changes() {
         let size = TermSize { cols: 403, rows: 143, xpix: 0, ypix: 0 };
-        let mut s = BlockScreen::new(true, Area::fullscreen(size));
+        let mut s = BlockScreen::new(true, Area::fullscreen(size, HEIGHT));
         let mut fb = vec![0x000000u32; WIDTH * HEIGHT];
         let mut out = Vec::new();
         s.draw(&fb, &mut out);
@@ -484,17 +489,17 @@ mod tests {
     fn inline_area_is_only_as_tall_as_the_image() {
         // 150×60 cells of 10×20: fits 3×, 852 pixels = 43 rows
         let size = TermSize { cols: 150, rows: 60, xpix: 1500, ypix: 1200 };
-        let rows = inline_rows(size, true);
+        let rows = inline_rows(size, true, HEIGHT);
         assert_eq!(rows, 43);
         // In the 43-row area from row 10 the image goes native at 3×, at
         // the top left
-        let p = kitty_placement(Area::inline(size, true, 10), 3);
+        let p = kitty_placement(Area::inline(size, true, 10, HEIGHT), 3);
         assert_eq!((p.scale, p.cells), (3, None));
         assert_eq!((p.col, p.x_off, p.row, p.y_off), (0, 0, 10, 0));
         // Huge window: at most 3×
-        assert_eq!(inline_rows(TermSize { cols: 400, rows: 200, xpix: 4000, ypix: 4000 }, true), 43);
+        assert_eq!(inline_rows(TermSize { cols: 400, rows: 200, xpix: 4000, ypix: 4000 }, true, HEIGHT), 43);
         // Half blocks: the rows of the sampled image
-        assert_eq!(inline_rows(TermSize { cols: 403, rows: 300, xpix: 0, ypix: 0 }, false), 142);
+        assert_eq!(inline_rows(TermSize { cols: 403, rows: 300, xpix: 0, ypix: 0 }, false, HEIGHT), 142);
     }
 
     #[test]

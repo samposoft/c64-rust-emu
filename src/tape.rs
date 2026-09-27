@@ -38,8 +38,6 @@ const MOTOR_DELAY_FAST: u64 = 1000;
 const MAX_GAP: u64 = 100_000;
 /// Duration of a zero in a version 0 TAP (as in mtap).
 const ZERO_GAP_DELAY: u64 = 2500;
-/// Cycles per second of the PAL C64, for the counter and fast winding.
-const CYCLES_PER_SECOND: f64 = 985_248.0;
 
 // Datasette mechanics (datasette.h): the counter is
 // c = g·(√(v·t/(d·π) + r²/d²) − r/d), with t the seconds of tape from the start.
@@ -185,6 +183,9 @@ pub struct Datasette {
     button: Button,
     /// The motor is running (also during the stop delay).
     motor: bool,
+    /// CPU clock, Hz (PAL or NTSC): the speed of the counter, of fast
+    /// winding and of the wobble, as VICE's datasette_cycles_per_second.
+    clock_hz: f64,
     /// Cycle at which the motor stops (0: no stop in progress).
     motor_stop_clk: u64,
     /// MOTOR line last seen on the processor port.
@@ -243,6 +244,7 @@ impl Datasette {
             pos: 0,
             button: Button::Stop,
             motor: false,
+            clock_hz: crate::timing::Standard::Pal.clock_hz() as f64,
             motor_stop_clk: 0,
             motor_line: false,
             alarm: None,
@@ -276,6 +278,12 @@ impl Datasette {
     /// datasette_set_tape_image). For the counter the tape length is
     /// measured by reading it all, and as in VICE the reading also advances
     /// the speed wobble.
+    /// CPU clock (PAL or NTSC), Hz. TAP pulses are in cycles and are played
+    /// as they are, as VICE does.
+    pub fn set_clock(&mut self, clock_hz: u64) {
+        self.clock_hz = clock_hz as f64;
+    }
+
     pub fn insert(&mut self, tap: Tap) {
         self.image = Some(tap);
         self.reset();
@@ -341,7 +349,7 @@ impl Datasette {
         let c1 = DS_V_PLAY / DS_D / PI;
         let c2 = (DS_R * DS_R) / (DS_D * DS_D);
         let c3 = DS_R / DS_D;
-        (DS_G * ((self.cycle_counter as f64 / (CYCLES_PER_SECOND / 8.0) * c1 + c2).sqrt() - c3)) as i32
+        (DS_G * ((self.cycle_counter as f64 / (self.clock_hz / 8.0) * c1 + c2).sqrt() - c3)) as i32
     }
 
     pub fn motor(&self) -> bool {
@@ -703,7 +711,7 @@ impl Datasette {
     /// the take-up reel (m/s).
     fn fast_speed(&self, counter: u64) -> f64 {
         DS_RPS_FAST / DS_G
-            * (4.0 * PI * DS_D * DS_V_PLAY / CYCLES_PER_SECOND * 8.0 * counter as f64
+            * (4.0 * PI * DS_D * DS_V_PLAY / self.clock_hz * 8.0 * counter as f64
                 + 4.0 * PI * PI * DS_R * DS_R).sqrt()
     }
 
@@ -789,7 +797,7 @@ impl Datasette {
         }
         let freq = self.wobble_frequency as f32 / WOBBLE_FREQUENCY_ONE as f32;
         let amplitude = self.wobble_amplitude as f32 / WOBBLE_AMPLITUDE_ONE as f32;
-        let cycles = self.cycle_counter_total as f32 / (CYCLES_PER_SECOND as f32 / 1_000_000.0);
+        let cycles = self.cycle_counter_total as f32 / (self.clock_hz as f32 / 1_000_000.0);
         let step = cycles as f64 / (10_000_000_000.0f32 as f64 * (2.0 * std::f64::consts::PI));
         self.wobble_phase = (freq as f64).mul_add(step, self.wobble_phase as f64) as f32;
         if self.wobble_phase as f64 > 2.0 * std::f64::consts::PI {
@@ -855,7 +863,7 @@ impl_state!(Datasette {
     last_direction, cycle_counter, cycle_counter_total, counter_offset, last_write_clk, last_write_bit,
     write_line, wobble_amplitude, wobble_frequency, wobble_phase, wobble_rest, azimuth_error, azimuth_rest,
     rng, sound_volume, sound_sign, sound_level, sound_from, pulses, run_start,
-} skip { sound_edges });
+} skip { sound_edges, clock_hz });
 
 #[cfg(test)]
 mod tests {

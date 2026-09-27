@@ -121,13 +121,15 @@ impl Rect {
 pub struct Placement {
     pub screen: Rect,
     pub bar: Option<Rect>,
+    /// Lines of the screen: 284 PAL, 253 NTSC (`timing::Standard`).
+    pub rows: usize,
 }
 
 impl Placement {
     /// Window point (physical pixels) in C64 pixels, from the top-left
     /// corner of the screen, also outside it (negative or beyond the
     /// edges); points on the status bar come after the screen lines
-    /// (y >= HEIGHT). None only before the first drawing.
+    /// (y >= `rows`). None only before the first drawing.
     pub fn to_image_signed(&self, x: f64, y: f64) -> Option<(i32, i32)> {
         if self.screen.sx == 0.0 {
             return None;
@@ -135,26 +137,28 @@ impl Placement {
         if let Some(bar) = &self.bar {
             let (bx, by) = bar.to_image(x, y);
             if by >= 0 {
-                return Some((bx, HEIGHT as i32 + by));
+                return Some((bx, self.rows as i32 + by));
             }
         }
         Some(self.screen.to_image(x, y))
     }
 }
 
-/// Where the screen and the bar go in a `dw`×`dh` window: the same integer
-/// scale for both, centered, one above the other. With the CRT emulation
-/// the screen pixels have the PAL aspect (narrower than tall); without the
-/// bar (fullscreen) the CRT screen then fills the window at any scale.
-pub fn layout(dw: usize, dh: usize, bar: bool, crt: bool) -> Placement {
+/// Where the screen (`rows` lines) and the bar go in a `dw`×`dh` window: the
+/// same integer scale for both, centered, one above the other. With the CRT
+/// emulation the screen pixels have the `crt_aspect` of the standard
+/// (narrower than tall: 0.936 PAL, 0.75 NTSC); without the bar (fullscreen)
+/// the CRT screen then fills the window at any scale.
+pub fn layout(dw: usize, dh: usize, rows: usize, bar: bool, crt_aspect: Option<f64>) -> Placement {
     let bar_h = if bar { super::status::BAR_HEIGHT } else { 0 };
-    let height = HEIGHT + bar_h;
-    let aspect = crate::crt::PIXEL_ASPECT;
+    let height = rows + bar_h;
+    let crt = crt_aspect.is_some();
+    let aspect = crt_aspect.unwrap_or(1.0);
     if crt && !bar {
-        let sy = (dh as f64 / HEIGHT as f64).min(dw as f64 / (WIDTH as f64 * aspect));
-        let (w, h) = (WIDTH as f64 * aspect * sy, HEIGHT as f64 * sy);
+        let sy = (dh as f64 / rows as f64).min(dw as f64 / (WIDTH as f64 * aspect));
+        let (w, h) = (WIDTH as f64 * aspect * sy, rows as f64 * sy);
         let (x, y) = (((dw as f64 - w) / 2.0).floor(), ((dh as f64 - h) / 2.0).floor());
-        return Placement { screen: Rect { x, y, sx: sy * aspect, sy }, bar: None };
+        return Placement { screen: Rect { x, y, sx: sy * aspect, sy }, bar: None, rows };
     }
     let scale = (dw / WIDTH).min(dh / height).max(1);
     let x0 = dw.saturating_sub(WIDTH * scale) / 2;
@@ -166,15 +170,15 @@ pub fn layout(dw: usize, dh: usize, bar: bool, crt: bool) -> Placement {
     } else {
         Rect { x: x0 as f64, y: y0 as f64, sx: s, sy: s }
     };
-    let bar = bar.then_some(Rect { x: x0 as f64, y: (y0 + HEIGHT * scale) as f64, sx: s, sy: s });
-    Placement { screen, bar }
+    let bar = bar.then_some(Rect { x: x0 as f64, y: (y0 + rows * scale) as f64, sx: s, sy: s });
+    Placement { screen, bar, rows }
 }
 
-/// Draws `screen` and, below it, `bar` (both WIDTH wide) into `buf`
+/// Draws `screen` and, below it, `bar` (both WIDTH wide, any height) into `buf`
 /// (dw×dh) with integer nearest-neighbour scaling, centered, on a black
 /// background: the drawing of the window without the GPU.
 pub fn blit_scaled(buf: &mut [u32], dw: usize, dh: usize, screen: &[u32], bar: Option<&[u32]>) -> Placement {
-    let placement = layout(dw, dh, bar.is_some(), false);
+    let placement = layout(dw, dh, screen.len() / WIDTH, bar.is_some(), None);
     let scale = placement.screen.sx as usize;
     let (x0, y0) = (placement.screen.x as usize, placement.screen.y as usize);
     let sw = WIDTH * scale;
@@ -201,6 +205,9 @@ pub struct CrtView {
     /// Frame blending (`C64::set_blend`), done by the GPU: the screen
     /// passed to `Display::draw` is then the last frame as the VIC drew it.
     pub blend: bool,
+    /// Number of the frame (`C64::frame_count`): its parity sets the phase
+    /// of the NTSC subcarrier, which alternates from frame to frame.
+    pub frame: u64,
 }
 
 /// Drawing surface of a window: the GPU (wgpu, needed for the CRT
@@ -306,8 +313,9 @@ impl MouseCapture {
     }
 
     /// Mouse button `button` pressed or released with the pointer at `at`
-    /// (image coordinates, see `Placement::to_image_signed`).
-    pub fn button(&mut self, button: MouseButton, pressed: bool, at: Option<(i32, i32)>, analog: Analog) -> Pointer {
+    /// (image coordinates, see `Placement::to_image_signed`, with a screen
+    /// of `rows` lines).
+    pub fn button(&mut self, button: MouseButton, pressed: bool, at: Option<(i32, i32)>, analog: Analog, rows: usize) -> Pointer {
         let which = match button {
             MouseButton::Left => Some((Button::Left, 1)),
             MouseButton::Right => Some((Button::Right, 2)),
@@ -329,7 +337,7 @@ impl MouseCapture {
             return Pointer::Nothing;
         }
         let Some((x, y)) = at else { return Pointer::Nothing };
-        let on_screen = (0..WIDTH as i32).contains(&x) && (0..HEIGHT as i32).contains(&y);
+        let on_screen = (0..WIDTH as i32).contains(&x) && (0..rows as i32).contains(&y);
         if on_screen && analog.mouse {
             return if b == Button::Left { Pointer::Capture } else { Pointer::Nothing };
         }
@@ -337,18 +345,18 @@ impl MouseCapture {
             self.held |= bit;
             return Pointer::Button(b, true);
         }
-        let in_bar = (0..WIDTH as i32).contains(&x) && (HEIGHT as i32..(HEIGHT + super::status::BAR_HEIGHT) as i32).contains(&y);
+        let in_bar = (0..WIDTH as i32).contains(&x) && (rows as i32..(rows + super::status::BAR_HEIGHT) as i32).contains(&y);
         if in_bar && b == Button::Left {
-            return Pointer::Bar(x as usize, y as usize - HEIGHT);
+            return Pointer::Bar(x as usize, y as usize - rows);
         }
         Pointer::Nothing
     }
 
     /// Pointer moved to `at`: the position for the paddles, when they are
     /// driven by the pointer (not captured) and it is not over the bar.
-    pub fn paddles_at(&self, at: Option<(i32, i32)>, analog: Analog) -> Option<(i32, i32)> {
+    pub fn paddles_at(&self, at: Option<(i32, i32)>, analog: Analog, rows: usize) -> Option<(i32, i32)> {
         let (x, y) = at?;
-        (analog.paddles && !self.captured && y < HEIGHT as i32).then_some((x, y))
+        (analog.paddles && !self.captured && y < rows as i32).then_some((x, y))
     }
 
     /// Hides and locks the cursor; false if the system does not allow it.

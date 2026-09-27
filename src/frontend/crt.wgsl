@@ -2,12 +2,14 @@
 // Copyright (C) 2026 SampoSoft - Francesco Sampoli
 
 // Window drawing and CRT monitor emulation (model and constants in
-// src/crt.rs). The constants W, H, NS, LUMA_TAPS, LUMA_FIRST, FIR_HALF,
-// SEP_HALF, ODD_BASE, the offsets U_* into the parameters and the gammas
-// are prepended by frontend::gpu.
+// src/crt.rs). The constants W, H, NS, PH, LUMA_TAPS, LUMA_FIRST, FIR_HALF,
+// SEP_HALF, FIRST_LINE, LINES, PAL, the offsets U_* into the parameters and
+// the gammas are prepended by frontend::gpu, for the machine's standard.
+// Signal passes run on NS samples per line (PH every 4 pixels: 9 PAL, 7
+// NTSC).
 //
-// Passes of the CRT emulation, all at signal resolution (NS samples, 9
-// every 4 pixels, by H lines) except the last:
+// Passes of the CRT emulation, all at signal resolution (NS samples by H
+// lines) except the last:
 //   vic      palette indices → VIC-II output: luma, chroma U/V, modulated chroma
 //   cable    composite and RF: the C64's composite signal (modulator luma network)
 //   separate input stage of the set: IF filter (RF), luma trap, peaking,
@@ -22,6 +24,7 @@
 //   8 triad pitch (window pixels), slot pitch (window pixels), stripe, bridge
 //  12 beam sigma dark, bright (lines), glow sigma (samples), glow sigma (lines)
 //  16 light white may lose to the mask, white point R, G, B
+//  20 parity of the frame (NTSC: the subcarrier phase alternates)
 //  then the tables at U_PAL_Y, U_PAL_UV, U_LUMA, U_CHROMA, U_LUMA_LPF (FIR_HALF
 //  taps each side) and U_MOD, U_LUMA_IN, U_CHROMA_IN (SEP_HALF taps each side)
 @group(0) @binding(0) var<uniform> P: array<vec4<f32>, NV>;
@@ -75,25 +78,35 @@ fn color_at(x: i32, y: i32) -> u32 {
     return textureLoad(index_tex, vec2<i32>(clamp(x, 0, W - 1), y), 0).r;
 }
 
-// Odd raster line (framebuffer line 0 is raster line ODD_BASE mod 2)
+// Odd raster line: framebuffer line y is raster line y + FIRST_LINE (NTSC:
+// the last lines are lines 0-11 of the next frame)
 fn is_odd(y: i32) -> bool {
-    return ((y + ODD_BASE) & 1) == 1;
+    return (((y + FIRST_LINE) % LINES) & 1) == 1;
 }
 
-// sin and cos of the subcarrier at sample n: 4 samples per cycle, and
-// 283.5 cycles per line flip the phase on odd lines
+// sin and cos of the subcarrier at sample n: 4 samples per cycle, and a
+// line of 283.5 (PAL) or 227.5 (NTSC) cycles flips the phase from line to
+// line. Counting the lines from the start of the frame, an odd number of
+// lines per frame (NTSC, 263) makes the phase alternate between frames too
 fn carrier(n: i32, y: i32) -> vec2<f32> {
-    let t = 0.5 * PI * (f32(n) + 0.5) + select(0.0, PI, is_odd(y));
+    let lines = i32(pf(20u)) * LINES + y + FIRST_LINE;
+    let t = 0.5 * PI * (f32(n) + 0.5) + select(0.0, PI, (lines & 1) == 1);
     return vec2<f32>(sin(t), cos(t));
+}
+
+// V switch of PAL (inverted on odd lines); none in NTSC
+fn v_switch(y: i32) -> f32 {
+    return select(1.0, -1.0, PAL && is_odd(y));
 }
 
 @fragment
 fn vic(v: VOut) -> @location(0) vec4<f32> {
     let n = i32(v.pos.x);
     let y = i32(v.pos.y);
-    // Pixel of the sample and phase of the sample in it (9 every 4 pixels)
-    let p = (4 * n + 2) / 9;
-    let phase = n % 9;
+    // Pixel of the sample, floor((n + 0.5) × 4 / PH), and phase of the
+    // sample in it (PH samples every 4 pixels)
+    let p = (8 * n + 4) / (2 * PH);
+    let phase = n % PH;
     var luma = 0.0;
     for (var j = 0; j < LUMA_TAPS; j++) {
         let c = color_at(p + LUMA_FIRST + j, y);
@@ -104,8 +117,7 @@ fn vic(v: VOut) -> @location(0) vec4<f32> {
     let uv = select(pal.xy, pal.zw, odd);
     // Modulated chroma: U sin + V cos, V inverted on odd lines (PAL)
     let sc = carrier(n, y);
-    let sw = select(1.0, -1.0, odd);
-    return vec4<f32>(luma, uv, uv.x * sc.x + sw * uv.y * sc.y);
+    return vec4<f32>(luma, uv, uv.x * sc.x + v_switch(y) * uv.y * sc.y);
 }
 
 // The C64's composite signal: the luma through the network of the RF
@@ -163,7 +175,7 @@ fn decode(n: i32, y: i32) -> vec3<f32> {
             yuv.y += h * 2.0 * c * carrier(n - k, y).x;
             yuv.z += h * 2.0 * c * carrier(n - k, y).y;
         }
-        yuv.z *= select(1.0, -1.0, is_odd(y));
+        yuv.z *= v_switch(y);
     } else {
         for (var k = -FIR_HALF; k <= FIR_HALF; k++) {
             yuv.y += pf(U_CHROMA + u32(k + FIR_HALF)) * sig(n - k, y).y;
@@ -178,8 +190,12 @@ fn decode_fs(v: VOut) -> @location(0) vec4<f32> {
     let n = i32(v.pos.x);
     let y = i32(v.pos.y);
     let a = decode(n, y);
-    // Delay line: the chroma averaged with the previous line
-    let b = decode(n, max(y - 1, 0));
+    // PAL delay line: the chroma averaged with the previous line (NTSC has
+    // none)
+    var b = a;
+    if (PAL) {
+        b = decode(n, max(y - 1, 0));
+    }
     let luma = a.x * CONTRAST;
     let u = (a.y + b.y) * 0.5 * CONTRAST;
     let w = (a.z + b.z) * 0.5 * CONTRAST;
