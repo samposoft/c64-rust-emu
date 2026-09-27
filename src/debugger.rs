@@ -690,6 +690,26 @@ impl Debugger {
         Self::sid_chip(&c64.bus.sid, c64.standard().clock_hz())
     }
 
+    /// Ethernet cartridge and virtual network, or how to attach them.
+    pub fn eth(c64: &C64) -> String {
+        let Some(e) = c64.bus.eth.as_ref() else {
+            return "  Ethernet: none ('eth rrnet' to attach an RR-Net)\n".into();
+        };
+        let c = &e.chip;
+        let mac = c.mac().iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+        let (tx, rx) = c.enabled();
+        let on = |b: bool| if b { "on" } else { "off" };
+        let mut s = format!(
+            "  Ethernet: {} at ${:04X} (CS8900A), MAC {mac}, transmitter {}, receiver {}, RxCTL ${:04X}\n  Frames: {} sent, {} received, {} filtered, {} dropped, {} waiting\n",
+            e.mode.name(), e.base, on(tx), on(rx), c.rx_control(),
+            c.stats.sent, c.stats.received, c.stats.filtered, c.stats.dropped, c.rx_queue.len(),
+        );
+        if let Some(net) = c64.network() {
+            s += &net.describe();
+        }
+        s
+    }
+
     /// Second SID: address and state, or how to attach one.
     pub fn sid2(c64: &C64) -> String {
         match &c64.bus.sid2 {
@@ -795,6 +815,8 @@ impl Debugger {
   audio file.wav [Hz] | audio off   record the SID output from the next frames (default 44100 Hz; stereo with the second SID)
   audio raw file     capture the first SID's filter output every cycle, 16-bit LE (like VICE's -residrawoutput)
   reu [KB|off]       REU registers; KB (128..16384) attaches it, off removes it
+  eth [rrnet|tfe[@addr]|off]  Ethernet cartridge (CS8900A) and its virtual network: state; rrnet or tfe attaches it (at $DE00, or addr de00-dff0), off removes it
+  eth forward HOSTPORT C64PORT  forward TCP port HOSTPORT of the host (127.0.0.1) to port C64PORT of the C64
   drive [mem a [b]]  1541 drive: CPU, track, motor, VIA, serial bus; mem = its memory
   drive g64 file     save the disk in the drive as a G64 image
   tape [play|record|stop|ff|rew]   Datasette: state and buttons
@@ -1238,6 +1260,19 @@ impl Debugger {
                 }
             }
             "drive" => write!(out, "{}", Self::drive(c64, &args)?).map_err(io)?,
+            "eth" => {
+                match &args[..] {
+                    [] => {}
+                    ["off"] => c64.set_ethernet(None)?,
+                    ["forward", host, c64_port] => {
+                        let port = |p: &str| p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("usage: eth forward HOSTPORT C64PORT");
+                        c64.forward_port(port(host)?, port(c64_port)?)?;
+                    }
+                    [dev] => c64.set_ethernet(Some(crate::net::parse_ethernet(dev)?))?,
+                    _ => return Err("usage: eth [rrnet|tfe[@addr]|off] | eth forward HOSTPORT C64PORT".into()),
+                }
+                write!(out, "{}", Self::eth(c64)).map_err(io)?;
+            }
             "reu" => {
                 match args.first().copied() {
                     None => {}

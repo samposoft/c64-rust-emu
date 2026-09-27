@@ -16,7 +16,8 @@ printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.t64/.d64/.g64...]` (with
 several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--vic CHIP` (the VIC-II and its standard: 6569, 6569r1, 8565, 6567, 6567r56a, 8562, 6572; see README.md), `--c64c` (8565 or 8562, 8580, 6526A), `--cia 6526|6526a`, `--roms DIR`, `-x script`, `-e "cmd; cmd"`
 (repeatable), `--no-stdin`, `--window`, `--audio`, `--reu KB` (REU from 128 to
-16384 KB), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
+16384 KB), `--eth rrnet|tfe[@ADDR]` (Ethernet cartridge on the virtual network, see
+README.md), `--eth-forward HOST:C64` (a host TCP port forwarded to the C64), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
 `--sid 6581|8580|8580d` (SID model, default 6581; `8580d` is the 8580 with
 digiboost), `--sid2 ADDR` (second SID, e.g. `d420` or `de00`), `--tape-sound` (tape sound),
 `--tape-azimuth CYCLES` (Datasette azimuth error), `--port1 DEV`/`--port2 DEV`
@@ -96,7 +97,9 @@ decimal.
 | `drive g64 file` | saves the disk in the drive as a G64 image |
 | `drive trace on file`, `drive trace off` | logs every drive instruction (`.8:pc`, registers, drive cycle) |
 | `reu [KB\|off]` | REU registers; with a size it attaches it (RAM as at power-on), `off` removes it |
-| `savestate file`, `loadstate file`, `reset` | complete state (CPU at the microcycle, RAM, VIC, SID, CIA, cartridge, mounted disk, screen), about 1.2 MB; the ROMs stay the ones loaded |
+| `eth [rrnet\|tfe[@addr]\|off]` | Ethernet cartridge (CS8900A): mapping, MAC address set by the program, transmitter and receiver, frame counters, and the virtual network (the C64's address, TCP connections with their host socket and bytes carried, UDP ports, pings, DNS and DHCP counters); `rrnet` or `tfe` attaches it (at `$DE00` or `addr`), `off` removes it |
+| `eth forward HOSTPORT C64PORT` | forwards TCP port HOSTPORT of the host (127.0.0.1 only) to port C64PORT of the C64, for a server running on it |
+| `savestate file`, `loadstate file`, `reset` | complete state (CPU at the microcycle, RAM, VIC, SID, CIA, cartridge, mounted disk, screen), about 1.2 MB; the ROMs stay the ones loaded, and the network connections of the C64 are closed (the Ethernet chip is in the state, the host's sockets are not) |
 | `trace on [file] [from to]`, `trace off` | logs every instruction (register line) with PC in the range; without a file it writes to stdout |
 | `audio file.wav [Hz]`, `audio off` | records the output of the SIDs (and the tape sound, if on) from the next frames (default 44100 Hz, or the rate of the audio already on; stereo with the second SID); `off` saves the file |
 | `audio raw file` | captures the first SID's filter output every cycle, before the C64 output stage and resampling: 16-bit little endian, like VICE's `-residrawoutput`; saved by `audio off` |

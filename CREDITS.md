@@ -30,6 +30,7 @@ are compared with it cycle by cycle by regression tests.
 | `src/mem/power_on.rs` (RAM pattern and color RAM at power-on) | `src/ram.c`, `src/vicii-colorram.h` (color RAM measured by William McCabe) | Andreas Matthies, Marco van den Heuvel |
 | `src/drive/mod.rs` (1541 disk rotation and read/write circuit) | `src/drive/rotation.c` | Andreas Boose, Istvan Fabian, Benjamin 'BeRo' Rosseaux, Peter Rittwage |
 | `src/sid/mod.rs` (`audio_mix`, mono mix of two SIDs) | `src/sound.c` (`sound_audio_mix`) | Teemu Rantanen, Marco van den Heuvel, Ettore Perazzoli |
+| `src/net/cs8900.rs` (CS8900A Ethernet controller: PacketPage, transmit and receive, address filter) | `src/core/cs8900.c` | Spiro Trikaliotis, Christian Vogelgsang |
 
 ### Behaviour modelled on VICE
 
@@ -47,6 +48,7 @@ their comments and checked against VICE by the tests:
 | `src/ctrlport.rs` (1351 mouse reading and movement limit, POT port selection) | `src/joyport/mouse_1351.c`, `src/joyport/mouse.c`, `src/joyport/joyport.c` | Marco van den Heuvel, Andreas Boose, Hannu Nuotio |
 | `src/ctrlport.rs` (1351 joystick mode: direction pulses, right button on POTX) | `src/joyport/mouse_digital.c` | the VICE Team |
 | `src/reu.rs` (REU 1700/1764/1750) | `src/c64/cart/reu.c` | Wolfgang Moser, Jouko Valta, Richard Hable, Ettore Perazzoli |
+| `src/net/mod.rs` (Ethernet cartridge mapping: TFE, RR-Net with A3 inverted) | `src/c64/cart/ethernetcart.c`, `src/c64/cart/clockport-rrnet.c` | Marco van den Heuvel |
 | `src/cart/flash.rs` (Am29F040 and compatible flash) | `src/core/flash040core.c` | Hannu Nuotio, Marko Mäkelä |
 | `src/cart/eeprom.rs` (M93C86 EEPROM of GMod2) | `src/core/m93c86.c`, `src/c64/cart/gmod2.c` | Groepaz |
 | `src/cart/mod.rs` (cartridge types) | `src/c64/cart/*.c` (e.g. `easyflash.c`: ALeX Kazik, Marco van den Heuvel) | the VICE Team |

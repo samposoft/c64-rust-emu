@@ -46,6 +46,8 @@ enum Mapped {
     Sid(u8),
     /// Second SID.
     Sid2(u8),
+    /// Ethernet cartridge (the address).
+    Eth(u16),
     /// Cartridge: ROM and I/O areas, whose reads can switch bank or
     /// return the state of a flash chip.
     Roml(u16),
@@ -70,6 +72,9 @@ pub struct Bus {
 
     /// RAM Expansion Unit, if attached (registers in I/O2, $DF00).
     pub reu: Option<Reu>,
+    /// Ethernet cartridge (RR-Net, TFE), if attached: 16 bytes of I/O1 or
+    /// I/O2, which take precedence over the cartridge and the REU.
+    pub eth: Option<Box<crate::net::EthernetCart>>,
     /// 1541 drive on the serial bus, if emulated.
     pub drive: Option<Box<Drive>>,
     /// The REU DMA was started by the first write of a
@@ -131,6 +136,7 @@ impl Bus {
             color_ram: power_on::COLOR_RAM,
             cart: None,
             reu: None,
+            eth: None,
             drive: None,
             skip_write: false,
             cpu_port_dir: 0x2F,
@@ -288,6 +294,7 @@ impl Bus {
             Mapped::Sid(reg @ (0x19 | 0x1A)) => self.ctrl.read(reg, self.cycle),
             Mapped::Sid(reg) => self.sid.read_mut(reg),
             Mapped::Sid2(reg) => self.sid2.as_mut().map_or(open, |s| s.read_mut(reg)),
+            Mapped::Eth(addr) => self.eth.as_mut().map_or(open, |e| e.read(addr)),
             Mapped::Roml(off) => {
                 let now = self.cycle;
                 self.cart.as_mut().map_or(open, |c| c.read_roml(off, now))
@@ -318,6 +325,7 @@ impl Bus {
             Mapped::Sid(reg @ (0x19 | 0x1A)) => self.ctrl.peek(reg),
             Mapped::Sid(reg) => self.sid.read(reg),
             Mapped::Sid2(reg) => self.sid2.as_ref().map_or(open, |s| s.read(reg)),
+            Mapped::Eth(addr) => self.eth.as_ref().map_or(open, |e| e.peek(addr)),
             Mapped::Roml(off) => self.cart.as_ref().map_or(open, |c| c.peek_roml(off)),
             Mapped::Romh(off) => self.cart.as_ref().map_or(open, |c| c.peek_romh(off)),
             Mapped::Io1(off) => self.cart.as_ref().and_then(|c| c.peek_io1(off, open)).unwrap_or(open),
@@ -465,6 +473,7 @@ impl Bus {
                 if reg == 0 { self.cia2_port_a() } else { return Mapped::Cia2(reg) }
             }
             0xDE00..=0xDFFF if self.is_sid2(addr) => return Mapped::Sid2((addr & 0x1F) as u8),
+            0xDE00..=0xDFFF if self.is_eth(addr) => return Mapped::Eth(addr),
             // Cartridge I/O areas (open bus if it does not respond)
             0xDE00..=0xDEFF => return Mapped::Io1(addr as u8),
             0xDF00..=0xDFFF => return Mapped::Io2(addr as u8),
@@ -668,6 +677,11 @@ impl Bus {
                 }
             }
             0xDD00..=0xDDFF => self.cia2.write((addr & 0x0F) as u8, val),
+            0xDE00..=0xDFFF if self.is_eth(addr) => {
+                if let Some(eth) = self.eth.as_mut() {
+                    eth.write(addr, val);
+                }
+            }
             0xDE00..=0xDEFF => {
                 if let Some(cart) = self.cart.as_mut() {
                     cart.write_io1(addr as u8, val);
@@ -690,6 +704,12 @@ impl Bus {
     #[inline]
     fn is_sid2(&self, addr: u16) -> bool {
         self.sid2.is_some() && addr & 0xFFE0 == self.sid2_base
+    }
+
+    /// The address falls within the 16 bytes of the Ethernet cartridge.
+    #[inline]
+    fn is_eth(&self, addr: u16) -> bool {
+        self.eth.as_ref().is_some_and(|e| e.contains(addr))
     }
 
     /// Direct RAM read (used by the VIC, which bypasses CPU banking).
@@ -733,7 +753,7 @@ impl Bus {
 // ROMs are not part of the state: those of the machine it is reloaded on
 // are kept. Debugger watchpoints excluded.
 crate::snapshot::impl_state!(Bus {
-    ram, color_ram, cart, reu, drive, skip_write, cpu_port_dir, cpu_port_data,
+    ram, color_ram, cart, reu, eth, drive, skip_write, cpu_port_dir, cpu_port_data,
     cpu_port_out, port_charge, port_charge_until, vic, sid, sid2, sid2_base, tape, cia1, cia2,
     keyboard, joy1, joy2, ctrl, cpu_pc, cycle,
 } skip { kernal_rom, basic_rom, char_rom, dbg_watch, dbg_watch_hit });

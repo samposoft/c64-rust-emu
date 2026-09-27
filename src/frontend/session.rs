@@ -30,6 +30,10 @@ pub struct MachineOptions {
     pub roms_dir: Option<PathBuf>,
     /// REU to attach, in KB.
     pub reu: Option<u32>,
+    /// Ethernet cartridge and its base address (`--eth`).
+    pub eth: Option<(crate::net::EthMode, u16)>,
+    /// TCP port forwards to the C64: (host port, C64 port) (`--eth-forward`).
+    pub eth_forwards: Vec<(u16, u16)>,
     /// No 1541 drive: D64s are loaded through the KERNAL trap.
     pub no_drive: bool,
     /// SID model and digiboost (default 6581).
@@ -67,7 +71,7 @@ pub struct MachineOptions {
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.t64/.d64/.g64...]";
+        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--eth rrnet|tfe[@ADDR]] [--eth-forward HOST:C64] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.t64/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
@@ -84,6 +88,13 @@ impl MachineOptions {
   --roms DIR   directory of kernal.rom, basic.rom, chargen.rom and dos1541.rom (default:
                roms/ next to the executable or in a directory above it, else ./roms)
   --reu KB     attach a REU (128, 256, 512 ... 16384 KB)
+  --eth DEV    Ethernet cartridge with the CS8900A: rrnet (RR-Net) or tfe (The Final
+               Ethernet), at $DE00 or at DEV@ADDR (de00-dff0, in steps of 10). It is
+               plugged into a virtual network with a router at 10.0.2.2 (DHCP, DNS at
+               10.0.2.3), which turns the C64's connections into sockets of this
+               program: no privileges, any host connection; 10.0.2.2 is the host itself
+  --eth-forward HOST:C64  with --eth, forward TCP port HOST of this machine (127.0.0.1
+               only) to port C64 of the C64, for servers running on it; repeatable
   --no-drive   no 1541 drive: D64s are loaded through the KERNAL trap
   --sid M      SID model: 6581 (default), 8580, 8580d (8580 with digiboost)
   --sid2 ADDR  second SID (stereo) at ADDR: d420-d7e0 or de00-dfe0, in steps of 20
@@ -129,6 +140,21 @@ impl MachineOptions {
                 Some(kb) => self.reu = Some(kb),
                 None => { eprintln!("--reu needs the size in KB (128, 256, 512 ... 16384)"); std::process::exit(2); }
             },
+            "--eth" => match rest.next().map(|d| crate::net::parse_ethernet(&d)) {
+                Some(Ok(eth)) => self.eth = Some(eth),
+                Some(Err(e)) => { eprintln!("--eth: {e}"); std::process::exit(2); }
+                None => { eprintln!("--eth needs the cartridge: rrnet or tfe, optionally @ADDR"); std::process::exit(2); }
+            },
+            "--eth-forward" => {
+                let fwd = rest.next().and_then(|s| {
+                    let (h, c) = s.split_once(':')?;
+                    Some((h.parse::<u16>().ok().filter(|&p| p != 0)?, c.parse::<u16>().ok().filter(|&p| p != 0)?))
+                });
+                match fwd {
+                    Some(f) => self.eth_forwards.push(f),
+                    None => { eprintln!("--eth-forward needs HOSTPORT:C64PORT, e.g. 8064:80"); std::process::exit(2); }
+                }
+            }
             "--no-drive" => self.no_drive = true,
             "--c64c" => self.c64c = true,
             "--cia" => match rest.next().as_deref().and_then(crate::cia::Model::parse) {
@@ -224,9 +250,10 @@ impl MachineOptions {
         Ok(())
     }
 
-    /// Creates the C64 with ROMs, drive and REU and resets it; loading the
-    /// file is left to the caller. Missing ROMs and drive are only warnings,
-    /// the error is an invalid REU size.
+    /// Creates the C64 with ROMs, drive, REU and Ethernet cartridge and
+    /// resets it; loading the file is left to the caller. Missing ROMs and
+    /// drive are only warnings; the errors are an invalid REU size or a port
+    /// forward that cannot listen.
     pub fn build(&self) -> Result<C64, String> {
         let mut c64 = C64::new();
         c64.set_chip(self.vic_chip())?;
@@ -235,6 +262,13 @@ impl MachineOptions {
             eprintln!("WARN: {w}");
         }
         c64.set_reu(self.reu)?;
+        c64.set_ethernet(self.eth)?;
+        if !self.eth_forwards.is_empty() && self.eth.is_none() {
+            return Err("--eth-forward needs the Ethernet cartridge (--eth rrnet)".into());
+        }
+        for &(host, port) in &self.eth_forwards {
+            c64.forward_port(host, port)?;
+        }
         let c64c_sid = self.c64c.then_some((Model::Mos8580, false));
         if let Some((model, digiboost)) = self.sid.or(c64c_sid) {
             c64.set_sid_model(model, digiboost);

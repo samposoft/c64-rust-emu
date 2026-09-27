@@ -13,6 +13,7 @@ pub mod disk;
 pub mod drive;
 pub mod cart;
 pub mod reu;
+pub mod net;
 pub mod c64;
 pub mod disasm;
 pub mod png;

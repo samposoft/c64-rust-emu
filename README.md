@@ -2,7 +2,8 @@
 
 Commodore 64 emulator in Rust: PAL or NTSC machine, 6510 CPU with illegal
 opcodes, cycle-exact VIC-II, SID, CIA, 1541 drive, Datasette, REU,
-keyboard, joystick, paddles, 1351 mouse, PRG/D64/G64/TAP/T64/CRT.
+keyboard, joystick, paddles, 1351 mouse, Ethernet (RR-Net, TFE) on a
+built-in virtual network, PRG/D64/G64/TAP/T64/CRT.
 The frontend uses only pure Rust crates (`winit`, `wgpu`, `softbuffer`,
 `cpal`, `gilrs`): no external libraries to install, a single executable on
 macOS, Linux and Windows. The window is drawn on the GPU, which also
@@ -23,6 +24,8 @@ cargo build --release
 ./target/release/c64dbg prg/game.d64                       # headless debugger, see DEBUGGER.md
 ./target/release/c64dbg --window prg/game.d64              # debugger with a window
 ./target/release/c64 --reu 512 prg/game.d64                # with a 512 KB REU 1750
+./target/release/c64 --eth rrnet prg/contiki.d64           # RR-Net Ethernet on the virtual network (DHCP, DNS, NAT)
+./target/release/c64 --eth rrnet --eth-forward 8064:80 prg/webserver.prg  # 127.0.0.1:8064 reaches the C64's port 80
 ./target/release/c64 --sid 8580 prg/game.d64               # SID 8580 instead of 6581
 ./target/release/c64 --sid2 d420 prg/music.prg             # second SID at $D420 (stereo)
 ./target/release/c64 --port1 mouse prg/program.prg         # 1351 mouse in control port 1
@@ -607,7 +610,8 @@ with port B selecting and port A reading, joysticks through the keys),
 complete CIA 6526 and 6526A (timers
 with start and load latencies, cascading, ICR with its delays, TOD with
 alarm, serial port output), SID 6581 and 8580 ported from reSID as VICE
-uses it (see below), 1541 drive (see below), cartridges, REU, PRG, full save
+uses it (see below), 1541 drive (see below), cartridges, REU, Ethernet
+(see below), PRG, full save
 state (restored mid-frame it continues identically).
 
 Memory at power-on as in VICE: the dynamic RAM does not start empty, every
@@ -699,6 +703,61 @@ cycle by cycle as in VICE: one byte per cycle (two in a swap), waiting while
 the VIC takes the bus for bad lines and sprites, with accesses that go
 through I/O (transfers into the VIC or SID registers). The REU contents are
 not saved to a file between sessions (they are kept in the save state).
+
+### Ethernet: `--eth`
+
+`--eth rrnet` (in `c64`, `c64term` and `c64dbg`, or the debugger's `eth`
+command) plugs in an Ethernet cartridge with the Cirrus Logic CS8900A, the
+chip of the RR-Net and of The Final Ethernet (`--eth tfe`), at `$DE00` or at
+another 16-byte slot of I/O1 and I/O2 (`--eth tfe@de10`). The chip is ported
+from VICE: the PacketPage with its registers and reserved areas, transmit
+command, length and the Rdy4TxNOW handshake, the receive buffer read as the
+real chip gives it (RxStatus and RxLength high byte first), the address
+filter (individual address, broadcast, multicast hash, promiscuous) and the
+RR-Net's mapping, with address line A3 inverted and the first two bytes left
+to the Retro Replay. Programs for the RR-Net (ip65, Contiki and the ones
+built on them) find it where they expect it.
+
+The cartridge is not bridged to the host's LAN, which on macOS would need
+root privileges and, over Wi-Fi, a cloned MAC address: it is plugged into a
+virtual network inside the emulator, in the manner of QEMU's user-mode
+networking. A router at `10.0.2.2` hands out `10.0.2.15` by DHCP, with
+itself as the gateway and `10.0.2.3` as the DNS server, and turns the C64's
+connections into ordinary sockets of the emulator: they reach any host the
+computer can reach, through Wi-Fi, cable or VPN, with no privileges.
+
+- **TCP**: every connection is ended at the router and continued by the
+  host. The C64 gets its SYN-ACK only once the host has connected (an RST if
+  the connection is refused), as from a real server; data, windows,
+  retransmissions and closing on the C64's side run in emulated time, so
+  pausing the machine in the debugger or running it in warp does not break
+  its connections: the remote server only sees a slow client.
+- **UDP**: one host socket for each port of the C64; the answers come back
+  to it.
+- **DNS**: queries for names (A records) to `10.0.2.3`, resolved by the
+  host (its hosts file included).
+- **ICMP**: the router answers pings to its addresses; pings to other hosts
+  go out through the host's unprivileged ICMP sockets (macOS, and Linux
+  within `net.ipv4.ping_group_range`).
+- **ARP**: the router answers for any address but the C64's own, so a C64
+  configured by hand, even on another subnet, works too.
+- `10.0.2.2` is the host itself: a connection to `10.0.2.2:80` reaches
+  `127.0.0.1:80` on the computer, for servers that run there.
+- **Servers on the C64**: `--eth-forward 8064:80` (repeatable, or `eth
+  forward 8064 80` in the debugger) forwards port 8064 of the host, on
+  127.0.0.1 only, to port 80 of the C64. As a real host, the router asks
+  for the C64's address (ARP) before it connects: ip65 learns the router's
+  address from that request, and would otherwise drop the first SYN.
+
+Checked with the ip65 programs (release 2025-01-19): DATE65 (DHCP, DNS,
+NTP over UDP), TELNET65 (a TCP connection to a server on the host) and
+HFS65, the web server on the C64, whose files come out through a port
+forward identical to the ones on the disk.
+
+The chip is part of the save state; the connections are not: loading a
+state, or a reset, closes them, as unplugging the cable would. The debugger's
+`eth` command shows the chip, the frame counters and every connection with
+its host socket and the bytes carried.
 
 ### 1541 drive
 
@@ -817,6 +876,11 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
   joystick, paddles and 1351 mouse in both modes only (no light pen, Neos
   mouse, Koalapad), and the mouse is not available in `c64term`.
 - Freezer and utility cartridges (see above).
+- Ethernet: only the CS8900A cartridges (no ETH64 with the LAN91C96, no
+  RR-Net MK3 flash ROM, no network of the Ultimate 64 and 1541 Ultimate);
+  the virtual network carries IPv4 TCP, UDP and ping, no IPv6, and the C64
+  is not visible on the host's LAN (no bridging): incoming connections only
+  through `--eth-forward`.
 - Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
   expansions; NIB/P64 images not supported.
 - VIC-II: no light pen (the registers read 0).

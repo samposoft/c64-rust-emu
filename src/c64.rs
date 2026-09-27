@@ -51,6 +51,9 @@ pub struct C64 {
     hdr: bool,
     /// CRT monitor emulation of the window frontends (`set_crt`).
     crt: Option<crate::crt::Crt>,
+    /// Virtual network behind the Ethernet cartridge (`set_ethernet`): host
+    /// sockets, not machine state.
+    net: Option<Box<crate::net::Nat>>,
 
     // Direct PRG (no disk)
     pending_prg: Option<Vec<u8>>,
@@ -114,6 +117,7 @@ impl C64 {
             blend: None,
             hdr: false,
             crt: None,
+            net: None,
             pending_prg: None,
             prg_kind: PrgKind::Basic,
             injected: false,
@@ -295,6 +299,14 @@ impl C64 {
         }
         if let Some(reu) = &mut self.bus.reu {
             reu.reset();
+        }
+        // The Ethernet chip resets with the machine; the connections the
+        // program had open are gone
+        if let Some(eth) = &mut self.bus.eth {
+            eth.reset();
+        }
+        if let Some(net) = &mut self.net {
+            net.reset();
         }
         if let Some(drive) = &mut self.bus.drive {
             drive.reset();
@@ -861,6 +873,12 @@ impl C64 {
         fresh.bus.char_rom = self.bus.char_rom;
         fresh.bus.dbg_watch = std::mem::take(&mut self.bus.dbg_watch);
         fresh.dbg = std::mem::take(&mut self.dbg);
+        // The network stays the host's; the connections of the C64 that
+        // was running are gone, and a state with the cartridge gets one
+        fresh.net = self.net.take().or_else(|| fresh.bus.eth.is_some().then(Box::default));
+        if let Some(net) = &mut fresh.net {
+            net.reset();
+        }
         // Audio belongs to the frontend: it stays as it was, also for the
         // second SID of the state
         fresh.apply_clocks()?;
@@ -977,6 +995,47 @@ impl C64 {
         }
     }
 
+    /// Plugs in an Ethernet cartridge (`mode`, at `base`) connected to the
+    /// virtual network, or removes it with `None`. The port forwards of a
+    /// network already there are kept.
+    pub fn set_ethernet(&mut self, eth: Option<(crate::net::EthMode, u16)>) -> Result<(), String> {
+        match eth {
+            Some((_, base)) if !crate::net::valid_base(base) => {
+                Err(format!("invalid Ethernet cartridge address ${base:04X} ($DE00-$DFF0, in steps of $10)"))
+            }
+            Some((mode, base)) => {
+                self.bus.eth = Some(Box::new(crate::net::EthernetCart::new(mode, base)));
+                let net = self.net.get_or_insert_with(Box::default);
+                net.reset();
+                Ok(())
+            }
+            None => {
+                self.bus.eth = None;
+                self.net = None;
+                Ok(())
+            }
+        }
+    }
+
+    /// Forwards TCP port `host_port` of the host (127.0.0.1) to port
+    /// `c64_port` of the C64. Needs the Ethernet cartridge.
+    pub fn forward_port(&mut self, host_port: u16, c64_port: u16) -> Result<(), String> {
+        match self.net.as_mut() {
+            Some(net) => net.forward(host_port, c64_port),
+            None => Err("no Ethernet cartridge: attach one first".into()),
+        }
+    }
+
+    /// The virtual network, if the Ethernet cartridge is attached.
+    pub fn network(&self) -> Option<&crate::net::Nat> {
+        self.net.as_deref()
+    }
+
+    /// Emulated time in microseconds, for the virtual network.
+    fn micros(&self) -> u64 {
+        (self.cpu.total_cycles as u128 * 1_000_000 / self.standard().clock_hz() as u128) as u64
+    }
+
     /// Executes a single CPU instruction and advances VIC, CIA and IRQ logic
     /// by the corresponding cycles. When the frame cycle budget is exceeded
     /// it runs the end-of-frame housekeeping (PRG injection, D64 autoload, audio).
@@ -1041,6 +1100,14 @@ impl C64 {
 
     /// End-of-frame housekeeping: PRG injection, D64 autoload, audio samples.
     fn end_of_frame(&mut self) {
+        // Virtual network: the frames the C64 sent, the answers for it
+        if self.net.is_some() && self.bus.eth.is_some() {
+            let now = self.micros();
+            if let (Some(net), Some(eth)) = (self.net.as_mut(), self.bus.eth.as_mut()) {
+                net.exchange(&mut eth.chip, now);
+            }
+        }
+
         // PRG injection after KERNAL boot
         if !self.injected && self.pending_prg.is_some() {
             match self.inject_countdown {
@@ -1355,7 +1422,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 23;
+const STATE_VERSION: u32 = 24;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
@@ -1387,10 +1454,11 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
 }
 
 // Excluded: the audio buffer (rewritten every frame), the debugger hooks,
-// frame blending and the CRT emulation (display settings).
+// frame blending and the CRT emulation (display settings), the virtual
+// network (host sockets).
 impl_state!(C64 {
     chip, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
     disk, disk_path, disk_autoload, tape_path, t64, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
     autoload_run, autoload_sys,
     frame_elapsed, frame_count,
-} skip { audio_buf, audio_buf2, dbg, blend, hdr, crt });
+} skip { audio_buf, audio_buf2, dbg, blend, hdr, crt, net });
