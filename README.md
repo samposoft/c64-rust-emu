@@ -319,9 +319,30 @@ Datasette follow the clock; TAP pulses are played as they are, as VICE does,
 and new tapes are marked with the standard. Programs written for PAL run as
 on a real NTSC or Drean C64: those that count on 63 cycles per line (demos,
 many European games) break their raster effects, and on NTSC those timed by
-frames run 20% faster. `--vic` changes only the VIC-II: a whole C64C also
-has the 8580 SID (`--sid 8580`) and newer CIAs (not emulated), and VICE's
-old NTSC machine also has the first KERNAL (`--roms` with it).
+frames run 20% faster. `--vic` changes only the VIC-II; `--c64c` makes the
+whole C64C (VICE's `-model c64c`): the HMOS VIC-II of the standard (8565, or
+8562 with `--ntsc`), the 8580 SID and the 6526A CIAs, each unless chosen
+otherwise with `--vic`, `--sid` or `--cia`. VICE's old NTSC machine also has
+the first KERNAL (`--roms` with it).
+
+### CIA: `--cia`
+
+The C64C has the 6526A CIAs (later called 8521), made in HMOS as its VIC-II
+and SID; `--cia 6526a` (debugger `cia 6526a`) puts them in any machine,
+`--cia 6526` (the default) brings back the NMOS 6526 of the first C64s. They
+differ in the interrupt register (ICR), as in VICE's `ciacore.c`: on the
+6526A an enabled timer interrupt raises the IRQ (or the NMI of CIA2) in the
+cycle its flag is set, one cycle before the 6526, and so does the mask
+enabled on a flag already set; reading the ICR clears the flags a cycle
+later instead of at once (a flag set meanwhile stays), and bit 7 already
+shows an interrupt raised in the same cycle; the 6526's "timer B bug" (an
+underflow right after an ICR read loses its flag) is not there. Ordinary
+programs do not notice; code timed to the cycle with the timer interrupts
+does (stable raster routines, demos that have a "new CIA" version, test
+suites). Checked against VICE `-ciamodel 1` (and `-model c64c` with
+`--c64c`): the boot matches instruction by instruction, and the CIA test programs give the same bytes;
+one of them measures the cycle each timer IRQ enters its handler from eight
+phases, two cycles earlier on the 6526A in half of them.
 
 It is checked against VICE (`x64sc -model ntsc`, `-model drean`,
 `-VICIImodel`): for every chip the boot matches it instruction by
@@ -583,7 +604,7 @@ line 0 with the interrupt mask cleared), processor port as in VICE (input
 bits keep the last value driven, bits 6-7 their charge for about 350000
 cycles), keyboard matrix solved as in VICE (ghost keys, backwards scanning
 with port B selecting and port A reading, joysticks through the keys),
-complete CIA 6526 (timers
+complete CIA 6526 and 6526A (timers
 with start and load latencies, cascading, ICR with its delays, TOD with
 alarm, serial port output), SID 6581 and 8580 ported from reSID as VICE
 uses it (see below), 1541 drive (see below), cartridges, REU, PRG, full save
@@ -767,7 +788,7 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 - Freezer and utility cartridges (see above).
 - Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
   expansions; NIB/P64 images not supported.
-- VIC-II: no light pen (the registers read 0) and no C64C CIAs (6526A).
+- VIC-II: no light pen (the registers read 0).
 - Monitor and TV: no 1701/1702 PAL (their PAL schematics are not
   available) and no 1802 (its manual gives neither tube nor pitch); the
   peaking of the PAL 1084S and of the 1901's video output stage is not

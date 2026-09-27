@@ -1111,6 +1111,16 @@ impl C64 {
     }
 
     /// SID model (the same for both, as in VICE).
+    /// Model of both CIAs: the 6526 (default) or the 6526A of the C64C.
+    pub fn set_cia_model(&mut self, model: crate::cia::Model) {
+        self.bus.cia1.model = model;
+        self.bus.cia2.model = model;
+    }
+
+    pub fn cia_model(&self) -> crate::cia::Model {
+        self.bus.cia1.model
+    }
+
     pub fn set_sid_model(&mut self, model: crate::sid::Model, digiboost: bool) {
         self.bus.sid.set_model(model, digiboost);
         if let Some(sid2) = &mut self.bus.sid2 {
@@ -1250,7 +1260,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 20;
+const STATE_VERSION: u32 = 21;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });

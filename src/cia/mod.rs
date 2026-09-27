@@ -155,6 +155,7 @@ const IRQ_RAISE1: u16 = 0x0100;
 const IRQ_RAISE0: u16 = 0x0200;
 const IRQ_RAISE_1: u16 = 0x0400;
 const IRQ_READ0: u16 = 0x1000;
+const IRQ_READ1: u16 = 0x2000;
 const IRQ_READ2: u16 = 0x4000;
 const IRQ_CLEAR: u16 = IRQ_ACK_2 | IRQ_D7SET_1 | IRQ_RAISE_1 | IRQ_READ2;
 
@@ -164,7 +165,40 @@ const IM_SET: u16 = 0x80;
 /// flag is lost on the next read (6526 bug).
 const IM_TBB: u16 = 0x100;
 
+/// CIA model (VICE's `CIA_MODEL_6526` and `CIA_MODEL_6526A`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Model {
+    /// The NMOS 6526 of the first C64s.
+    #[default]
+    Mos6526,
+    /// The HMOS 6526A (8521) of the C64C: an interrupt raises the line in
+    /// the cycle its flag is set, one cycle before the 6526; an ICR read
+    /// clears the flags one cycle later; no timer B bug.
+    Mos6526A,
+}
+
+impl Model {
+    pub fn parse(s: &str) -> Option<Model> {
+        match s.to_ascii_lowercase().as_str() {
+            "6526" | "old" => Some(Model::Mos6526),
+            "6526a" | "8521" | "new" => Some(Model::Mos6526A),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Model::Mos6526 => "6526",
+            Model::Mos6526A => "6526A",
+        }
+    }
+}
+
+crate::snapshot::impl_state_enum!(Model { Mos6526, Mos6526A });
+
 pub struct CiaState {
+    /// Chip model (`set_model`), kept by reset.
+    pub model: Model,
     /// "Raw" registers: ports, DDR, CRA/CRB as written (bit 4 at 0; bit 0
     /// does not follow the one-shot stop, which is read from the timer).
     pub regs: [u8; 16],
@@ -180,6 +214,8 @@ pub struct CiaState {
     pub icr_mask: u8,
     /// Flags set in this cycle, not yet passed to the delay line.
     new_flags: u16,
+    /// Flags an ICR read clears a cycle later (6526A).
+    ack_flags: u16,
     ifr_delay: u16,
     /// IRQ (CIA1) or NMI (CIA2) line towards the CPU.
     irq_line: bool,
@@ -218,6 +254,7 @@ fn bcd_inc(v: u8) -> u8 {
 impl CiaState {
     pub fn new() -> Self {
         Self {
+            model: Model::Mos6526,
             regs: [0u8; 16],
             ta: Timer::new(),
             tb: Timer::new(),
@@ -226,6 +263,7 @@ impl CiaState {
             icr_flags: 0,
             icr_mask: 0,
             new_flags: 0,
+            ack_flags: 0,
             ifr_delay: 0,
             irq_line: false,
             clock: 0,
@@ -255,9 +293,10 @@ impl CiaState {
     }
 
     pub fn reset(&mut self) {
-        let (clock, tod_tick_cycles) = (self.clock, self.tod_tick_cycles);
+        let (clock, tod_tick_cycles, model) = (self.clock, self.tod_tick_cycles, self.model);
         *self = Self::new();
         self.clock = clock;
+        self.model = model;
         // The mains at the TOD pin is part of the board, not of the chip
         self.tod_tick_cycles = tod_tick_cycles;
         self.tod_stopped = true;
@@ -337,17 +376,32 @@ impl CiaState {
         }
     }
 
-    /// ICR read: returns flags and bit 7, clears the flags immediately (bit 7
-    /// two cycles later) and releases the IRQ line.
+    /// ICR read: returns flags and bit 7 and releases the IRQ line. The
+    /// 6526 clears the flags at once and bit 7 two cycles later; the 6526A
+    /// clears flags and bit 7 on the next cycle (those set meanwhile stay),
+    /// and returns bit 7 also for an interrupt raised in this cycle.
     fn read_icr(&mut self) -> u8 {
         if self.icr_flags & IM_TBB != 0 {
             self.icr_flags &= !(IM_TBB | 0x02);
         }
-        self.ifr_delay |= IRQ_ACK1;
-        self.ifr_delay &= !IRQ_RAISE0;
-        let result = self.icr_flags as u8;
-        self.icr_flags &= IM_SET;
-        self.new_flags = 0;
+        let result;
+        if self.model == Model::Mos6526A {
+            if self.ifr_delay & IRQ_RAISE0 != 0 && self.icr_flags & 0x1F != 0 {
+                self.icr_flags |= IM_SET;
+            }
+            if self.icr_flags & 0x9F != 0 {
+                self.ack_flags |= (self.icr_flags & 0x9F) | IM_SET;
+            }
+            self.ifr_delay |= IRQ_ACK1;
+            self.ifr_delay &= !(IRQ_RAISE0 | IRQ_D7SET0);
+            result = self.icr_flags as u8;
+        } else {
+            self.ifr_delay |= IRQ_ACK1;
+            self.ifr_delay &= !IRQ_RAISE0;
+            result = self.icr_flags as u8;
+            self.icr_flags &= IM_SET;
+            self.new_flags = 0;
+        }
         self.ifr_delay |= IRQ_READ0;
         self.irq_line = false;
         self.icr_read_clock = self.clock;
@@ -390,11 +444,18 @@ impl CiaState {
                 }
                 if self.icr_flags & self.icr_mask as u16 & 0x7F != 0 {
                     // A flag already set and now enabled: bit 7 and IRQ after the
-                    // usual delays (an already active line stays as it is)
+                    // usual delays (an already active line stays as it is): on
+                    // the 6526A at once, unless the ICR was read a cycle before
                     if !self.irq_line {
-                        self.ifr_delay |= IRQ_RAISE1 | IRQ_D7SET1;
+                        if self.model == Model::Mos6526A {
+                            if self.ifr_delay & IRQ_READ1 == 0 {
+                                self.ifr_delay |= IRQ_RAISE0 | IRQ_D7SET0;
+                            }
+                        } else {
+                            self.ifr_delay |= IRQ_RAISE1 | IRQ_D7SET1;
+                        }
                     }
-                } else if self.ifr_delay & IRQ_ACK_1 != 0 {
+                } else if self.model == Model::Mos6526 && self.ifr_delay & IRQ_ACK_1 != 0 {
                     self.ifr_delay &= !(IRQ_RAISE0 | IRQ_D7SET0);
                 }
             }
@@ -439,6 +500,8 @@ impl CiaState {
     fn set_flag(&mut self, bits: u16) {
         self.icr_flags |= bits;
         self.new_flags |= bits;
+        // A flag set after a read is not cleared by it (6526A)
+        self.ack_flags &= !bits;
     }
 
     fn tod_tick(&mut self) {
@@ -511,7 +574,7 @@ impl CiaState {
         if tb_under {
             self.set_flag(0x02);
             self.tbt = !self.tbt;
-            if self.icr_read_clock == self.clock - 1 {
+            if self.model == Model::Mos6526 && self.icr_read_clock == self.clock - 1 {
                 self.icr_flags |= IM_TBB;
             } else {
                 self.icr_flags &= !IM_TBB;
@@ -528,19 +591,31 @@ impl CiaState {
         self.ifr_cycle();
     }
 
-    /// One cycle of the ICR delay line: an enabled flag set in
-    /// this cycle brings bit 7 and IRQ on the next cycle; a read clears
-    /// bit 7 two cycles later.
+    /// One cycle of the ICR delay line (VICE's cia_run_ifr_cycle): an
+    /// enabled flag set in this cycle brings bit 7 and IRQ on the next cycle
+    /// (6526A: in this one, unless the ICR was read in the previous cycle);
+    /// a read clears bit 7 two cycles later (6526A: flags and bit 7 one
+    /// cycle later).
     fn ifr_cycle(&mut self) {
         if self.ifr_delay == 0 && self.new_flags == 0 {
             return;
         }
+        let new_model = self.model == Model::Mos6526A;
         let mut d = self.ifr_delay;
         if d & IRQ_ACK0 != 0 {
-            self.icr_flags &= !IM_SET;
+            if new_model {
+                self.icr_flags &= !self.ack_flags;
+            } else {
+                self.icr_flags &= !IM_SET;
+            }
+            self.ack_flags = 0;
         }
         if self.new_flags & self.icr_mask as u16 & 0x1F != 0 {
-            d |= IRQ_RAISE1 | IRQ_D7SET1;
+            if new_model && self.icr_read_clock.wrapping_add(1) != self.clock {
+                d |= IRQ_RAISE0 | IRQ_D7SET0;
+            } else {
+                d |= IRQ_RAISE1 | IRQ_D7SET1;
+            }
         }
         if d & IRQ_D7SET0 != 0 {
             self.icr_flags |= IM_SET;
@@ -560,7 +635,7 @@ use crate::snapshot::impl_state;
 impl_state!(Timer { state, cnt, latch });
 
 impl_state!(CiaState {
-    regs, ta, tb, tat, tbt, icr_flags, icr_mask, new_flags, ifr_delay, irq_line,
+    model, regs, ta, tb, tat, tbt, icr_flags, icr_mask, new_flags, ack_flags, ifr_delay, irq_line,
     clock, icr_read_clock,
     tod, tod_alarm, tod_latch, tod_stopped, tod_cycles, tod_prescale,
     sdr, sdr_shifting, sdr_pending, sdr_count,

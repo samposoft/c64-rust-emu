@@ -14,7 +14,7 @@ printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 ```
 
 Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.d64/.g64...]` (with
-several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--vic CHIP` (the VIC-II and its standard: 6569, 6569r1, 8565, 6567, 6567r56a, 8562, 6572; see README.md), `--roms DIR`, `-x script`, `-e "cmd; cmd"`
+several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--vic CHIP` (the VIC-II and its standard: 6569, 6569r1, 8565, 6567, 6567r56a, 8562, 6572; see README.md), `--c64c` (8565 or 8562, 8580, 6526A), `--cia 6526|6526a`, `--roms DIR`, `-x script`, `-e "cmd; cmd"`
 (repeatable), `--no-stdin`, `--window`, `--audio`, `--reu KB` (REU from 128 to
 16384 KB), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
 `--sid 6581|8580|8580d` (SID model, default 6581; `8580d` is the 8580 with
@@ -60,7 +60,8 @@ decimal.
 | `stack` | stack bytes and plausible return addresses (preceded by a JSR) |
 | `screen` | screen RAM as 40×25 text (uses the current VIC bank and `$D018`) |
 | `bank` | memory configuration `$01`, cartridge (type, mode, banks, registers), VIC bank, screen/charset/bitmap |
-| `vic`, `sprites`, `cia1`, `cia2`, `sid` | decoded registers; `vic` also the chip and its raster, `sid` also model, OSC3, ENV3, value on the data bus and audio |
+| `vic`, `sprites`, `cia1`, `cia2`, `sid` | decoded registers; `vic` also the chip and its raster, `cia1` and `cia2` also the model, `sid` also model, OSC3, ENV3, value on the data bus and audio |
+| `cia [6526\|6526a]` | model of both CIAs: the old 6526 (default) or the 6526A (8521) of the C64C, whose timer interrupts come one cycle earlier; without arguments it shows it |
 | `sid 6581\|8580\|8580d` | changes the SID model (`8580d`: with digiboost) |
 | `sid2 [addr\|off]` | second SID: state; with an address (`$D420`-`$D7E0`, `$DE00`-`$DFE0`, in steps of `$20`) it attaches it, as just powered on; `off` removes it |
 | `blend [on\|off]` | frame blending: the framebuffer (window and screenshots) becomes the average, in linear light, of the last two frames, as the eye sees a 50 Hz CRT; for pictures that alternate two frames (interlace, IFLI). Off by default, `--blend` turns it on |

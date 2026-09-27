@@ -588,8 +588,8 @@ impl Debugger {
 
     fn cia_common(name: &str, base: u16, c: &crate::cia::CiaState, pa: u8, pb: u8) -> String {
         let mut s = String::new();
-        let _ = writeln!(s, "{name} ${base:04X}: PA=${pa:02X} DDRA=${:02X} PB=${pb:02X} DDRB=${:02X}",
-            c.regs[2], c.regs[3]);
+        let _ = writeln!(s, "{name} ${base:04X} ({}): PA=${pa:02X} DDRA=${:02X} PB=${pb:02X} DDRB=${:02X}",
+            c.model.name(), c.regs[2], c.regs[3]);
         let cra = c.regs[0x0E];
         let crb = c.regs[0x0F];
         let _ = writeln!(s, "  timer A: ${:04X} latch ${:04X}  CRA=${cra:02X} start={} oneshot={} pbon={} inmode={}",
@@ -780,6 +780,7 @@ impl Debugger {
   screen             screen RAM as text
   bank | vic | sprites | cia1 | cia2
   sid [6581|8580|8580d]  SID registers and state; a model switches every SID to it (8580d: with digiboost)
+  cia [6526|6526a]   CIA model of both CIAs: the old 6526 (default) or the 6526A of the C64C
   sid2 [addr|off]    second SID: state; an address (d420-d7e0, de00-dfe0) attaches it, off removes it
   audio file.wav [Hz] | audio off   record the SID output from the next frames (default 44100 Hz; stereo with the second SID)
   audio raw file     capture the first SID's filter output every cycle, 16-bit LE (like VICE's -residrawoutput)
@@ -1057,6 +1058,12 @@ impl Debugger {
             "vic" => write!(out, "{}", Self::vic(c64)).map_err(io)?,
             "sprites" => write!(out, "{}", Self::sprites(c64)).map_err(io)?,
             "cia1" => write!(out, "{}", Self::cia1(c64)).map_err(io)?,
+            "cia" => {
+                if let Some(m) = args.first() {
+                    c64.set_cia_model(crate::cia::Model::parse(m).ok_or("usage: cia [6526|6526a]")?);
+                }
+                writeln!(out, "CIA model {}", c64.cia_model().name()).map_err(io)?;
+            }
             "cia2" => write!(out, "{}", Self::cia2(c64)).map_err(io)?,
             "sid" => {
                 if let Some(m) = args.first() {

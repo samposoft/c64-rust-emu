@@ -34,6 +34,11 @@ pub struct MachineOptions {
     pub no_drive: bool,
     /// SID model and digiboost (default 6581).
     pub sid: Option<(Model, bool)>,
+    /// CIA model (`--cia`; the 6526 by default).
+    pub cia: Option<crate::cia::Model>,
+    /// A C64C (`--c64c`): the HMOS VIC-II of the standard, the 8580 SID and
+    /// the 6526A CIAs, where not chosen otherwise.
+    pub c64c: bool,
     /// Address of the second SID.
     pub sid2: Option<u16>,
     /// Sound of the running tape (VICE's default volume).
@@ -55,12 +60,14 @@ pub struct MachineOptions {
     /// VIC-II, and with it the video standard (`--vic`, `--ntsc`; the PAL
     /// 6569 by default).
     pub chip: crate::vic::Chip,
+    /// The VIC-II was chosen with `--vic`.
+    pub vic_chosen: bool,
 }
 
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--ntsc | --vic CHIP] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
+        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.d64/.g64...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
@@ -70,6 +77,10 @@ impl MachineOptions {
                as --ntsc), 6567r56a (first NTSC C64s: 64 cycles, 262 lines, 5 lumas),
                8562 (NTSC C64C), 6572 (PAL-N: the Drean C64 of Argentina, 65 cycles,
                312 lines)
+  --c64c       a C64C: VIC-II 8565 (with --ntsc 8562), SID 8580, CIA 6526A, unless
+               --vic, --sid or --cia choose otherwise
+  --cia M      CIA model: 6526 (the old one, default) or 6526a (8521, C64C: timer
+               interrupts one cycle earlier)
   --roms DIR   directory of kernal.rom, basic.rom, chargen.rom and dos1541.rom (default:
                roms/ next to the executable or in a directory above it, else ./roms)
   --reu KB     attach a REU (128, 256, 512 ... 16384 KB)
@@ -118,10 +129,18 @@ impl MachineOptions {
                 None => { eprintln!("--reu needs the size in KB (128, 256, 512 ... 16384)"); std::process::exit(2); }
             },
             "--no-drive" => self.no_drive = true,
+            "--c64c" => self.c64c = true,
+            "--cia" => match rest.next().as_deref().and_then(crate::cia::Model::parse) {
+                Some(m) => self.cia = Some(m),
+                None => { eprintln!("--cia needs the model: 6526 or 6526a"); std::process::exit(2); }
+            },
             "--ntsc" => self.chip = crate::vic::Chip::Mos6567R8,
             "--pal" => self.chip = crate::vic::Chip::Mos6569,
             "--vic" => match rest.next().as_deref().and_then(crate::vic::Chip::parse) {
-                Some(c) => self.chip = c,
+                Some(c) => {
+                    self.chip = c;
+                    self.vic_chosen = true;
+                }
                 None => { eprintln!("--vic needs the VIC-II: {}", crate::vic::Chip::NAMES); std::process::exit(2); }
             },
             "--sid" => match rest.next().as_deref().and_then(parse_sid_model) {
@@ -167,6 +186,17 @@ impl MachineOptions {
         }
     }
 
+    /// The VIC-II of the machine: `--vic`, or the one of the standard (the
+    /// HMOS one of a C64C with `--c64c`).
+    pub fn vic_chip(&self) -> crate::vic::Chip {
+        use crate::vic::Chip;
+        match self.chip {
+            Chip::Mos6569 if self.c64c && !self.vic_chosen => Chip::Mos8565,
+            Chip::Mos6567R8 if self.c64c && !self.vic_chosen => Chip::Mos8562,
+            c => c,
+        }
+    }
+
     /// CRT emulation asked for on the command line, for the machine's
     /// standard.
     pub fn crt(&self) -> Result<Option<crate::crt::Crt>, String> {
@@ -198,14 +228,19 @@ impl MachineOptions {
     /// the error is an invalid REU size.
     pub fn build(&self) -> Result<C64, String> {
         let mut c64 = C64::new();
-        c64.set_chip(self.chip)?;
+        c64.set_chip(self.vic_chip())?;
         let roms = self.roms_dir.clone().unwrap_or_else(C64::default_roms_dir);
         for w in c64.load_roms_from_dir(&roms) {
             eprintln!("WARN: {w}");
         }
         c64.set_reu(self.reu)?;
-        if let Some((model, digiboost)) = self.sid {
+        let c64c_sid = self.c64c.then_some((Model::Mos8580, false));
+        if let Some((model, digiboost)) = self.sid.or(c64c_sid) {
             c64.set_sid_model(model, digiboost);
+        }
+        let c64c_cia = self.c64c.then_some(crate::cia::Model::Mos6526A);
+        if let Some(model) = self.cia.or(c64c_cia) {
+            c64.set_cia_model(model);
         }
         c64.set_sid2(self.sid2)?;
         c64.set_blend(self.blend);
