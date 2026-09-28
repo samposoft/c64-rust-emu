@@ -5,6 +5,7 @@ use crate::{cpu::{Cpu, Flags}, mem::Bus, disk::D64, cart, reu::DmaCycle};
 use crate::snapshot::{impl_state, impl_state_enum, Reader, State, Writer};
 use std::path::{Path, PathBuf};
 
+use crate::drive::Model as DriveModel;
 use crate::timing::Standard;
 use crate::vic::Chip;
 
@@ -61,10 +62,17 @@ pub struct C64 {
     injected: bool,
     inject_countdown: Option<u8>,
 
-    // Mounted D64 image
+    // Mounted D64 image in unit 8: loaded through the KERNAL trap without a
+    // drive, and its directory for the frontends
     pub disk: Option<D64>,
-    /// File of the mounted disk, to write back the changes made by the drive.
-    disk_path: String,
+    /// File of the disk in each drive (units 8, 9), to write back the
+    /// changes made by the drive.
+    disk_path: [String; crate::drive::UNITS],
+    /// The D64 or D71 each disk was built from (empty for a G64): the
+    /// sectors the drive could not decode are saved as they were.
+    disk_source: [Vec<u8>; crate::drive::UNITS],
+    /// ROM directory, for the drives attached later (a D71 needs a 1571).
+    roms_dir: Option<PathBuf>,
     disk_autoload: bool,    // true = still have to inject the LOAD"*",8,1 + RUN command
     /// File of the inserted tape, to write the recordings back to (or of
     /// the T64 image, which is never written).
@@ -131,7 +139,9 @@ impl C64 {
             injected: false,
             inject_countdown: None,
             disk: None,
-            disk_path: String::new(),
+            disk_path: Default::default(),
+            disk_source: Default::default(),
+            roms_dir: None,
             disk_autoload: false,
             tape_path: String::new(),
             t64: None,
@@ -227,7 +237,7 @@ impl C64 {
         if let Some(sid2) = &mut self.bus.sid2 {
             sid2.set_clock(hz)?;
         }
-        if let Some(drive) = &mut self.bus.drive {
+        for drive in self.bus.drives.iter_mut().flatten() {
             drive.set_c64_clock(hz);
         }
         self.bus.tape.set_clock(hz);
@@ -296,6 +306,7 @@ impl C64 {
                 }
             }
         };
+        self.roms_dir = Some(dir.to_path_buf());
         let kernal  = load("kernal.rom",  0x2000);
         let basic   = load("basic.rom",   0x2000);
         let charrom = load("chargen.rom", 0x1000);
@@ -319,7 +330,7 @@ impl C64 {
         if let Some(net) = &mut self.net {
             net.reset();
         }
-        if let Some(drive) = &mut self.bus.drive {
+        for drive in self.bus.drives.iter_mut().flatten() {
             drive.reset();
         }
         // The Datasette stops and rewinds (VICE's DatasetteResetWithCPU)
@@ -398,20 +409,26 @@ impl C64 {
                 }
                 Ok(msg)
             }
-            "d64" => {
+            "d64" | "g64" | "d71" | "g71" => {
+                // A double-sided disk needs a 1571 in unit 8: it takes the
+                // place of the 1541
+                let two_sides = matches!(ext.as_str(), "d71" | "g71");
+                if two_sides && self.drive(8).is_none_or(|d| d.model() != DriveModel::Mos1571) {
+                    self.attach_drive_model(8, DriveModel::Mos1571)
+                        .map_err(|e| format!("{path} needs a 1571 drive: {e}"))?;
+                }
+                if let Some(d) = self.drive(8) {
+                    let model = d.model().name();
+                    self.insert_disk(path)?;
+                    self.disk_autoload = true;
+                    return Ok(format!("Disk inserted: {path} (drive 8, {model}; auto-load LOAD\"*\",8,1 + RUN)"));
+                }
+                if ext != "d64" {
+                    return Err(format!("{path}: GCR images need a drive (the dos1541.rom ROM is missing)"));
+                }
                 self.mount_disk(data).map_err(|e| format!("D64 error: {e}"))?;
-                self.disk_path = path.to_string();
-                let how = if self.bus.drive.is_some() { "drive 1541" } else { "fast load" };
-                Ok(format!("Disk mounted: {path} ({how}, auto-load LOAD\"*\",8,1 + RUN)"))
-            }
-            "g64" => {
-                let drive = self.bus.drive.as_mut()
-                    .ok_or("G64 images require the 1541 drive (the dos1541.rom ROM is missing)")?;
-                drive.insert(crate::drive::gcr::Disk::from_g64(&data)?);
-                self.disk = None;
-                self.disk_path = path.to_string();
-                self.disk_autoload = true;
-                Ok(format!("G64 disk inserted: {path} (auto-load LOAD\"*\",8,1 + RUN)"))
+                self.disk_path[0] = path.to_string();
+                Ok(format!("Disk mounted: {path} (fast load, auto-load LOAD\"*\",8,1 + RUN)"))
             }
             "t64" => {
                 let t64 = crate::tape::T64::from_bytes(&data).map_err(|e| format!("T64 error: {e}"))?;
@@ -464,9 +481,9 @@ impl C64 {
         Ok(blank)
     }
 
-    /// File of the inserted disk ("" if none).
-    pub fn disk_path(&self) -> &str {
-        &self.disk_path
+    /// File of the disk inserted in `unit` ("" if none).
+    pub fn disk_path(&self, unit: u8) -> &str {
+        Self::unit_index(unit).map_or("", |i| &self.disk_path[i])
     }
 
     /// File of the inserted tape or T64 ("" if it does not come from a
@@ -572,27 +589,61 @@ impl C64 {
         Ok(Some(cart.nvram_path.clone()))
     }
 
-    /// Mounts a D64 image. Returns Err if the format is invalid.
-    pub fn mount_disk(&mut self, data: Vec<u8>) -> Result<(), String> {
-        if let Some(drive) = self.bus.drive.as_mut() {
-            drive.insert(crate::drive::gcr::Disk::from_d64(&data)?);
-        }
+    /// Mounts a D64 image for the KERNAL trap (no drive), with auto-load.
+    /// Returns Err if the format is invalid.
+    fn mount_disk(&mut self, data: Vec<u8>) -> Result<(), String> {
         match D64::from_bytes(data) {
             Some(d) => { self.disk = Some(d); self.disk_autoload = true; Ok(()) }
             None    => Err("invalid or too short D64 file".into()),
         }
     }
 
-    /// Inserts a D64 or G64 disk into the drive without auto-loading.
+    /// Index in `bus.drives` of drive `unit` (8, 9).
+    fn unit_index(unit: u8) -> Result<usize, String> {
+        let i = unit.wrapping_sub(crate::drive::FIRST_UNIT) as usize;
+        if i < crate::drive::UNITS {
+            Ok(i)
+        } else {
+            Err(format!("drive {unit}: the units are 8 and 9"))
+        }
+    }
+
+    /// Drive `unit` (8, 9), if attached.
+    pub fn drive(&self, unit: u8) -> Option<&crate::drive::Drive> {
+        self.bus.drives.get(Self::unit_index(unit).ok()?)?.as_deref()
+    }
+
+    pub fn drive_mut(&mut self, unit: u8) -> Option<&mut crate::drive::Drive> {
+        self.bus.drives.get_mut(Self::unit_index(unit).ok()?)?.as_deref_mut()
+    }
+
+    /// Inserts a D64, G64, D71 or G71 disk into drive 8 without
+    /// auto-loading.
     pub fn insert_disk(&mut self, path: &str) -> Result<String, String> {
+        self.insert_disk_in(8, path)
+    }
+
+    /// Inserts a D64, G64, D71 or G71 disk into drive `unit`, after saving
+    /// the changes to the disk it replaces. A double-sided disk needs a 1571.
+    pub fn insert_disk_in(&mut self, unit: u8, path: &str) -> Result<String, String> {
+        let i = Self::unit_index(unit)?;
         let data = std::fs::read(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
-        let drive = self.bus.drive.as_mut().ok_or("1541 drive not emulated")?;
-        let g64 = data.starts_with(b"GCR-1541");
-        let disk = if g64 { crate::drive::gcr::Disk::from_g64(&data)? } else { crate::drive::gcr::Disk::from_d64(&data)? };
-        drive.insert(disk);
-        self.disk = if g64 { None } else { D64::from_bytes(data) };
-        self.disk_path = path.to_string();
-        Ok(format!("Disk inserted into the drive: {path}"))
+        let disk = crate::drive::gcr::Disk::from_image(&data).map_err(|e| format!("{path}: {e}"))?;
+        let model = self.drive(unit).ok_or(format!("drive {unit} not emulated"))?.model();
+        if disk.sides() > model.sides() as usize {
+            return Err(format!("{path}: a double-sided disk needs a 1571 (drive {unit} is a {})", model.name()));
+        }
+        if let Some(saved) = self.save_unit_changes(i)? {
+            crate::notice!("Disk changes written to {saved}");
+        }
+        let from_sectors = disk.from_d64;
+        self.bus.drives[i].as_mut().unwrap().insert(disk);
+        if unit == crate::drive::FIRST_UNIT {
+            self.disk = if from_sectors { D64::from_bytes(data.clone()) } else { None };
+        }
+        self.disk_source[i] = if from_sectors { data } else { Vec::new() };
+        self.disk_path[i] = path.to_string();
+        Ok(format!("Disk inserted into drive {unit}: {path}"))
     }
 
     /// Medium change with the machine on, as a person would do it: a tape
@@ -614,58 +665,99 @@ impl C64 {
                 self.bus.tape.play(self.bus.cycle);
                 Ok(format!("T64 inserted: {path} (PLAY pressed)"))
             }
-            "d64" | "g64" => {
-                if let Some(saved) = self.save_disk_changes()? {
-                    crate::notice!("Disk changes written to {saved}");
-                }
-                if self.bus.drive.is_some() {
+            "d64" | "g64" | "d71" | "g71" => {
+                if self.drive(8).is_some() {
                     self.insert_disk(path)
                 } else {
                     // Without a drive, D64 images are read through the KERNAL trap
                     let data = std::fs::read(path).map_err(|e| format!("Cannot read {path}: {e}"))?;
                     self.disk = Some(D64::from_bytes(data).ok_or("invalid D64")?);
-                    self.disk_path = path.to_string();
+                    self.disk_path[0] = path.to_string();
                     Ok(format!("Disk inserted: {path}"))
                 }
             }
-            _ => Err(format!("{path}: only tapes (.tap, .t64) and disks (.d64, .g64) can be changed")),
+            _ => Err(format!("{path}: only tapes (.tap, .t64) and disks (.d64, .g64, .d71, .g71) can be changed")),
         }
     }
 
-    /// Attaches the 1541 drive with the DOS ROM in `dir` (dos1541.rom, or with
-    /// the VICE file names). Without it, D64 images load through the KERNAL trap.
+    /// Attaches a 1541 as drive 8 with the DOS ROM in `dir` (dos1541.rom,
+    /// or with the VICE file names). Without it, D64 images load through the
+    /// KERNAL trap.
     pub fn attach_drive_from_dir(&mut self, dir: &Path) -> Result<(), String> {
-        const NAMES: [&str; 3] = ["dos1541.rom", "1541.rom", "dos1541-325302-01+901229-05.bin"];
-        let rom = NAMES.iter().find_map(|n| std::fs::read(dir.join(n)).ok())
-            .ok_or_else(|| format!("1541 ROM not found in {} ({})", dir.display(), NAMES.join(", ")))?;
-        let mut drive = Box::new(crate::drive::Drive::new(&rom, 8)?);
+        self.attach_drive(8, DriveModel::Mos1541, dir)
+    }
+
+    /// Attaches drive `unit` (8, 9) of `model`, with its DOS ROM from `dir`,
+    /// in place of the drive there (whose disk changes are saved). The new
+    /// drive is empty and starts from its reset.
+    pub fn attach_drive(&mut self, unit: u8, model: DriveModel, dir: &Path) -> Result<(), String> {
+        let i = Self::unit_index(unit)?;
+        let names = model.rom_names();
+        let rom = names.iter().find_map(|n| std::fs::read(dir.join(n)).ok())
+            .ok_or_else(|| format!("{} ROM not found in {} ({})", model.name(), dir.display(), names.join(", ")))?;
+        let mut drive = Box::new(crate::drive::Drive::new(model, &rom, unit)?);
         drive.set_c64_clock(self.standard().clock_hz());
-        self.bus.drive = Some(drive);
+        self.detach_drive(unit)?;
+        self.bus.drives[i] = Some(drive);
         Ok(())
     }
 
-    /// Writes the changes made by the drive (game saves, SAVE) to the disk
-    /// file, if there are any. Returns the file written.
-    pub fn save_disk_changes(&mut self) -> Result<Option<String>, String> {
-        let Some(drive) = self.bus.drive.as_mut() else { return Ok(None) };
+    /// Attaches drive `unit` of `model` with the ROMs of the machine's ROM
+    /// directory.
+    pub fn attach_drive_model(&mut self, unit: u8, model: DriveModel) -> Result<(), String> {
+        let dir = self.roms_dir.clone().unwrap_or_else(Self::default_roms_dir);
+        self.attach_drive(unit, model, &dir)
+    }
+
+    /// Removes drive `unit` (8, 9), after saving the changes to its disk.
+    pub fn detach_drive(&mut self, unit: u8) -> Result<(), String> {
+        let i = Self::unit_index(unit)?;
+        if let Some(saved) = self.save_unit_changes(i)? {
+            crate::notice!("Disk changes written to {saved}");
+        }
+        self.bus.drives[i] = None;
+        self.disk_path[i].clear();
+        self.disk_source[i].clear();
+        if i == 0 {
+            self.disk = None;
+        }
+        Ok(())
+    }
+
+    /// Writes the changes made by the drives (game saves, SAVE) to the
+    /// disk files, if there are any. Returns the files written.
+    pub fn save_disk_changes(&mut self) -> Result<Vec<String>, String> {
+        let mut saved = Vec::new();
+        for i in 0..crate::drive::UNITS {
+            saved.extend(self.save_unit_changes(i)?);
+        }
+        Ok(saved)
+    }
+
+    /// Writes the changes to the disk in drive `bus.drives[i]`.
+    fn save_unit_changes(&mut self, i: usize) -> Result<Option<String>, String> {
+        let Some(drive) = self.bus.drives[i].as_mut() else { return Ok(None) };
         let Some(disk) = drive.bus.mech.disk.as_mut() else { return Ok(None) };
-        if !disk.dirty || self.disk_path.is_empty() {
+        let path = &self.disk_path[i];
+        if !disk.dirty || path.is_empty() {
             return Ok(None);
         }
-        // A D64 stays a D64 (sectors decoded from GCR, the rest of the
-        // original file unchanged), a G64 is rewritten track by track
-        let data = match (disk.from_d64, self.disk.as_ref()) {
-            (true, Some(d64)) => disk.to_d64(d64.bytes()),
-            (true, None) => return Ok(None),
+        // A D64 or D71 stays one (sectors decoded from GCR, the rest of the
+        // original file unchanged), a G64 or G71 is rewritten track by track
+        let data = match (disk.from_d64, self.disk_source[i].is_empty()) {
+            (true, false) => disk.to_d64(&self.disk_source[i]),
+            (true, true) => return Ok(None),
             (false, _) => disk.to_g64(),
         };
-        std::fs::write(&self.disk_path, &data)
-            .map_err(|e| format!("Cannot save {}: {e}", self.disk_path))?;
+        std::fs::write(path, &data).map_err(|e| format!("Cannot save {path}: {e}"))?;
         disk.dirty = false;
         if disk.from_d64 {
-            self.disk = D64::from_bytes(data);
+            if i == 0 {
+                self.disk = D64::from_bytes(data.clone());
+            }
+            self.disk_source[i] = data;
         }
-        Ok(Some(self.disk_path.clone()))
+        Ok(Some(path.clone()))
     }
 
     /// Queues a .prg to be loaded automatically after the KERNAL boot.
@@ -958,9 +1050,17 @@ impl C64 {
     /// the drive up to the clock of the access).
     #[inline]
     fn tick_drive(&mut self) {
-        if self.bus.drive.is_some() {
+        if self.bus.drives.iter().any(Option::is_some) {
+            // Each drive sees the lines of the C64 and of the other drives
+            // as they were at the end of the previous cycle
             let (atn, clk, data) = self.bus.iec_c64_lines();
-            self.bus.drive.as_deref_mut().unwrap().run_c64_cycle(atn, clk, data);
+            let others: [(bool, bool); crate::drive::UNITS] =
+                std::array::from_fn(|i| self.bus.drive_pulls(atn, i));
+            for (d, (oclk, odata)) in self.bus.drives.iter_mut().zip(others) {
+                if let Some(d) = d {
+                    d.run_c64_cycle(atn, clk || oclk, data || odata);
+                }
+            }
         }
         // Datasette: like VICE alarms, after the CPU access
         if self.bus.tape.tick(self.bus.cycle) {
@@ -1052,7 +1152,7 @@ impl C64 {
     /// it runs the end-of-frame housekeeping (PRG injection, D64 autoload, audio).
     pub fn step_instruction(&mut self) -> StepResult {
         // Intercept KERNAL LOAD before the CPU executes the instruction
-        if self.cpu.pc == 0xFFD5 && self.disk.is_some() && self.bus.drive.is_none() && self.handle_kernal_load() {
+        if self.cpu.pc == 0xFFD5 && self.disk.is_some() && self.bus.drives[0].is_none() && self.handle_kernal_load() {
             return StepResult { cycles: 0, elapsed: 0, frame_done: false };
         }
         if self.cpu.pc == 0xF81E && self.tape_auto_buttons {
@@ -1437,12 +1537,12 @@ impl C64 {
 
     /// Drive activity counter (0 without a drive), see `DriveBus::activity`.
     pub fn drive_activity(&self) -> u64 {
-        self.bus.drive.as_ref().map_or(0, |d| d.bus.activity)
+        self.bus.drives.iter().flatten().map(|d| d.bus.activity).sum()
     }
 
     /// DOS job pending with the motor on, see `Drive::job_pending`.
     pub fn drive_job_pending(&self) -> bool {
-        self.bus.drive.as_ref().is_some_and(|d| d.job_pending())
+        self.bus.drives.iter().flatten().any(|d| d.job_pending())
     }
 
     /// The tape is moving (a key pressed and the motor on).
@@ -1503,7 +1603,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 27;
+const STATE_VERSION: u32 = 28;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
@@ -1539,7 +1639,7 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
 // network (host sockets).
 impl_state!(C64 {
     chip, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
-    disk, disk_path, disk_autoload, tape_path, t64, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
+    disk, disk_path, disk_source, disk_autoload, tape_path, t64, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
     autoload_run, autoload_sys, freeze_at, freeze_step, freeze_rng,
     frame_elapsed, frame_count,
-} skip { audio_buf, audio_buf2, dbg, blend, hdr, crt, net });
+} skip { audio_buf, audio_buf2, dbg, blend, hdr, crt, net, roms_dir });

@@ -630,27 +630,30 @@ impl Debugger {
         s
     }
 
-    /// 1541 drive: its CPU's registers and instructions, mechanics, VIAs,
+    /// Drive `unit`: its CPU's registers and instructions, mechanics, VIAs,
     /// serial bus lines; with `mem a [b]`, its memory.
-    pub fn drive(c64: &C64, args: &[&str]) -> Result<String, String> {
-        let Some(d) = c64.bus.drive.as_ref() else { return Ok("  1541 drive: not emulated\n".into()) };
+    pub fn drive(c64: &C64, unit: u8, args: &[&str]) -> Result<String, String> {
+        let Some(d) = c64.drive(unit) else {
+            let others: Vec<String> = (8..8 + crate::drive::UNITS as u8)
+                .filter_map(|u| c64.drive(u).map(|d| format!("{u} ({})", d.model().name())))
+                .collect();
+            return Ok(format!("  drive {unit}: not emulated ('drive {unit} 1541' attaches one; drives: {})\n",
+                if others.is_empty() { "none".to_string() } else { others.join(", ") }));
+        };
         let mut s = String::new();
-        if args.first() == Some(&"trace") {
-            // The drive must be modified: handled in exec_inner()
-            return Err("usage: drive trace on file | off".into());
-        }
         if args.first() == Some(&"g64") {
-            let path = args.get(1).ok_or("usage: drive g64 file")?;
+            let path = args.get(1).ok_or("usage: drive [8|9] g64 file")?;
             let disk = d.bus.mech.disk.as_ref().ok_or("no disk in the drive")?;
             std::fs::write(path, disk.to_g64()).map_err(|e| format!("{path}: {e}"))?;
-            return Ok(format!("disk saved to {path}\n"));
+            let kind = if disk.sides() == 2 { "G71" } else { "G64" };
+            return Ok(format!("disk saved to {path} ({kind})\n"));
         }
         if args.first() == Some(&"mem") {
-            let a = parse_addr(args.get(1).ok_or("usage: drive mem a [b]")?)?;
+            let a = parse_addr(args.get(1).ok_or("usage: drive [8|9] mem a [b]")?)?;
             let b = args.get(2).map(|x| parse_addr(x)).transpose()?.unwrap_or(a.wrapping_add(0x7F));
             let mut addr = a;
             while addr <= b {
-                let _ = write!(s, ">8:{addr:04x} ");
+                let _ = write!(s, ">{unit}:{addr:04x} ");
                 for i in 0..16u16 {
                     let _ = write!(s, " {:02x}", d.bus.peek(addr.wrapping_add(i)));
                 }
@@ -660,19 +663,24 @@ impl Debugger {
             }
             return Ok(s);
         }
+        if let Some(a) = args.first() {
+            return Err(format!("drive: unknown argument {a} (mem, g64, insert, trace, 1541, 1571, off)"));
+        }
         let c = &d.cpu;
-        let _ = writeln!(s, "  8: PC ${:04X} A ${:02X} X ${:02X} Y ${:02X} SP ${:02X} P ${:02X}",
-            c.pc, c.a, c.x, c.y, c.sp, c.p.0);
+        let _ = writeln!(s, "  {unit} ({}): PC ${:04X} A ${:02X} X ${:02X} Y ${:02X} SP ${:02X} P ${:02X}",
+            d.model().name(), c.pc, c.a, c.x, c.y, c.sp, c.p.0);
         let mut pc = c.pc;
         for _ in 0..4 {
             let ins = disasm::disasm(&|a| d.bus.peek(a), pc);
-            let _ = writeln!(s, "  .8:{:04x}  {:<11} {}", pc, ins.bytes_hex(), ins.text());
+            let _ = writeln!(s, "  .{unit}:{:04x}  {:<11} {}", pc, ins.bytes_hex(), ins.text());
             pc = pc.wrapping_add(ins.len());
         }
         s += &d.describe();
         let (atn, clk, data) = c64.bus.iec_c64_lines();
         let (dclk, ddata) = d.pulls(atn);
-        let _ = writeln!(s, "  serial bus: ATN {}  CLK {}  DATA {}  (C64 pulls low{}{}{}; drive{}{})",
+        let (oclk, odata) = c64.bus.drive_pulls(atn, (unit - 8) as usize);
+        let (clk, data) = (clk || oclk, data || odata);
+        let _ = writeln!(s, "  serial bus: ATN {}  CLK {}  DATA {}  (C64 and other drives pull low{}{}{}; this drive{}{})",
             if atn { "low" } else { "high" }, if clk || dclk { "low" } else { "high" },
             if data || ddata { "low" } else { "high" },
             if atn { " ATN" } else { "" }, if clk { " CLK" } else { "" }, if data { " DATA" } else { "" },
@@ -820,8 +828,9 @@ impl Debugger {
   reu [KB|off]       REU registers; KB (128..16384) attaches it, off removes it
   eth [rrnet|tfe[@addr]|off]  Ethernet cartridge (CS8900A) and its virtual network: state; rrnet or tfe attaches it (at $DE00, or addr de00-dff0), off removes it
   eth forward HOSTPORT C64PORT  forward TCP port HOSTPORT of the host (127.0.0.1) to port C64PORT of the C64
-  drive [mem a [b]]  1541 drive: CPU, track, motor, VIA, serial bus; mem = its memory
-  drive g64 file     save the disk in the drive as a G64 image
+  drive [8|9] [mem a [b]]  drive 8 (default) or 9: CPU, track, side, motor, VIAs, serial bus; mem = its memory
+  drive [8|9] g64 file     save the disk in the drive as a G64 image (G71 for a double-sided disk)
+  drive [8|9] 1541|1571|off  attach a 1541 or a 1571 as that unit (empty, from its reset), or remove it
   tape [play|record|stop|ff|rew]   Datasette: state and buttons
   tape insert file|eject|save      .tap tape (missing file: blank tape) or .t64 image; save writes the recordings
   tape rewind|counter              rewind instantly (T64: back to the first program) / reset the counter
@@ -830,8 +839,8 @@ impl Debugger {
   tape azimuth [cycles | off]      azimuth error: each pulse is off by a random amount up to that many cycles (0.001-10)
   tape sound [on [vol] | off]      tape sound during PLAY (volume 1-4096, default 1024)
   swap               next medium among the command-line files (tape with PLAY, disk)
-  drive insert file  insert a D64/G64 without autoloading it
-  drive trace on file | off   trace of the drive's instructions (PC, registers, cycle)
+  drive [8|9] insert file    insert a D64/G64 (D71/G71 in a 1571) without autoloading it
+  drive [8|9] trace on file | off   trace of the drive's instructions (PC, registers, cycle)
   blend [on|off]     frame blending: each frame mixed with the previous one, as on a 50 Hz CRT (interlace pictures)
   hdr [on|off]       HDR output of the CRT emulation, on a display with headroom above white (Apple EDR): the slot mask at full depth
   crt [off | SET | lc | composite | rf | knob=N | comb=on|off | bars=on|off]...  CRT emulation in the window (GPU): sets 1084s, 1084s-p1, 1084s-d1, 1901, cp90 (PAL), 1702, 1084s-p, kv1311 (NTSC), cnt4442 (PAL-N), tv (the TV of the standard), 1900 (monochrome); inputs; knobs brightness, contrast, color, tint, sharpness (-100..100); comb filter and VIC-II jail bars
@@ -845,7 +854,7 @@ impl Debugger {
   mouse left|right down|up|press   mouse button (1351: left = fire, right = up, in joystick mode POTX; paddles: fire of X / Y)
   paddle 1|2 x y     paddle readings of a port (0-255)
   pen X Y | pen off  light pen or gun in port 1: pointer at VIC X (sprite coordinates) and raster line Y; a pen sees only with the right button (mouse right down)
-  load file          load .prg/.d64/.g64/.tap/.t64/.crt      savestate file | loadstate file   reset
+  load file          load .prg/.d64/.g64/.d71/.g71/.tap/.t64/.crt      savestate file | loadstate file   reset
   freeze             freeze button of the cartridge (Action Replay, Final Cartridge III, Retro Replay), like Shift+F11 in the window
   speed [auto|real|max]  auto: real speed, maximum while loading from disk and tape (default with --window); real: always 50 frames/s; max: maximum
   info | echo text | help | quit"
@@ -1240,31 +1249,49 @@ impl Debugger {
                 }
                 write!(out, "{}", Self::tape(c64)).map_err(io)?
             }
-            "drive" if args.first() == Some(&"insert") => {
-                let path = args.get(1).ok_or("usage: drive insert file")?;
-                writeln!(out, "{}", c64.insert_disk(path)?).map_err(io)?;
-            }
-            "drive" if args.first() == Some(&"trace") => {
-                let d = c64.bus.drive.as_mut().ok_or("1541 drive: not emulated")?;
-                match (args.get(1).copied(), args.get(2)) {
-                    (Some("on"), Some(path)) => {
-                        let f = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
-                        let mut w = std::io::BufWriter::new(f);
-                        d.trace = Some(Box::new(move |cpu, bus, clk| {
-                            let ins = disasm::disasm(&|a| bus.peek(a), cpu.pc);
-                            let _ = writeln!(w, ".8:{:04x}  {:<11} {:<15}- A:{:02X} X:{:02X} Y:{:02X} SP:{:02x} {}  {}",
-                                cpu.pc, ins.bytes_hex(), ins.text(), cpu.a, cpu.x, cpu.y, cpu.sp, flags_str(cpu.p), clk);
-                        }));
-                        writeln!(out, "drive trace to {path}").map_err(io)?;
+            "drive" => {
+                // An optional unit first: drive 8 by default
+                let (unit, args) = match args.first().and_then(|a| a.parse::<u8>().ok()) {
+                    Some(u) => (u, &args[1..]),
+                    None => (8, args),
+                };
+                match args.first().copied() {
+                    Some("insert") => {
+                        let path = args.get(1).ok_or("usage: drive [8|9] insert file")?;
+                        writeln!(out, "{}", c64.insert_disk_in(unit, path)?).map_err(io)?;
                     }
-                    (Some("off"), _) => {
-                        d.trace = None;
-                        writeln!(out, "drive trace off").map_err(io)?;
+                    Some(m @ ("1541" | "1571")) => {
+                        let model = crate::drive::Model::parse(m).unwrap();
+                        c64.attach_drive_model(unit, model)?;
+                        writeln!(out, "drive {unit}: {m} attached (empty, starting from its reset)").map_err(io)?;
                     }
-                    _ => return Err("usage: drive trace on file | off".into()),
+                    Some("off") => {
+                        c64.detach_drive(unit)?;
+                        writeln!(out, "drive {unit} removed").map_err(io)?;
+                    }
+                    Some("trace") => {
+                        let d = c64.drive_mut(unit).ok_or(format!("drive {unit}: not emulated"))?;
+                        match (args.get(1).copied(), args.get(2)) {
+                            (Some("on"), Some(path)) => {
+                                let f = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
+                                let mut w = std::io::BufWriter::new(f);
+                                d.trace = Some(Box::new(move |cpu, bus, clk| {
+                                    let ins = disasm::disasm(&|a| bus.peek(a), cpu.pc);
+                                    let _ = writeln!(w, ".{unit}:{:04x}  {:<11} {:<15}- A:{:02X} X:{:02X} Y:{:02X} SP:{:02x} {}  {}",
+                                        cpu.pc, ins.bytes_hex(), ins.text(), cpu.a, cpu.x, cpu.y, cpu.sp, flags_str(cpu.p), clk);
+                                }));
+                                writeln!(out, "drive {unit} trace to {path}").map_err(io)?;
+                            }
+                            (Some("off"), _) => {
+                                d.trace = None;
+                                writeln!(out, "drive {unit} trace off").map_err(io)?;
+                            }
+                            _ => return Err("usage: drive [8|9] trace on file | off".into()),
+                        }
+                    }
+                    _ => write!(out, "{}", Self::drive(c64, unit, args)?).map_err(io)?,
                 }
             }
-            "drive" => write!(out, "{}", Self::drive(c64, &args)?).map_err(io)?,
             "eth" => {
                 match &args[..] {
                     [] => {}

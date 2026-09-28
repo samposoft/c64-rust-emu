@@ -5,12 +5,22 @@
 // Peter Rittwage.
 // Ported to Rust and modified by SampoSoft in 2026; see CREDITS.md.
 
-//! 1541 drive emulated at the hardware level: 6502 at 1 MHz, 2 KB of RAM,
-//! 16 KB DOS ROM, two 6522 VIAs, mechanics and flux-level disk reading.
+//! 1541 and 1571 drives emulated at the hardware level: 6502 at 1 MHz (the
+//! 1571 also at 2 MHz), 2 KB of RAM, DOS ROM, two 6522 VIAs, mechanics and
+//! flux-level disk reading; the 1571 adds a 6526 CIA (fast serial, for
+//! the C128), a WD1770 controller (MFM disks) and a second head.
 //!
-//! Drive memory: RAM $0000-$07FF, VIA1 (serial bus) $1800-$1BFF,
-//! VIA2 (disk) $1C00-$1FFF, ROM $8000-$FFFF (16 KB mirrored). The rest is
-//! open bus: the last byte that went over the bus is read back.
+//! 1541 memory: RAM $0000-$07FF, VIA1 (serial bus) $1800-$1BFF, VIA2
+//! (disk) $1C00-$1FFF, repeated every 8 KB up to $7FFF (A13 and A14 are
+//! not decoded, as in VICE), ROM $8000-$FFFF (16 KB mirrored). 1571 memory:
+//! RAM $0000-$0FFF (2 KB mirrored), VIA1 $1800, VIA2 $1C00, WD1770
+//! $2000-$2FFF, CIA $4000-$7FFF, ROM $8000-$FFFF (32 KB). The rest is open
+//! bus: the last byte that went over the bus is read back.
+//!
+//! 1571 VIA1 port A: 0 track 0 sensor (0 = head on track 1), 1 fast serial
+//! direction, 2 side (head) select, 5 clock (1 = 2 MHz), 7 BYTE READY
+//! level (0 = a byte is ready; cleared by the VIA2 port accesses). At 2 MHz
+//! the disk turns at the same speed: 8 reference cycles per drive cycle.
 //!
 //! VIA1 port B: 0 DATA IN, 1 DATA OUT, 2 CLK IN, 3 CLK OUT, 4 ATN ACK,
 //! 5-6 drive number, 7 ATN IN; CA1 = ATN (rising edge when the C64
@@ -44,17 +54,76 @@
 
 pub mod gcr;
 pub mod via;
+pub mod wd1770;
 
+use crate::cia::CiaState;
 use crate::cpu::{Cpu, CpuBus};
 use crate::snapshot::{impl_state, Reader, Result as StateResult, State, Writer};
 use gcr::{Disk, HALF_TRACKS};
 use via::Via;
+use wd1770::Wd1770;
+
+/// Drive units on the serial bus: 8 and 9.
+pub const UNITS: usize = 2;
+/// Number of the first unit.
+pub const FIRST_UNIT: u8 = 8;
+
+/// Drive model.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Model {
+    #[default]
+    Mos1541,
+    Mos1571,
+}
+
+impl Model {
+    pub fn parse(s: &str) -> Option<Model> {
+        match s {
+            "1541" => Some(Model::Mos1541),
+            "1571" => Some(Model::Mos1571),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Model::Mos1541 => "1541",
+            Model::Mos1571 => "1571",
+        }
+    }
+
+    /// Size of the DOS ROM.
+    pub fn rom_size(self) -> usize {
+        match self {
+            Model::Mos1541 => 0x4000,
+            Model::Mos1571 => 0x8000,
+        }
+    }
+
+    /// ROM files looked for in the ROM directory: ours, then VICE's names.
+    pub fn rom_names(self) -> &'static [&'static str] {
+        match self {
+            Model::Mos1541 => &["dos1541.rom", "1541.rom", "dos1541-325302-01+901229-05.bin"],
+            Model::Mos1571 => &["dos1571.rom", "1571.rom", "dos1571-310654-05.bin"],
+        }
+    }
+
+    /// Heads: the 1571 reads both sides of the disk.
+    pub fn sides(self) -> u8 {
+        match self {
+            Model::Mos1541 => 1,
+            Model::Mos1571 => 2,
+        }
+    }
+}
+
+crate::snapshot::impl_state_enum!(Model { Mos1541, Mos1571 });
 
 /// Reference cycles (16 MHz) in one revolution at 300 rpm.
 const REF_PER_REVOLUTION: u32 = 3_200_000;
 /// VIA2 register reads sample the disk at 14/16 of the cycle.
 const BUS_READ_DELAY: u32 = 14;
-/// Drive cycles in one revolution.
+/// Drive cycles in one revolution at 1 MHz.
 const CYCLES_PER_REVOLUTION: u64 = 200_000;
 /// Disk change (VICE): after insertion the disk is unreadable and write
 /// protect is active for 1.8 s; on ejection write protect is active for
@@ -63,7 +132,8 @@ const CYCLES_PER_REVOLUTION: u64 = 200_000;
 const ATTACH_DELAY: u64 = 1_800_000;
 const DETACH_DELAY: u64 = 600_000;
 const ATTACH_DETACH_DELAY: u64 = 1_200_000;
-/// The drive's clock: 1 MHz (the C64's is set by `Drive::set_c64_clock`).
+/// The drive's clock: 1 MHz, or 2 MHz for a 1571 in fast mode (the C64's
+/// is set by `Drive::set_c64_clock`).
 const DRIVE_HZ: u32 = 1_000_000;
 
 /// Mechanics and read/write circuit.
@@ -71,6 +141,10 @@ pub struct Mechanics {
     pub disk: Option<Disk>,
     /// Half-track under the head (2 = track 1).
     pub half_track: usize,
+    /// Head in use (1571: 1 = the second side of the disk).
+    pub side: u8,
+    /// 1571 at 2 MHz: the drive cycles are half as long.
+    pub fast: bool,
     /// Head position in the track, in bits.
     head_bit: usize,
     pub motor: bool,
@@ -101,6 +175,8 @@ pub struct Mechanics {
     gcr_write: u8,
     /// BYTE READY edge not yet seen by the CPU.
     so_edge: bool,
+    /// BYTE READY as a level (1571 VIA1 PA7), until a VIA2 port access.
+    byte_ready_level: bool,
     /// V must be set right away (BYTE READY disabled or motor turned off with
     /// an edge pending).
     force_v: bool,
@@ -121,6 +197,8 @@ impl Default for Mechanics {
         Self {
             disk: None,
             half_track: 36, // track 18 at power-on, as in VICE
+            side: 0,
+            fast: false,
             head_bit: 0,
             motor: false,
             led: false,
@@ -143,6 +221,7 @@ impl Default for Mechanics {
             gcr_read: 0,
             gcr_write: 0,
             so_edge: false,
+            byte_ready_level: true,
             force_v: false,
             last_clk: 0,
             ref_advance: 0,
@@ -155,8 +234,13 @@ impl Default for Mechanics {
 }
 
 impl Mechanics {
+    /// Index of the track under the head in the disk's tracks.
+    fn track_index(&self) -> usize {
+        self.side as usize * HALF_TRACKS + self.half_track
+    }
+
     fn track(&self) -> Option<&gcr::Track> {
-        self.disk.as_ref()?.tracks.get(self.half_track)?.as_ref()
+        self.disk.as_ref()?.tracks.get(self.track_index())?.as_ref()
     }
 
     /// Bits per revolution of the track under the head (0 without a track: on
@@ -192,7 +276,7 @@ impl Mechanics {
         }
         let pos = self.head_bit;
         self.head_bit = (pos + 1) % bits;
-        let ht = self.half_track;
+        let ht = self.track_index();
         if let Some(disk) = self.disk.as_mut() {
             if let Some(Some(t)) = disk.tracks.get_mut(ht) {
                 let mask = 0x80 >> (pos & 7);
@@ -247,6 +331,7 @@ impl Mechanics {
                 self.so_delay -= todo;
                 if self.so_delay == 0 {
                     self.so_edge = true;
+                    self.byte_ready_level = true;
                 }
             }
             if self.read_mode {
@@ -338,10 +423,12 @@ impl Mechanics {
         let mut cycles = clk.saturating_sub(self.last_clk);
         self.last_clk = clk;
         // After long intervals without accesses whole revolutions are skipped
-        while cycles > 2 * CYCLES_PER_REVOLUTION {
-            cycles -= CYCLES_PER_REVOLUTION;
+        let revolution = CYCLES_PER_REVOLUTION << self.fast as u32;
+        while cycles > 2 * revolution {
+            cycles -= revolution;
         }
-        let refs = cycles as u32 * 16 + adv;
+        // 16 reference cycles per drive cycle, 8 at 2 MHz
+        let refs = ((cycles as u32) << (4 - self.fast as u32)) + adv;
         if refs > 0 {
             if refs > self.ref_advance {
                 let todo = refs - self.ref_advance;
@@ -412,14 +499,43 @@ impl Mechanics {
         }
     }
 
+    /// 1571 clock switch at cycle `clk`: the disk is brought up to date and
+    /// the read circuit starts again, as VICE's rotation_init.
+    fn set_fast(&mut self, fast: bool, clk: u64) {
+        self.rotate_to(clk);
+        self.fast = fast;
+        self.accum = 0;
+        self.ue7 = 0;
+        self.uf4 = 0;
+        self.fr_randcount = 0;
+        self.xorshift = 0x1234_ABCD;
+        self.filter_counter = 0;
+        self.filter_state = false;
+        self.filter_last = false;
+        self.so_delay = 0;
+        self.cycle_index = 0;
+        self.ref_advance = 0;
+    }
+
+    /// 1571 head select at cycle `clk`.
+    fn set_side(&mut self, side: u8, clk: u64) {
+        self.rotate_to(clk);
+        self.set_head(self.half_track, side);
+    }
+
     /// New half-track: the head stays at the same fraction of the revolution
     /// (from the start, if it came from an empty half-track).
     fn set_half_track(&mut self, ht: usize) {
+        self.set_head(ht, self.side);
+    }
+
+    fn set_head(&mut self, ht: usize, side: u8) {
         let ht = ht.clamp(2, 84);
         let old_bits = self.track_bits() as usize;
         self.half_track = ht;
+        self.side = side;
         let new_bits = self.track_bits() as usize;
-        self.head_bit = if old_bits == 0 { 0 } else { self.head_bit * new_bits / old_bits };
+        self.head_bit = (self.head_bit * new_bits).checked_div(old_bits).unwrap_or(0);
         if self.head_bit >= new_bits.max(1) {
             self.head_bit = 0;
         }
@@ -432,20 +548,26 @@ impl Mechanics {
         self.led = pb & 0x08 != 0;
         self.zone = (pb >> 5) & 3;
         let motor = pb & 0x04 != 0;
-        if motor {
-            // The coils move only with the motor on: one step at a time
-            let old = (self.half_track - 2) & 3;
-            let step = ((pb & 3) as usize).wrapping_sub(old) & 3;
-            match step {
-                1 => self.set_half_track(self.half_track + 1),
-                3 => self.set_half_track(self.half_track - 1),
-                _ => {}
-            }
+        // Coil phases: the head moves towards the new one (+1, +2 or -1
+        // half-tracks), only with the motor on and one step at a time
+        let old = (self.half_track - 2) & 3;
+        let step = match ((pb & 3) as usize).wrapping_sub(old) & 3 {
+            3 => -1,
+            s => s as isize,
+        };
+        if motor && step.abs() == 1 {
+            self.set_half_track(self.half_track.saturating_add_signed(step));
         }
         if motor && !self.motor {
             // The disk restarts from here
             self.last_clk = clk;
             self.cycle_index = 0;
+            // A phase change as the motor starts moves the head once more
+            // (VICE's fix for bug #1083, "Primitive 7 Sins"), by two
+            // half-tracks for opposite coils
+            if step != 0 {
+                self.set_half_track(self.half_track.saturating_add_signed(step));
+            }
         } else if !motor && self.motor && self.so_edge {
             self.so_edge = false;
             self.force_v = true;
@@ -475,11 +597,17 @@ impl Mechanics {
 
 /// Drive memory and peripherals, as seen by its CPU.
 pub struct DriveBus {
+    pub model: Model,
     pub ram: [u8; 0x800],
     rom: Vec<u8>,
     pub via1: Via,
     pub via2: Via,
     pub mech: Mechanics,
+    /// 1571: CIA for the fast serial bus and WD1770 controller.
+    pub cia: CiaState,
+    pub wd: Wd1770,
+    /// Last VIA1 port A output (1571: clock, side), as VICE's oldpa.
+    via1_pa: u8,
     /// Last byte that went over the bus (reads of unmapped areas).
     last_data: u8,
     /// Lines driven by the C64 (true = asserted, i.e. low).
@@ -516,11 +644,48 @@ impl DriveBus {
             | (self.c64_atn as u8) << 7
     }
 
+    /// VIA1 port A input pins: nothing connected on the 1541; on the 1571
+    /// BYTE READY and the track 0 sensor (the other inputs read 0).
+    fn via1_pa_pins(&self) -> u8 {
+        match self.model {
+            Model::Mos1541 => 0xFF,
+            Model::Mos1571 => {
+                (if self.mech.byte_ready_level { 0 } else { 0x80 }) | (self.mech.half_track != 2) as u8
+            }
+        }
+    }
+
+    /// CIA port A and B: nothing connected (the parallel cable is not
+    /// emulated): inputs read 1.
+    fn cia_read(&mut self, reg: u8) -> u8 {
+        match reg & 0x0F {
+            0x0 => {
+                let ddr = self.cia.regs[2];
+                (self.cia.regs[0] & ddr) | !ddr
+            }
+            r => self.cia.read_mut(r),
+        }
+    }
+
+    fn cia_peek(&self, reg: u8) -> u8 {
+        match reg & 0x0F {
+            0x0 => {
+                let ddr = self.cia.regs[2];
+                (self.cia.regs[0] & ddr) | !ddr
+            }
+            r => self.cia.read(r),
+        }
+    }
+
     fn io_read(&mut self, addr: u16) -> u8 {
         let reg = (addr & 0x0F) as u8;
         if addr & 0x1C00 == 0x1800 {
+            if self.model == Model::Mos1571 && (reg == 0x1 || reg == 0xF) {
+                self.mech.rotate_to(self.clk);
+            }
             let pins = self.iec_pins();
-            return self.via1.read(reg, 0xFF, pins);
+            let pa = self.via1_pa_pins();
+            return self.via1.read(reg, pa, pins);
         }
         // The disk data is sampled towards the end of the cycle
         let clk = self.clk;
@@ -536,6 +701,9 @@ impl DriveBus {
             }
             _ => {}
         }
+        if matches!(reg, 0x0 | 0x1 | 0xF) {
+            self.mech.byte_ready_level = false;
+        }
         let wp = if reg == 0 { self.mech.write_protect_bit(clk) } else { self.mech.peek_write_protect_bit() };
         let pb = self.mech.sync_bit() | wp | 0x6F;
         self.via2.read(reg, self.mech.gcr_read, pb)
@@ -543,26 +711,79 @@ impl DriveBus {
 
     /// Read without side effects (debugger).
     pub fn peek(&self, addr: u16) -> u8 {
-        match addr {
-            0x0000..=0x07FF => self.ram[addr as usize],
-            0x1800..=0x1BFF => self.via1.peek((addr & 0xF) as u8, 0xFF, self.iec_pins()),
-            0x1C00..=0x1FFF => {
+        match self.decode(addr) {
+            Area::Ram(a) => self.ram[a],
+            Area::Rom(a) => self.rom[a],
+            Area::Via1 => self.via1.peek((addr & 0xF) as u8, self.via1_pa_pins(), self.iec_pins()),
+            Area::Via2 => {
                 let pb = self.mech.sync_bit() | self.mech.peek_write_protect_bit() | 0x6F;
                 self.via2.peek((addr & 0xF) as u8, self.mech.gcr_read, pb)
             }
-            0x8000..=0xFFFF => self.rom[addr as usize & 0x3FFF],
-            _ => self.last_data,
+            Area::Wd => self.wd.peek(addr as u8),
+            Area::Cia => self.cia_peek(addr as u8),
+            Area::Open => self.last_data,
         }
     }
+
+    /// What answers at `addr`.
+    fn decode(&self, addr: u16) -> Area {
+        if addr >= 0x8000 {
+            return Area::Rom(addr as usize & (self.rom.len() - 1));
+        }
+        match self.model {
+            Model::Mos1541 => match addr & 0x1FFF {
+                0x0000..=0x07FF => Area::Ram(addr as usize & 0x7FF),
+                0x1800..=0x1BFF => Area::Via1,
+                0x1C00..=0x1FFF => Area::Via2,
+                _ => Area::Open,
+            },
+            Model::Mos1571 => match addr {
+                0x0000..=0x0FFF => Area::Ram(addr as usize & 0x7FF),
+                0x1800..=0x1BFF => Area::Via1,
+                0x1C00..=0x1FFF => Area::Via2,
+                0x2000..=0x2FFF => Area::Wd,
+                0x4000..=0x7FFF => Area::Cia,
+                _ => Area::Open,
+            },
+        }
+    }
+
+    /// VIA1 write on a 1571: port A changes switch the clock and the head,
+    /// from the next cycle (as the VIA2 outputs).
+    fn via1_pa_written(&mut self) {
+        let pa = self.via1.pa_out();
+        let old = std::mem::replace(&mut self.via1_pa, pa);
+        let clk = self.clk + 1;
+        if (old ^ pa) & 0x20 != 0 {
+            self.mech.set_fast(pa & 0x20 != 0, clk);
+        }
+        if (old ^ pa) & 0x04 != 0 {
+            self.mech.set_side((pa >> 2) & 1, clk);
+        }
+        // Bit 1, the direction of the fast serial bus: only a C128 uses it
+    }
+}
+
+/// Areas of the drive's memory map.
+enum Area {
+    Ram(usize),
+    Rom(usize),
+    Via1,
+    Via2,
+    Wd,
+    Cia,
+    Open,
 }
 
 impl CpuBus for DriveBus {
     fn read(&mut self, addr: u16) -> u8 {
-        let v = match addr {
-            0x0000..=0x07FF => self.ram[addr as usize],
-            0x1800..=0x1FFF => self.io_read(addr),
-            0x8000..=0xFFFF => self.rom[addr as usize & 0x3FFF],
-            _ => self.last_data,
+        let v = match self.decode(addr) {
+            Area::Ram(a) => self.ram[a],
+            Area::Rom(a) => self.rom[a],
+            Area::Via1 | Area::Via2 => self.io_read(addr & 0x1FFF),
+            Area::Wd => self.wd.read(addr as u8, self.clk),
+            Area::Cia => self.cia_read(addr as u8),
+            Area::Open => self.last_data,
         };
         self.last_data = v;
         v
@@ -570,16 +791,23 @@ impl CpuBus for DriveBus {
 
     fn write(&mut self, addr: u16, v: u8) {
         self.last_data = v;
-        match addr {
-            0x0000..=0x07FF => self.ram[addr as usize] = v,
-            0x1800..=0x1BFF => {
+        match self.decode(addr) {
+            Area::Ram(a) => self.ram[a] = v,
+            Area::Rom(_) | Area::Open => {}
+            Area::Wd => self.wd.write(addr as u8, v, self.clk),
+            Area::Cia => self.cia.write(addr as u8 & 0x0F, v),
+            Area::Via1 => {
+                let reg = (addr & 0xF) as u8;
                 let pulls = self.via1.pb_out() & 0x1A;
-                self.via1.write((addr & 0xF) as u8, v);
+                self.via1.write(reg, v);
                 if self.via1.pb_out() & 0x1A != pulls {
                     self.activity += 1;
                 }
+                if self.model == Model::Mos1571 && matches!(reg, 0x1 | 0x3 | 0xF) {
+                    self.via1_pa_written();
+                }
             }
-            0x1C00..=0x1FFF => {
+            Area::Via2 => {
                 let reg = (addr & 0xF) as u8;
                 // VIA outputs change at the end of the cycle: motor, head and
                 // mode act on the disk from the next cycle (as in VICE)
@@ -595,8 +823,11 @@ impl CpuBus for DriveBus {
                     0xC => self.mech.control_written(&self.via2, clk),
                     _ => {}
                 }
+                // After the disk has turned (VICE's store_pra, store_prb)
+                if matches!(reg, 0x0..=0x3 | 0xF) {
+                    self.mech.byte_ready_level = false;
+                }
             }
-            _ => {}
         }
     }
 
@@ -633,19 +864,27 @@ impl Drive {
         self.c64_hz = c64_hz as u32;
     }
 
-    /// Drive with the DOS ROM (16 KB) and number `device` (8-11).
-    pub fn new(rom: &[u8], device: u8) -> Result<Drive, String> {
-        if rom.len() != 0x4000 {
-            return Err(format!("1541 ROM of {} bytes, expected 16384", rom.len()));
+    /// Drive `model` with its DOS ROM (16 KB for the 1541, 32 KB for the
+    /// 1571) and number `device` (8-11).
+    pub fn new(model: Model, rom: &[u8], device: u8) -> Result<Drive, String> {
+        if rom.len() != model.rom_size() {
+            return Err(format!("{} ROM of {} bytes, expected {}", model.name(), rom.len(), model.rom_size()));
         }
+        let mut cia = CiaState::new();
+        // As VICE sets the 1571's CIA: 1 MHz, 50 Hz at the TOD input
+        cia.set_tod_input(DRIVE_HZ as u64, 50);
         let mut d = Drive {
             cpu: Cpu::new(),
             bus: DriveBus {
+                model,
                 ram: [0; 0x800],
                 rom: rom.to_vec(),
                 via1: Via::new(),
                 via2: Via::new(),
                 mech: Mechanics::default(),
+                cia,
+                wd: Wd1770::default(),
+                via1_pa: 0,
                 last_data: 0,
                 c64_atn: false,
                 c64_clk: false,
@@ -662,10 +901,21 @@ impl Drive {
         Ok(d)
     }
 
-    /// Reset (the C64 reset button also reaches the drive).
+    /// Drive model.
+    pub fn model(&self) -> Model {
+        self.bus.model
+    }
+
+    /// Reset (the C64 reset button also reaches the drive). The 1571 keeps
+    /// its clock and head until the DOS changes them, as in VICE, where the
+    /// WD1770 is not reset either.
     pub fn reset(&mut self) {
         self.bus.via1.reset();
         self.bus.via2.reset();
+        self.bus.via1_pa = 0;
+        if self.bus.model == Model::Mos1571 {
+            self.bus.cia.reset();
+        }
         let m = &mut self.bus.mech;
         // VIA2 CA2 and CB2 go back high: read, BYTE READY enabled
         m.motor = false;
@@ -709,7 +959,7 @@ impl Drive {
     /// 0.6 to 1.25 cycles.
     #[inline]
     pub fn run_c64_cycle(&mut self, atn: bool, clk: bool, data: bool) {
-        self.frac += DRIVE_HZ as i32;
+        self.frac += (DRIVE_HZ << self.bus.mech.fast as u32) as i32;
         while self.frac > 0 {
             self.frac -= self.c64_hz as i32;
             self.cycle();
@@ -737,11 +987,12 @@ impl Drive {
         let b = &mut self.bus;
         b.via1.tick();
         b.via2.tick();
+        let cia_irq = b.model == Model::Mos1571 && b.cia.tick(1);
         if b.mech.force_v {
             b.mech.force_v = false;
             self.cpu.set_overflow();
         }
-        let irq = b.via1.irq() || b.via2.irq();
+        let irq = b.via1.irq() || b.via2.irq() || cia_irq;
         b.clk += 1;
         self.cpu.sample_lines(irq, false, false);
     }
@@ -763,7 +1014,12 @@ impl Drive {
     pub fn describe(&self) -> String {
         let m = &self.bus.mech;
         let (v1, v2) = (&self.bus.via1, &self.bus.via2);
-        format!(
+        let model = match self.bus.model {
+            Model::Mos1541 => String::new(),
+            Model::Mos1571 => format!("  side {}  {} MHz  BYTE READY level {}  WD1770 status ${:02X}  CIA ICR ${:02X}\n",
+                m.side, 1 + m.fast as u8, m.byte_ready_level as u8, self.bus.wd.peek(0), self.bus.cia.icr_flags as u8),
+        };
+        model + &format!(
             "  track {}{} (half {})  head bit {}  motor {}  LED {}  density {}  {}  BYTE READY {}  disk {}\n  \
              VIA1 PB ${:02X} DDRB ${:02X} IFR ${:02X} IER ${:02X}  VIA2 PB ${:02X} DDRB ${:02X} PCR ${:02X} IFR ${:02X} IER ${:02X}  last byte ${:02X}\n  \
              activity {} (disk bytes and serial bus changes)  queued DOS job {}\n",
@@ -782,27 +1038,29 @@ impl Drive {
 // The disk is part of the state: the drive may have written it. The ROM too,
 // to reload the state on a C64 without a drive.
 impl_state!(Mechanics {
-    disk, half_track, head_bit, motor, led, zone, read_mode, soe, accum, shift, write_shift,
+    disk, half_track, side, fast, head_bit, motor, led, zone, read_mode, soe, accum, shift, write_shift,
     bit_counter, ue7, uf4, fr_randcount, filter_counter, filter_state, filter_last, so_delay,
-    cycle_index, xorshift, gcr_read, gcr_write, so_edge, force_v, last_clk, ref_advance, req_ref,
-    attach_clk, detach_clk, attach_detach_clk,
+    cycle_index, xorshift, gcr_read, gcr_write, so_edge, byte_ready_level, force_v, last_clk,
+    ref_advance, req_ref, attach_clk, detach_clk, attach_detach_clk,
 });
 
 impl_state!(DriveBus {
-    ram, rom, via1, via2, mech, last_data, c64_atn, c64_clk, c64_data, device, clk,
+    model, ram, rom, via1, via2, mech, cia, wd, via1_pa, last_data, c64_atn, c64_clk, c64_data, device,
+    clk,
 } skip { activity });
 
 impl_state!(Drive { cpu, bus, frac } skip { trace, c64_hz });
 
 impl Default for Drive {
     fn default() -> Self {
-        Drive::new(&[0; 0x4000], 8).unwrap()
+        Drive::new(Model::Mos1541, &[0; 0x4000], 8).unwrap()
     }
 }
 
 /// Disk tracks in the state (the disk changes during use).
 impl State for Disk {
     fn save(&self, w: &mut Writer) {
+        (self.sides() as u8).save(w);
         for t in &self.tracks {
             match t {
                 None => false.save(w),
@@ -820,7 +1078,9 @@ impl State for Disk {
     }
 
     fn load(&mut self, r: &mut Reader) -> StateResult<()> {
-        self.tracks = vec![None; HALF_TRACKS];
+        let mut sides = 0u8;
+        sides.load(r)?;
+        self.tracks = vec![None; HALF_TRACKS * sides.clamp(1, 2) as usize];
         for t in self.tracks.iter_mut() {
             let mut some = false;
             some.load(r)?;

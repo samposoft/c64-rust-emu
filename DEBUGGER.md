@@ -13,11 +13,11 @@ printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 ./target/release/c64dbg                       # interactive: license notice, then the dbg> prompt
 ```
 
-Options: `[file.prg|.d64|.g64|.tap|.t64|.crt] [more .tap/.t64/.d64/.g64...]` (with
+Options: `[file.prg|.d64|.g64|.d71|.g71|.tap|.t64|.crt] [more .tap/.t64/.d64/.g64/.d71/.g71...]` (with
 several files the first is loaded, `swap` moves to the next ones), `--version`, `--ntsc` (an NTSC C64 instead of PAL), `--vic CHIP` (the VIC-II and its standard: 6569, 6569r1, 8565, 6567, 6567r56a, 8562, 6572; see README.md), `--c64c` (8565 or 8562, 8580, 6526A), `--cia 6526|6526a`, `--roms DIR`, `-x script`, `-e "cmd; cmd"`
 (repeatable), `--no-stdin`, `--window`, `--audio`, `--reu KB` (REU from 128 to
 16384 KB), `--eth rrnet|tfe[@ADDR]` (Ethernet cartridge on the virtual network, see
-README.md), `--eth-forward HOST:C64` (a host TCP port forwarded to the C64), `--no-drive` (no 1541 drive: D64s through the KERNAL trap),
+README.md), `--eth-forward HOST:C64` (a host TCP port forwarded to the C64), `--drive8 1541|1571|none`, `--drive9 1541|1571` (a second drive, unit 9), `--disk9 FILE` (its disk), `--no-drive` (no drive 8: D64s through the KERNAL trap),
 `--sid 6581|8580|8580d` (SID model, default 6581; `8580d` is the 8580 with
 digiboost), `--sid2 ADDR` (second SID, e.g. `d420` or `de00`), `--tape-sound` (tape sound),
 `--tape-azimuth CYCLES` (Datasette azimuth error), `--port1 DEV`/`--port2 DEV`
@@ -93,10 +93,11 @@ decimal.
 | `tape azimuth [cycles \| off]` | azimuth error: each distance between pulses shifts randomly by up to that many cycles (0.001-10), with the remainder carried over to the next one; off by default. In VICE 3.10 `-dstapeerror` is broken (a negative error becomes +4.3 million cycles): here it keeps its sign |
 | `tape sound [on [volume] \| off]` | tape sound in PLAY: one period of square wave per pulse, mixed with the SIDs (volume 1-4096, default 1024 as in VICE); off by default. It is heard when audio is on: `--audio` at real speed (not during the `speed auto` turbo) or `audio file.wav` |
 | `tape wobble [off \| % Hz]` | tape speed wobble: default ±0.5% at 3 Hz as in VICE (`-dstapewobbleamp`, `-dstapewobblefreq`); the phase advances at every pulse by a step proportional to the tape length, as in VICE |
-| `drive [mem a [b]]` | 1541 drive: CPU, track and head position, motor, VIA, serial bus, activity counter and queued DOS job (the load turbo's signals); `mem` reads the drive's memory |
-| `drive insert file` | inserts a D64/G64 in the drive without autoloading it |
-| `drive g64 file` | saves the disk in the drive as a G64 image |
-| `drive trace on file`, `drive trace off` | logs every drive instruction (`.8:pc`, registers, drive cycle) |
+| `drive [8\|9] [mem a [b]]` | drive 8 (the default) or 9: model, CPU, track and head position, motor, VIAs (on a 1571 also side, clock, BYTE READY level, WD1770 and CIA), serial bus, activity counter and queued DOS job (the load turbo's signals); `mem` reads the drive's memory |
+| `drive [8\|9] insert file` | inserts a D64/G64 (D71/G71 in a 1571) in the drive without autoloading it |
+| `drive [8\|9] g64 file` | saves the disk in the drive as a G64 image (G71 for a double-sided disk) |
+| `drive [8\|9] 1541\|1571\|off` | attaches a 1541 or a 1571 as that unit, empty and starting from its reset (the ROM from the ROM directory), or removes it |
+| `drive [8\|9] trace on file`, `drive [8\|9] trace off` | logs every drive instruction (`.8:pc`, registers, drive cycle) |
 | `reu [KB\|off]` | REU registers; with a size it attaches it (RAM as at power-on), `off` removes it |
 | `eth [rrnet\|tfe[@addr]\|off]` | Ethernet cartridge (CS8900A): mapping, MAC address set by the program, transmitter and receiver, frame counters, and the virtual network (the C64's address, TCP connections with their host socket and bytes carried, UDP ports, pings, DNS and DHCP counters); `rrnet` or `tfe` attaches it (at `$DE00` or `addr`), `off` removes it; with a Retro Replay inserted, the RR-Net at `$DE00` answers only while its clock port is enabled |
 | `eth forward HOSTPORT C64PORT` | forwards TCP port HOSTPORT of the host (127.0.0.1 only) to port C64PORT of the C64, for a server running on it |

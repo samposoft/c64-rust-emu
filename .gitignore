@@ -5,3 +5,4 @@ roms/
 prg/
 *.sav
 __pycache__/
+tests/drive/disk.g71

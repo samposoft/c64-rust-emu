@@ -2,7 +2,7 @@
 // Copyright (C) 2026 SampoSoft - Francesco Sampoli
 
 //! Frontend status bar, like VICE's: Datasette (clickable buttons,
-//! counter, motor), 1541 drive (LED, track, motor), joysticks, paddles
+//! counter, motor), drives 8 and 9 (LED, track, motor), joysticks, paddles
 //! and mouse,
 //! configuration, speed, inserted media and the last message.
 //!
@@ -34,11 +34,13 @@ pub struct Status {
     pub tape_name: String,
     /// Recordings not yet written to the file.
     pub tape_changed: bool,
-    /// Emulated 1541 drive (None: disks through the KERNAL trap).
-    pub drive: Option<DriveStatus>,
-    pub disk_name: String,
+    /// Emulated drives 8 and 9 (drive 8 None: disks through the KERNAL
+    /// trap).
+    pub drives: [Option<DriveStatus>; crate::drive::UNITS],
+    /// Disk of each drive.
+    pub disk_names: [String; crate::drive::UNITS],
     /// Drive writes not yet saved to the disk file.
-    pub disk_changed: bool,
+    pub disk_changed: [bool; crate::drive::UNITS],
     pub cart_name: String,
     /// SID, REU: one word each.
     pub config: String,
@@ -75,6 +77,8 @@ pub struct Status {
 pub struct DriveStatus {
     pub led: bool,
     pub motor: bool,
+    /// Half-track under the head, counted on both sides as in a D71: side
+    /// 1 of a 1571 starts at track 36.
     pub half_track: usize,
     pub disk: bool,
 }
@@ -84,15 +88,20 @@ impl Status {
     /// reminders are filled in by the frontend.
     pub fn of(c64: &C64) -> Status {
         let tape = &c64.bus.tape;
-        let drive = c64.bus.drive.as_ref().map(|d| DriveStatus {
+        let drives = c64.bus.drives.each_ref().map(|d| d.as_ref().map(|d| DriveStatus {
             led: d.bus.mech.led,
             motor: d.bus.mech.motor,
-            half_track: d.bus.mech.half_track,
+            half_track: d.bus.mech.half_track + d.bus.mech.side as usize * 70,
             disk: d.bus.mech.disk.is_some(),
+        }));
+        let disk_changed = c64.bus.drives.each_ref()
+            .map(|d| d.as_ref().and_then(|d| d.bus.mech.disk.as_ref()).is_some_and(|d| d.dirty));
+        let disk_names = std::array::from_fn(|i| {
+            let unit = crate::drive::FIRST_UNIT + i as u8;
+            // Without drive 8 the trap's disk
+            let shown = if i == 0 { drives[0].is_none_or(|d| d.disk) } else { drives[i].is_some_and(|d| d.disk) };
+            if shown { file_name(c64.disk_path(unit)) } else { String::new() }
         });
-        let disk_changed = c64.bus.drive.as_ref()
-            .and_then(|d| d.bus.mech.disk.as_ref())
-            .is_some_and(|d| d.dirty);
         let sid = &c64.bus.sid;
         let mut config = if sid.digiboost() { "8580D".to_string() } else { sid.model().name().to_string() };
         if c64.bus.sid2.is_some() {
@@ -119,8 +128,8 @@ impl Status {
             tape_counter: tape.counter(),
             tape_name: file_name(c64.tape_path()),
             tape_changed: tape.image.as_ref().is_some_and(|t| t.changed),
-            drive,
-            disk_name: if drive.is_none_or(|d| d.disk) { file_name(c64.disk_path()) } else { String::new() },
+            drives,
+            disk_names,
             disk_changed,
             cart_name: c64.bus.cart.as_ref().map_or(String::new(), |c| c.name.trim().to_string()),
             config,
@@ -155,8 +164,10 @@ impl Status {
             };
             parts.push(format!("{icon} {:03}{}", self.tape_counter, if self.tape_motor { " ⟳" } else { "" }));
         }
-        if let Some(d) = self.drive {
-            parts.push(format!("8:{} {}", if d.led { "●" } else { "○" }, track(d.half_track)));
+        for (i, d) in self.drives.iter().enumerate() {
+            if let Some(d) = d {
+                parts.push(format!("{}:{} {}", 8 + i, if d.led { "●" } else { "○" }, track(d.half_track)));
+            }
         }
         parts.push(match self.keyboard_port {
             JoyPort::One => "J1".into(),
@@ -194,8 +205,13 @@ impl Status {
         if !self.tape_name.is_empty() {
             items.push(('T', format!("{}{}", self.tape_name, if self.tape_changed { "*" } else { "" })));
         }
-        if !self.disk_name.is_empty() {
-            items.push(('D', format!("{}{}", self.disk_name, if self.disk_changed { "*" } else { "" })));
+        // With drive 9 the disks are labelled with their unit
+        let two = self.drives[1].is_some();
+        for (i, name) in self.disk_names.iter().enumerate() {
+            if !name.is_empty() {
+                let label = if two { (b'8' + i as u8) as char } else { 'D' };
+                items.push((label, format!("{name}{}", if self.disk_changed[i] { "*" } else { "" })));
+            }
         }
         if !self.cart_name.is_empty() {
             items.push(('C', self.cart_name.clone()));
@@ -422,14 +438,30 @@ impl Bar {
     }
 
     fn render_drive(&mut self, s: &Status) {
-        let Some(d) = s.drive else {
+        if s.drives[1].is_some() {
+            // Two drives: number, LED and track of each, the track green
+            // while the motor turns
+            for (i, d) in s.drives.iter().enumerate() {
+                let x = DRIVE_X - 3 + i * 33;
+                let Some(d) = d else {
+                    self.text(x, ROW1 + 1, "8", DIM, (0, WIDTH));
+                    continue;
+                };
+                self.text(x, ROW1 + 1, if i == 0 { "8" } else { "9" }, TEXT, (0, WIDTH));
+                self.rect(x + 8, ROW1 + 3, 5, 4, if d.led { LED_ON } else { LED_OFF });
+                let color = if d.motor { GREEN } else if d.disk { TEXT } else { DIM };
+                self.text(x + 15, ROW1 + 1, &format!("{:02}", d.half_track / 2), color, (0, WIDTH));
+            }
+            return;
+        }
+        let Some(d) = s.drives[0] else {
             self.text(DRIVE_X, ROW1 + 1, "8", DIM, (0, WIDTH));
             self.text(DRIVE_X + 18, ROW1 + 1, "trap", DIM, (0, WIDTH));
             return;
         };
         self.text(DRIVE_X, ROW1 + 1, "8", TEXT, (0, WIDTH));
-        // Red drive LED, as on the 1541: lit during accesses, blinking on
-        // errors (the DOS does that)
+        // Red drive LED, as on the 1541 and 1571: lit during accesses,
+        // blinking on errors (the DOS does that)
         self.rect(DRIVE_X + 9, ROW1 + 3, 6, 4, if d.led { LED_ON } else { LED_OFF });
         let t = track(d.half_track);
         self.text(DRIVE_X + 18, ROW1 + 1, &t, if d.disk { TEXT } else { DIM }, (0, WIDTH));

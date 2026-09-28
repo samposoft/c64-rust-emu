@@ -1,9 +1,9 @@
 # c64
 
 Commodore 64 emulator in Rust: PAL or NTSC machine, 6510 CPU with illegal
-opcodes, cycle-exact VIC-II, SID, CIA, 1541 drive, Datasette, REU,
-keyboard, joystick, paddles, 1351 mouse, Ethernet (RR-Net, TFE) on a
-built-in virtual network, PRG/D64/G64/TAP/T64/CRT.
+opcodes, cycle-exact VIC-II, SID, CIA, 1541 and 1571 drives (units 8 and
+9), Datasette, REU, keyboard, joystick, paddles, 1351 mouse, Ethernet
+(RR-Net, TFE) on a built-in virtual network, PRG/D64/G64/D71/G71/TAP/T64/CRT.
 The frontend uses only pure Rust crates (`winit`, `wgpu`, `softbuffer`,
 `cpal`, `gilrs`): no external libraries to install, a single executable on
 macOS, Linux and Windows. The window is drawn on the GPU, which also
@@ -16,6 +16,8 @@ emulates Commodore monitors and a home TV (`--crt 1084s`, `1084s-d1`,
 cargo build --release
 ./target/release/c64 prg/game.d64                          # GUI
 ./target/release/c64 prg/game.tap                          # from tape
+./target/release/c64 prg/disk.d71                          # double-sided disk: drive 8 becomes a 1571
+./target/release/c64 --disk9 prg/data.d64 prg/game.d64     # a second drive, unit 9, with its disk
 ./target/release/c64 side_a.tap side_b.tap                 # several media: F8 switches to the next one
 ./target/release/c64 new.tap                               # blank tape (file does not exist) for SAVE
 ./target/release/c64 --no-turbo --tape-sound prg/game.tap  # with the tape sound
@@ -47,8 +49,12 @@ The ROMs `kernal.rom`, `basic.rom`, `chargen.rom` are needed in the `roms/`
 directory (next to the executable or in a directory above it, as the
 project's for `target/release`, otherwise in the current directory), plus
 `dos1541.rom` (16 KB; VICE's names `1541.rom` and
-`dos1541-325302-01+901229-05.bin` also work) for the 1541 drive. Without the
-drive ROM, or with `--no-drive`, D64s are loaded through the KERNAL trap.
+`dos1541-325302-01+901229-05.bin` also work) for the 1541 drive and
+`dos1571.rom` (32 KB; also `1571.rom`, `dos1571-310654-05.bin`) for the
+1571. Without the drive ROM, or with `--no-drive`, D64s are loaded through
+the KERNAL trap. `--drive8 1541|1571|none` chooses drive 8, `--drive9
+1541|1571` adds drive 9 and `--disk9 FILE` puts a disk in it (and the
+drive, of the same model as drive 8, if missing).
 
 While the drive is loading, the emulator runs at maximum speed (turbo, about
 10 times real time, without audio; the window title and the status bar show
@@ -587,9 +593,11 @@ fullscreen):
 - first row: the five Datasette buttons in the Datasette's order (the
   pressed one is highlighted, and they can be clicked), the 000-999 counter
   (a click resets it) and the reel, which turns while the tape moves and is
-  green with the motor on; then drive 8 with the 1541's red LED (on during
+  green with the motor on; then drive 8 with the drive's red LED (on during
   accesses, blinking on errors), the track under the head (`18.5` for half
-  tracks) and the disk spinning with the motor; the two joystick ports with
+  tracks; on the second side of a 1571 from `36.0`, as in a D71) and the
+  disk spinning with the motor; with drive 9 both drives, each with number,
+  LED and track, green while the motor turns; the two joystick ports with
   the directions and fire pressed (the number in white is the port driven by
   the keyboard), or the paddle and mouse icons with their buttons (the
   mouse is lit while the host mouse is captured), and the gamepad icon if
@@ -838,7 +846,7 @@ state, or a reset, closes them, as unplugging the cable would. The debugger's
 `eth` command shows the chip, the frame counters and every connection with
 its host socket and the bytes carried.
 
-### 1541 drive
+### Drives (1541, 1571)
 
 The 1541 is emulated as hardware: its 6502 CPU (with decimal mode and the
 SO pin connected to BYTE READY), the two 6522 VIAs cycle by cycle, the
@@ -857,11 +865,34 @@ D64s (converted to GCR as VICE does, including error bytes and tracks
 loaded. Opening a D64 or G64 starts `LOAD"*",8,1` and then `RUN`; in the
 debugger `drive insert` changes the disk without autoloading. What the drive
 writes (SAVE, formatting, game saves) goes back into the file on exit: a D64
-with the sectors decoded from GCR, a G64 track by track.
+with the sectors decoded from GCR, a G64 track by track. As in VICE, a
+phase change of the stepper motor written together with the motor start
+moves the head twice.
+
+The 1571 is the same hardware with a 32 KB ROM, a second head for the other
+side of the disk, a 2 MHz mode (the disk turns at the same speed: the read
+circuit counts 8 reference cycles per drive cycle instead of 16), BYTE READY
+also as a level on VIA1 PA7 (the 1571 DOS polls it instead of the SO pin),
+the track 0 sensor, a 6526 CIA for the fast serial bus and a WD1770
+controller for MFM disks, ported from VICE. On a C64 it starts in 1541 mode;
+`OPEN15,8,15,"U0>M1"` switches it to the double-sided mode. D71s and G71s
+(double-sided: tracks 36-70 of a D71 are tracks 1-35 of the second side)
+need a 1571: opening one turns drive 8 into a 1571 by itself. A D64 or G64
+in a 1571 has no second side.
+
+A second drive, unit 9 (1541 or 1571, `--drive9`, `--disk9`, or `drive 9
+1541` in the debugger), shares the serial bus: each drive sees the lines of
+the C64 and of the other drive. `LOAD"$",9` and copies between the drives
+work as on the real bus.
 
 The check against VICE uses programs that run code in the drive and a shared G64 disk: timed GCR reads, SYNC and BYTE READY
 read at the cycle, and a fast 2-bit transfer taken from IFFL give the same
-bytes as VICE.
+bytes as VICE. On the 1571 (with a double-sided test disk) GCR reads at 2
+and 1 MHz on both sides, with BYTE READY on SO and as a level, the CIA's
+timer and interrupts, the WD1770's registers and commands and the memory
+map give the same bytes as VICE; with a 1541 as unit 8 and a 1571 as unit
+9, the status messages of both, a file loaded from the second side in the
+double-sided mode and the directory match VICE too.
 
 ### Tape
 
@@ -963,8 +994,10 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
   the virtual network carries IPv4 TCP, UDP and ping, no IPv6, and the C64
   is not visible on the host's LAN (no bridging): incoming connections only
   through `--eth-forward`.
-- Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
-  expansions; NIB/P64 images not supported.
+- Drives: at most two (units 8 and 9), no 1581, parallel cables or drive
+  RAM expansions; NIB/P64 images not supported. The 1571's fast serial bus
+  needs a C128 and the burst modifications for the C64 are not emulated;
+  the WD1770 has no MFM disk to read (as in VICE with D71s and G71s).
 - Monitor and TV: no 1701/1702 PAL (their PAL schematics are not
   available) and no 1802 (its manual gives neither tube nor pitch); the
   peaking of the PAL 1084S and of the 1901's video output stage is not
@@ -989,7 +1022,8 @@ but WITHOUT ANY WARRANTY. `--version` prints version, copyright and license;
 a short notice is printed at startup on the terminal the program is started
 from, as VICE does, and before the `c64dbg` prompt.
 
-The VIC-II, the SID, the Datasette and the 1541 disk rotation are ports of
+The VIC-II, the SID, the Datasette, the drives' disk rotation and the
+1571's WD1770 are ports of
 [VICE](https://vice-emu.sourceforge.io/) 3.10 and of reSID by Dag Lem, both
 under the same license: see `CREDITS.md` for authors and files. The C64 and
-1541 ROMs are copyrighted by Commodore and are not included.
+drive ROMs are copyrighted by Commodore and are not included.

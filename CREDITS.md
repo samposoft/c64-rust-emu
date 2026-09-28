@@ -28,7 +28,8 @@ are compared with it cycle by cycle by regression tests.
 | `src/tape.rs` (Datasette, TAP, T64 and its KERNAL tape traps) | `src/datasette/datasette.c`, `src/tape/tap.c`, `src/tape/t64.c`, `src/tape/tape.c` | Andreas Boose, Andreas Matthies, Marco van den Heuvel, David Hansel, Ettore Perazzoli, Compyx, Jouko Valta |
 | `src/random.rs` (PCG random generator: power-on RAM, tape azimuth error) | `src/lib.c` | Andreas Boose, Marco van den Heuvel |
 | `src/mem/power_on.rs` (RAM pattern and color RAM at power-on) | `src/ram.c`, `src/vicii-colorram.h` (color RAM measured by William McCabe) | Andreas Matthies, Marco van den Heuvel |
-| `src/drive/mod.rs` (1541 disk rotation and read/write circuit) | `src/drive/rotation.c` | Andreas Boose, Istvan Fabian, Benjamin 'BeRo' Rosseaux, Peter Rittwage |
+| `src/drive/mod.rs` (1541 and 1571 disk rotation and read/write circuit) | `src/drive/rotation.c` | Andreas Boose, Istvan Fabian, Benjamin 'BeRo' Rosseaux, Peter Rittwage |
+| `src/drive/wd1770.rs` (WD1770 controller of the 1571 and its floppy) | `src/drive/iec/wd1770.c`, `src/drive/iec/fdd.c` | Kajtar Zsolt |
 | `src/sid/mod.rs` (`audio_mix`, mono mix of two SIDs) | `src/sound.c` (`sound_audio_mix`) | Teemu Rantanen, Marco van den Heuvel, Ettore Perazzoli |
 | `src/net/cs8900.rs` (CS8900A Ethernet controller: PacketPage, transmit and receive, address filter) | `src/core/cs8900.c` | Spiro Trikaliotis, Christian Vogelgsang |
 
@@ -42,7 +43,8 @@ their comments and checked against VICE by the tests:
 | `src/timing.rs` (PAL and NTSC clocks, raster and mains frequency) | `src/c64/c64.h`, `src/c64/c64.c` (`machine_change_timing`) | the VICE Team |
 | `src/cia/mod.rs` (CIA 6526 timers and interrupts; written from the description, not copied) | `src/core/ciacore.c`, `src/core/ciatimer.c` | Andre Fachat, Ettore Perazzoli, Andreas Boose, Alexander Bluhm, Olaf Seibert |
 | `src/drive/via.rs` (VIA 6522 of the 1541) | `src/core/viacore.c` | Andre Fachat, Andreas Boose, Olaf Seibert |
-| `src/drive/gcr.rs` (D64 to GCR tracks) | `src/gcr.c`, `src/diskimage/fsimage-gcr.c` | Andreas Boose, Daniel Sladic, Kajtar Zsolt |
+| `src/drive/mod.rs` (stepper motor, including the extra step at motor start; 1571 memory map, VIA1 port A, side and clock switch) | `src/drive/iecieee/via2d.c`, `src/drive/iec/memiec.c`, `src/drive/iec/via1d1541.c`, `src/drive/iec/glue1571.c`, `src/drive/drivesync.c` | Andreas Boose, Ettore Perazzoli, Daniel Sladic, Andre Fachat |
+| `src/drive/gcr.rs` (D64 and D71 to GCR tracks, G64 and G71) | `src/gcr.c`, `src/diskimage/fsimage-gcr.c`, `src/diskimage/fsimage-dxx.c` | Andreas Boose, Daniel Sladic, Kajtar Zsolt |
 | `src/mem/mod.rs`, `src/keyboard.rs` (CIA1 ports: keyboard matrix solver, ghost keys, backwards scanning) | `src/c64/c64cia1.c` | Andre Fachat, Ettore Perazzoli, Andreas Boose, Marco van den Heuvel |
 | `src/mem/mod.rs` (processor port $00/$01: pin values, bits 6-7 fall-off) | `src/c64/c64pla.c`, `src/c64/c64memsc.c` | Andreas Boose, Ettore Perazzoli, Marco van den Heuvel |
 | `src/ctrlport.rs` (1351 mouse reading and movement limit, POT port selection) | `src/joyport/mouse_1351.c`, `src/joyport/mouse.c`, `src/joyport/joyport.c` | Marco van den Heuvel, Andreas Boose, Hannu Nuotio |

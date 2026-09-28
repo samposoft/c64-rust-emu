@@ -34,8 +34,15 @@ pub struct MachineOptions {
     pub eth: Option<(crate::net::EthMode, u16)>,
     /// TCP port forwards to the C64: (host port, C64 port) (`--eth-forward`).
     pub eth_forwards: Vec<(u16, u16)>,
-    /// No 1541 drive: D64s are loaded through the KERNAL trap.
+    /// No drive 8: D64s are loaded through the KERNAL trap (`--no-drive`,
+    /// `--drive8 none`).
     pub no_drive: bool,
+    /// Model of drive 8 (`--drive8`; a 1541 by default) and of drive 9
+    /// (`--drive9`; none by default).
+    pub drive8: Option<crate::drive::Model>,
+    pub drive9: Option<crate::drive::Model>,
+    /// Disk for drive 9 (`--disk9`), which then is attached if missing.
+    pub disk9: Option<String>,
     /// SID model and digiboost (default 6581).
     pub sid: Option<(Model, bool)>,
     /// CIA model (`--cia`; the 6526 by default).
@@ -71,7 +78,7 @@ pub struct MachineOptions {
 impl MachineOptions {
     /// Syntax of the common arguments, for usage messages.
     pub const USAGE: &'static str =
-        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--eth rrnet|tfe[@ADDR]] [--eth-forward HOST:C64] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .tap | .t64 | .crt] [more .tap/.t64/.d64/.g64...]";
+        "[--version] [--ntsc | --vic CHIP] [--c64c] [--cia 6526|6526a] [--roms DIR] [--reu KB] [--eth rrnet|tfe[@ADDR]] [--eth-forward HOST:C64] [--drive8 1541|1571|none] [--drive9 1541|1571] [--disk9 FILE] [--no-drive] [--sid 6581|8580|8580d] [--sid2 ADDR] [--tape-sound] [--tape-azimuth CYCLES] [--port1 DEV] [--port2 DEV] [--blend] [--crt SET[,...]] [--hdr] [--composite] [--rf] [--remote] [--remote-socket PATH] [file.prg | .d64 | .g64 | .d71 | .g71 | .tap | .t64 | .crt] [more .tap/.t64/.d64/.g64/.d71/.g71...]";
 
     /// Explanation of the common arguments, for `--help`.
     pub const HELP: &'static str = "  --version    print version, copyright and license
@@ -85,8 +92,9 @@ impl MachineOptions {
                --vic, --sid or --cia choose otherwise
   --cia M      CIA model: 6526 (the old one, default) or 6526a (8521, C64C: timer
                interrupts one cycle earlier)
-  --roms DIR   directory of kernal.rom, basic.rom, chargen.rom and dos1541.rom (default:
-               roms/ next to the executable or in a directory above it, else ./roms)
+  --roms DIR   directory of kernal.rom, basic.rom, chargen.rom, dos1541.rom and dos1571.rom
+               (default: roms/ next to the executable or in a directory above it, else
+               ./roms)
   --reu KB     attach a REU (128, 256, 512 ... 16384 KB)
   --eth DEV    Ethernet cartridge with the CS8900A: rrnet (RR-Net) or tfe (The Final
                Ethernet), at $DE00 or at DEV@ADDR (de00-dff0, in steps of 10); with a
@@ -96,7 +104,12 @@ impl MachineOptions {
                program: no privileges, any host connection; 10.0.2.2 is the host itself
   --eth-forward HOST:C64  with --eth, forward TCP port HOST of this machine (127.0.0.1
                only) to port C64 of the C64, for servers running on it; repeatable
-  --no-drive   no 1541 drive: D64s are loaded through the KERNAL trap
+  --drive8 M   drive 8: 1541 (default), 1571 (double-sided D71/G71 disks; opening one
+               turns drive 8 into a 1571 by itself) or none (as --no-drive)
+  --drive9 M   a second drive, unit 9: 1541 or 1571 (none by default)
+  --disk9 FILE disk (.d64, .g64, .d71, .g71) in drive 9; without --drive9 the drive is
+               of the same model as drive 8
+  --no-drive   no drive 8: D64s are loaded through the KERNAL trap
   --sid M      SID model: 6581 (default), 8580, 8580d (8580 with digiboost)
   --sid2 ADDR  second SID (stereo) at ADDR: d420-d7e0 or de00-dfe0, in steps of 20
   --tape-sound sound of the tape running in PLAY (as VICE's -datasettesound)
@@ -160,6 +173,21 @@ impl MachineOptions {
                 }
             }
             "--no-drive" => self.no_drive = true,
+            "--drive8" | "--drive9" => {
+                let value = rest.next();
+                let model = value.as_deref().and_then(crate::drive::Model::parse);
+                match (arg, value.as_deref(), model) {
+                    ("--drive8", _, Some(m)) => { self.drive8 = Some(m); self.no_drive = false; }
+                    ("--drive8", Some("none"), _) => self.no_drive = true,
+                    ("--drive9", _, Some(m)) => self.drive9 = Some(m),
+                    ("--drive9", Some("none"), _) => self.drive9 = None,
+                    _ => { eprintln!("{arg} needs the model: 1541, 1571 or none"); std::process::exit(2); }
+                }
+            }
+            "--disk9" => match rest.next() {
+                Some(f) => self.disk9 = Some(f),
+                None => { eprintln!("--disk9 needs the disk image"); std::process::exit(2); }
+            },
             "--c64c" => self.c64c = true,
             "--cia" => match rest.next().as_deref().and_then(crate::cia::Model::parse) {
                 Some(m) => self.cia = Some(m),
@@ -253,8 +281,8 @@ impl MachineOptions {
     pub fn check_media(&self) -> Result<(), String> {
         for f in self.input_files.iter().skip(1) {
             let ext = std::path::Path::new(f).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if !matches!(ext.as_str(), "tap" | "t64" | "d64" | "g64") {
-                return Err(format!("{f}: after the first file only tapes (.tap, .t64) and disks (.d64, .g64) can be given"));
+            if !matches!(ext.as_str(), "tap" | "t64" | "d64" | "g64" | "d71" | "g71") {
+                return Err(format!("{f}: after the first file only tapes (.tap, .t64) and disks (.d64, .g64, .d71, .g71) can be given"));
             }
         }
         Ok(())
@@ -300,10 +328,19 @@ impl MachineOptions {
         for (i, dev) in self.ports.iter().enumerate() {
             c64.set_control_port(i + 1, *dev);
         }
+        use crate::drive::Model as DriveModel;
         if !self.no_drive {
-            if let Err(e) = c64.attach_drive_from_dir(&roms) {
+            if let Err(e) = c64.attach_drive(8, self.drive8.unwrap_or_default(), &roms) {
                 eprintln!("WARN: {e}; D64s are loaded through the KERNAL trap");
             }
+        }
+        // A disk for drive 9 brings the drive, of the same model as drive 8
+        let default9 = if self.no_drive { DriveModel::Mos1541 } else { self.drive8.unwrap_or_default() };
+        if let Some(model) = self.drive9.or(self.disk9.as_ref().map(|_| default9)) {
+            c64.attach_drive(9, model, &roms)?;
+        }
+        if let Some(path) = &self.disk9 {
+            crate::notice!("{}", c64.insert_disk_in(9, path)?);
         }
         c64.reset();
         Ok(c64)
@@ -347,8 +384,11 @@ pub fn save_on_exit(c64: &mut C64) {
         Err(e) => eprintln!("{e}"),
     }
     match c64.save_disk_changes() {
-        Ok(Some(path)) => eprintln!("Disk changes written to {path}"),
-        Ok(None) => {}
+        Ok(saved) => {
+            for path in saved {
+                eprintln!("Disk changes written to {path}");
+            }
+        }
         Err(e) => eprintln!("{e}"),
     }
 }

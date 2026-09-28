@@ -75,8 +75,8 @@ pub struct Bus {
     /// Ethernet cartridge (RR-Net, TFE), if attached: 16 bytes of I/O1 or
     /// I/O2, which take precedence over the cartridge and the REU.
     pub eth: Option<Box<crate::net::EthernetCart>>,
-    /// 1541 drive on the serial bus, if emulated.
-    pub drive: Option<Box<Drive>>,
+    /// Drives on the serial bus, units 8 and 9, if emulated.
+    pub drives: [Option<Box<Drive>>; crate::drive::UNITS],
     /// The REU DMA was started by the first write of a
     /// read-modify-write to $FF00: the second one does not happen.
     skip_write: bool,
@@ -137,7 +137,7 @@ impl Bus {
             cart: None,
             reu: None,
             eth: None,
-            drive: None,
+            drives: [None, None],
             skip_write: false,
             cpu_port_dir: 0x2F,
             cpu_port_data: 0x37,
@@ -465,13 +465,25 @@ impl Bus {
         let ddr = self.cia2.regs[2];
         let out = self.cia2.regs[0];
         let (atn, mut clk_low, mut data_low) = self.iec_c64_lines();
-        if let Some(d) = &self.drive {
-            let (clk, data) = d.pulls(atn);
-            clk_low |= clk;
-            data_low |= data;
-        }
+        let (clk, data) = self.drive_pulls(atn, usize::MAX);
+        clk_low |= clk;
+        data_low |= data;
         let lines = 0x3F | if clk_low { 0 } else { 0x40 } | if data_low { 0 } else { 0x80 };
         (out & ddr) | (lines & !ddr)
+    }
+
+    /// Serial bus lines pulled low by the drives other than `except`
+    /// (index in `drives`) with ATN in state `atn`: (CLK, DATA).
+    pub fn drive_pulls(&self, atn: bool, except: usize) -> (bool, bool) {
+        let mut lines = (false, false);
+        for (i, d) in self.drives.iter().enumerate() {
+            if let Some(d) = d.as_ref().filter(|_| i != except) {
+                let (clk, data) = d.pulls(atn);
+                lines.0 |= clk;
+                lines.1 |= data;
+            }
+        }
+        lines
     }
 
     fn map_io(&self, addr: u16) -> Mapped {
@@ -830,7 +842,7 @@ impl Bus {
 // ROMs are not part of the state: those of the machine it is reloaded on
 // are kept. Debugger watchpoints excluded.
 crate::snapshot::impl_state!(Bus {
-    ram, color_ram, cart, reu, eth, drive, skip_write, cpu_port_dir, cpu_port_data,
+    ram, color_ram, cart, reu, eth, drives, skip_write, cpu_port_dir, cpu_port_data,
     cpu_port_out, port_charge, port_charge_until, vic, sid, sid2, sid2_base, tape, cia1, cia2,
     keyboard, joy1, joy2, ctrl, cpu_pc, cycle,
 } skip { kernal_rom, basic_rom, char_rom, dbg_watch, dbg_watch_hit });
