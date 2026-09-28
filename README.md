@@ -198,7 +198,7 @@ F11, or until Claude's connection closes. `c64mcp` works on macOS and Linux
 | F8 | next medium (side B, disk 2) among the files on the command line; with a single file, disk directory |
 | F10 | fullscreen |
 | F11 | reset (it also ends a pause of the remote monitor) |
-| Shift+F11 | freeze button of the cartridge (Action Replay) |
+| Shift+F11 | freeze button of the cartridge (Action Replay, Final Cartridge III) |
 | F12 | quit |
 | Click on the status bar | Datasette buttons (RECORD, PLAY, REW, FF, STOP); on the counter: reset it |
 | Pointer over the C64 screen, left/right click | with paddles in a control port: position of the knobs, fire of paddle X / Y |
@@ -677,10 +677,10 @@ mirrors of the first outside its 32 bytes) and the same output. See
 `.crt` files of the types used by games, verified against VICE with test cartridges: Normal (8K, 16K, Ultimax), Ocean, Fun Play / Power
 Play, Super Games, C64 Game System / System 3, Dinamic, Zaxxon, Magic Desk /
 Domark / HES Australia, Ross, EasyFlash, RGCD / Hucky, GMod2, Drean, Magic
-Desk 16K, Megabyter, Magic Desk Plus, and the Action Replay freezer.
-Other freezers (Retro Replay, Final Cartridge, Super Snapshot…) and utility
-and language cartridges are missing; an unsupported type is rejected with
-its name.
+Desk 16K, Megabyter, Magic Desk Plus, and the Action Replay and Final
+Cartridge III freezers. Other freezers (Retro Replay, Super Snapshot…) and
+utility and language cartridges are missing; an unsupported type is
+rejected with its name.
 
 The Action Replay (versions 4.2, 5 and 6, the same hardware: 32K of ROM in
 four banks and 8K of RAM) is emulated as in VICE: the `$DE00` register
@@ -697,6 +697,18 @@ enabled even if the program had turned it off. Checked against VICE: a
 test cartridge that goes through banks, modes, RAM (including the mode
 that selects both RAMs at once) and the disable, and one whose NMI handler
 records the cartridge RAM, the ROM and the stack after a freeze.
+
+The Final Cartridge III (4 16K banks, or 16 in the III+) is emulated as in
+VICE too: it starts in 16K mode, the register at `$DFFF` selects bank,
+/EXROM and /GAME, drives the NMI line with bit 6 (the cartridge's software
+uses it too) and with bit 7 hides itself until reset; the whole of
+`$DE00-$DFFF` shows the last two pages of the ROML bank. On the freeze
+button it keeps its bank and switches to Ultimax for the CPU only: the VIC
+keeps seeing the screen in RAM, and the freezer's software reads it as it
+was. Checked against VICE like the Action Replay: a test cartridge for
+banks, modes and the hidden register, and one whose NMI handler, after a
+freeze, records ROML, ROMH and the stack, then pulls NMI low with the
+register and gets it through the KERNAL.
 
 The flash chips of EasyFlash (two Am29F040B), GMod2 (Am29F040) and Megabyter
 (MX29F800CB) can be written: programming, sector or chip erase with their
@@ -893,8 +905,8 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 - SID: at most two chips (VICE 3.10 handles up to eight). Control ports:
   joystick, paddles and 1351 mouse in both modes only (no light pen, Neos
   mouse, Koalapad), and the mouse is not available in `c64term`.
-- Freezer cartridges other than the Action Replay, and utility cartridges
-  (see above).
+- Freezer cartridges other than the Action Replay and the Final Cartridge
+  III, and utility cartridges (see above).
 - Ethernet: only the CS8900A cartridges (no ETH64 with the LAN91C96, no
   RR-Net MK3 flash ROM, no network of the Ultimate 64 and 1541 Ultimate);
   the virtual network carries IPv4 TCP, UDP and ping, no IPv6, and the C64

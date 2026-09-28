@@ -756,7 +756,7 @@ impl Bus {
         let phys     = bank_num * 0x4000 + vic_addr;
         // Ultimax: at offsets $3000-$3FFF of every bank the VIC sees the
         // last 4K of ROMH ($F000-$FFFF), elsewhere RAM (no character ROM)
-        if let Some(c) = self.cart.as_ref().filter(|c| c.ultimax()) {
+        if let Some(c) = self.cart.as_ref().filter(|c| c.vic_ultimax()) {
             return if vic_addr & 0x3000 == 0x3000 {
                 c.peek_romh(0x1000 | (vic_addr & 0x0FFF))
             } else {

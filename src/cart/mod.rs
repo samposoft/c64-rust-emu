@@ -20,10 +20,11 @@
 //! $FF (erased flash or missing EPROM). A chip smaller than 8K repeats
 //! within its window, as on the bus (high address lines not connected).
 //!
-//! Freezer cartridges (Action Replay) have a freeze button: the cartridge
-//! pulls the NMI line low and, three cycles later, takes over the machine
-//! in Ultimax mode (`freeze`), so that the NMI vector comes from its ROM.
-//! The NMI stays asserted until the cartridge's software releases it.
+//! Freezer cartridges (Action Replay, Final Cartridge III) have a freeze
+//! button: the cartridge pulls the NMI line low and, three cycles later,
+//! takes over the machine in Ultimax mode (`freeze`), so that the NMI
+//! vector comes from its ROM. The NMI stays asserted until the cartridge's
+//! software releases it.
 //!
 //! EasyFlash, GMod2 and Megabyter have writable flash (see `flash.rs`): the
 //! commands arrive with CPU writes in Ultimax mode, at $8000-$9FFF for the
@@ -81,6 +82,11 @@ pub enum Kind {
     /// freeze NMI. $DF00-$DFFF shows the last page of the bank or of the
     /// RAM.
     ActionReplay,
+    /// 3: Final Cartridge III (and III+): 4 (16) 16K banks, freeze button.
+    /// Register at $DFFF (write only): bits 0-3 bank, bit 4 /EXROM, bit 5
+    /// /GAME (0 = low), bit 6 NMI line (0 = low), bit 7 hides the register
+    /// until reset. $DE00-$DFFF shows the last two pages of the ROML bank.
+    FinalCartridge3,
     /// 5: 8K banks selected with $DE00 (bits 0-5). Up to 256K in 16K mode
     /// with the same bank also at $A000; the 512K one (Terminator 2) in 8K mode.
     Ocean,
@@ -128,6 +134,7 @@ impl Kind {
         Some(match t {
             0 => Kind::Normal,
             1 => Kind::ActionReplay,
+            3 => Kind::FinalCartridge3,
             5 => Kind::Ocean,
             7 => Kind::FunPlay,
             8 => Kind::SuperGames,
@@ -151,6 +158,7 @@ impl Kind {
         match self {
             Kind::Normal => 0,
             Kind::ActionReplay => 1,
+            Kind::FinalCartridge3 => 3,
             Kind::Ocean => 5,
             Kind::FunPlay => 7,
             Kind::SuperGames => 8,
@@ -192,7 +200,7 @@ impl Kind {
             Kind::Normal => 0,
             Kind::ActionReplay | Kind::SuperGames | Kind::Drean => 0x03,
             Kind::Rgcd => 0x07,
-            Kind::FunPlay | Kind::Dinamic => 0x0F,
+            Kind::FinalCartridge3 | Kind::FunPlay | Kind::Dinamic => 0x0F,
             Kind::Zaxxon | Kind::Ross => 0x01,
             Kind::Ocean | Kind::Gs | Kind::EasyFlash | Kind::GMod2 => 0x3F,
             Kind::MagicDesk | Kind::MagicDesk16 | Kind::Megabyter | Kind::MagicDeskPlus => 0x7F,
@@ -272,6 +280,9 @@ pub struct CartState {
     export_ram: bool,
     /// Freeze: the cartridge holds the NMI line low.
     pub nmi: bool,
+    /// Final Cartridge III frozen: Ultimax for the CPU only, the VIC still
+    /// sees the machine without the cartridge (VICE: phi1 in RAM mode).
+    vic_ram: bool,
     /// GMod2: serial EEPROM.
     eeprom: Option<M93c86>,
     /// Flash chip commands on ROML and ROMH (the data is in `roml` and `romh`).
@@ -308,6 +319,7 @@ impl CartState {
             ram: Vec::new(),
             export_ram: false,
             nmi: false,
+            vic_ram: false,
             eeprom: None,
             flash_lo: None,
             flash_hi: None,
@@ -327,6 +339,7 @@ impl CartState {
         self.locked = false;
         self.export_ram = false;
         self.nmi = false;
+        self.vic_ram = false;
         for f in [&mut self.flash_lo, &mut self.flash_hi].into_iter().flatten() {
             f.reset();
         }
@@ -345,7 +358,8 @@ impl CartState {
                 }
             }
             Kind::SuperGames | Kind::Drean => self.write_io2(0, 0),
-            Kind::Normal | Kind::ActionReplay | Kind::Gs | Kind::Dinamic | Kind::Zaxxon | Kind::Ross => {}
+            Kind::Normal | Kind::ActionReplay | Kind::FinalCartridge3 | Kind::Gs | Kind::Dinamic
+            | Kind::Zaxxon | Kind::Ross => {}
         }
     }
 
@@ -353,26 +367,44 @@ impl CartState {
 
     /// The cartridge has a freeze button.
     pub fn can_freeze(&self) -> bool {
-        self.kind == Kind::ActionReplay
+        matches!(self.kind, Kind::ActionReplay | Kind::FinalCartridge3)
     }
 
     /// Freeze button, three cycles after the NMI (VICE's
-    /// actionreplay_freeze): the cartridge turns on again, in Ultimax with
-    /// its RAM at $8000 and bank 0 at $E000, where the NMI vector is read.
+    /// actionreplay_freeze and final_v3_freeze): the cartridge turns on
+    /// again in Ultimax, where the NMI vector is read from its ROM. The
+    /// Action Replay switches to bank 0 with its RAM at $8000; the Final
+    /// Cartridge III keeps its bank and makes the register visible, and
+    /// the VIC keeps seeing the machine without the cartridge.
     pub fn freeze(&mut self) {
         self.locked = false;
         self.mode = Mode::Ultimax;
-        self.export_ram = true;
-        self.roml_bank = 0;
-        self.romh_bank = 0;
+        if self.kind == Kind::FinalCartridge3 {
+            self.vic_ram = true;
+        } else {
+            self.export_ram = true;
+            self.roml_bank = 0;
+            self.romh_bank = 0;
+        }
+    }
+
+    /// Ultimax as the VIC sees it (ROMH at $3000-$3FFF of every bank).
+    pub fn vic_ultimax(&self) -> bool {
+        self.mode == Mode::Ultimax && !self.vic_ram
     }
 
     /// State of a freezer cartridge for the debugger: RAM, disabled, NMI.
     pub fn freezer_state(&self) -> Option<String> {
-        self.can_freeze().then(|| format!("RAM at $8000 {}, {}, NMI {}",
-            if self.export_ram { "on" } else { "off" },
-            if self.locked { "disabled until reset" } else { "enabled" },
-            if self.nmi { "held (freeze)" } else { "released" }))
+        let nmi = if self.nmi { "held" } else { "released" };
+        match self.kind {
+            Kind::ActionReplay => Some(format!("RAM at $8000 {}, {}, NMI {nmi}",
+                if self.export_ram { "on" } else { "off" },
+                if self.locked { "disabled until reset" } else { "enabled" })),
+            Kind::FinalCartridge3 => Some(format!("register {}, NMI {nmi}{}",
+                if self.locked { "hidden until reset" } else { "visible" },
+                if self.vic_ram { ", frozen (the VIC sees RAM)" } else { "" })),
+            _ => None,
+        }
     }
 
     /// Action Replay with $DE00 = %xx1xxx10: 8K mode with the RAM, but the
@@ -556,8 +588,8 @@ impl CartState {
                     self.mode = [Mode::Game8K, Mode::Game16K, Mode::Off, Mode::Ultimax][(v & 3) as usize];
                 }
             }
-            Kind::Normal | Kind::ActionReplay | Kind::SuperGames | Kind::Dinamic | Kind::Zaxxon
-            | Kind::Ross | Kind::Drean => {}
+            Kind::Normal | Kind::ActionReplay | Kind::FinalCartridge3 | Kind::SuperGames
+            | Kind::Dinamic | Kind::Zaxxon | Kind::Ross | Kind::Drean => {}
         }
     }
 
@@ -576,6 +608,7 @@ impl CartState {
             // The R/W line is not decoded: a read writes the register with
             // the byte left on the bus
             Kind::ActionReplay if !self.locked => self.write_io1(off, open),
+            Kind::FinalCartridge3 => return self.peek_io1(off, open),
             Kind::Gs => self.roml_bank = off & self.bank_mask,
             Kind::Dinamic if off < 16 => self.roml_bank = off,
             Kind::Ross if self.bank_mask > 0 => {
@@ -592,10 +625,12 @@ impl CartState {
     }
 
     /// I/O1 read without side effects (debugger).
-    pub fn peek_io1(&self, _off: u8, open: u8) -> Option<u8> {
+    pub fn peek_io1(&self, off: u8, open: u8) -> Option<u8> {
         match self.kind {
             // The debugger shows the register, as VICE's monitor does
             Kind::ActionReplay => Some(self.regs[0]),
+            // The second-to-last page of the bank, in every mode
+            Kind::FinalCartridge3 => Some(Self::byte(&self.roml, self.roml_bank, 0x1E00 | off as u16)),
             Kind::GMod2 => {
                 let e = self.eeprom.as_ref()?;
                 (self.regs[0] & 0x40 != 0).then(|| (e.peek_do() as u8) << 7 | open & 0x7F)
@@ -609,6 +644,17 @@ impl CartState {
     pub fn write_io2(&mut self, off: u8, v: u8) {
         match self.kind {
             Kind::ActionReplay if !self.locked && self.export_ram => self.ram[0x1F00 | off as usize] = v,
+            Kind::FinalCartridge3 => {
+                self.regs[0] = v;
+                if !self.locked && off == 0xFF {
+                    self.locked = v & 0x80 != 0;
+                    self.nmi = v & 0x40 == 0;
+                    self.roml_bank = v & self.bank_mask;
+                    self.romh_bank = v & self.bank_mask;
+                    self.mode = Mode::from_lines(v & 0x10 == 0, v & 0x20 == 0);
+                    self.vic_ram = false;
+                }
+            }
             Kind::EasyFlash => self.ram[off as usize] = v,
             Kind::SuperGames if !self.locked => {
                 self.regs[0] = v;
@@ -649,6 +695,7 @@ impl CartState {
         match self.kind {
             // The last page of $8000-$9FFF, ROM or RAM, in every mode
             Kind::ActionReplay if !self.locked => Some(self.peek_roml(0x1F00 | off as u16)),
+            Kind::FinalCartridge3 => Some(Self::byte(&self.roml, self.roml_bank, 0x1F00 | off as u16)),
             Kind::EasyFlash => Some(self.ram[off as usize]),
             Kind::MagicDeskPlus => self.mdp_index(off).map(|m| match m {
                 MdpMem::Sram(i) => self.ram[i],
@@ -824,7 +871,7 @@ pub fn parse_crt(data: &[u8]) -> Result<CartState, String> {
         Kind::Ocean => {
             if chips.iter().any(|c| c.bank >= 32) { Mode::Game8K } else { Mode::Game16K }
         }
-        Kind::SuperGames | Kind::Zaxxon | Kind::Ross | Kind::MagicDesk16 => Mode::Game16K,
+        Kind::FinalCartridge3 | Kind::SuperGames | Kind::Zaxxon | Kind::Ross | Kind::MagicDesk16 => Mode::Game16K,
         Kind::EasyFlash => EASYFLASH_MODES[0],
         _ => Mode::Game8K,
     };
@@ -901,6 +948,9 @@ pub fn parse_crt(data: &[u8]) -> Result<CartState, String> {
             cart.flash_lo = flash(&mut cart.roml, Chip::Am29F040);
         }
         Kind::Megabyter => cart.flash_lo = flash(&mut cart.roml, Chip::Mx29F800CB),
+        Kind::FinalCartridge3 if highest != 3 && highest != 15 => {
+            return Err(format!("Final Cartridge III with {} banks: 4 (III) or 16 (III+) required", highest + 1));
+        }
         Kind::Rgcd if revision == 1 && ![0, 1, 3, 7].contains(&highest) => {
             return Err(format!("Hucky with {} banks: 1, 2, 4 or 8 required", highest + 1));
         }
@@ -938,7 +988,7 @@ use crate::snapshot::{Reader, Result as StateResult, State, Writer};
 crate::snapshot::impl_state_enum!(Mode { Off, Game8K, Game16K, Ultimax });
 crate::snapshot::impl_state_enum!(Kind {
     Normal, Ocean, FunPlay, SuperGames, Gs, Dinamic, Zaxxon, MagicDesk, Ross, EasyFlash, Rgcd,
-    GMod2, Drean, MagicDesk16, Megabyter, MagicDeskPlus, ActionReplay,
+    GMod2, Drean, MagicDesk16, Megabyter, MagicDeskPlus, ActionReplay, FinalCartridge3,
 });
 
 /// ROMs are saved as a block (length and bytes), not byte by byte.
@@ -958,7 +1008,8 @@ impl State for CartState {
     fn save(&self, w: &mut Writer) {
         let Self {
             kind, name, revision, roml, romh, roml_bank, romh_bank, mode, boot_mode, regs,
-            bank_mask, locked, ram, export_ram, nmi, eeprom, flash_lo, flash_hi, nv, nv_dirty, nvram_path,
+            bank_mask, locked, ram, export_ram, nmi, vic_ram, eeprom, flash_lo, flash_hi, nv, nv_dirty,
+            nvram_path,
         } = self;
         kind.save(w);
         name.save(w);
@@ -975,6 +1026,7 @@ impl State for CartState {
         save_bytes(ram, w);
         export_ram.save(w);
         nmi.save(w);
+        vic_ram.save(w);
         eeprom.save(w);
         flash_lo.save(w);
         flash_hi.save(w);
@@ -986,7 +1038,8 @@ impl State for CartState {
     fn load(&mut self, r: &mut Reader) -> StateResult<()> {
         let Self {
             kind, name, revision, roml, romh, roml_bank, romh_bank, mode, boot_mode, regs,
-            bank_mask, locked, ram, export_ram, nmi, eeprom, flash_lo, flash_hi, nv, nv_dirty, nvram_path,
+            bank_mask, locked, ram, export_ram, nmi, vic_ram, eeprom, flash_lo, flash_hi, nv, nv_dirty,
+            nvram_path,
         } = self;
         kind.load(r)?;
         name.load(r)?;
@@ -1003,6 +1056,7 @@ impl State for CartState {
         load_bytes(ram, r)?;
         export_ram.load(r)?;
         nmi.load(r)?;
+        vic_ram.load(r)?;
         eeprom.load(r)?;
         flash_lo.load(r)?;
         flash_hi.load(r)?;
@@ -1038,9 +1092,9 @@ mod tests {
 
     #[test]
     fn unsupported_type_is_an_error() {
-        let data = crt(3, 0, 1, 0, &[(0, 0x8000, vec![0; 0x2000])]);
+        let data = crt(20, 0, 1, 0, &[(0, 0x8000, vec![0; 0x2000])]);
         let err = parse_crt(&data).err().unwrap();
-        assert!(err.contains("Final Cartridge III"), "{err}");
+        assert!(err.contains("Super Snapshot V5"), "{err}");
     }
 
     #[test]
@@ -1076,6 +1130,36 @@ mod tests {
         assert_eq!((c.mode, c.peek_roml(0), c.nmi), (Mode::Game8K, 1, false));
         c.write_io1(0, 0x20);
         assert_eq!(c.peek_roml(0x1F10), 0x42);
+    }
+
+    #[test]
+    fn final_cartridge_3_register_and_freeze() {
+        let bank16 = |b: u16| (b, 0x8000, [vec![b as u8 * 2 + 1; 0x2000], vec![b as u8 * 2 + 2; 0x2000]].concat());
+        let three: Vec<_> = (0..3).map(bank16).collect();
+        assert!(parse_crt(&crt(3, 0, 0, 0, &three)).is_err());
+        let chips: Vec<_> = (0..4).map(bank16).collect();
+        let mut c = parse_crt(&crt(3, 1, 1, 0, &chips)).unwrap();
+        assert_eq!((c.kind, c.mode), (Kind::FinalCartridge3, Mode::Game16K));
+        // Only $DFFF is the register; I/O1 and I/O2 show the ROML bank
+        c.write_io2(0xF0, 0x72);
+        assert_eq!(c.mode, Mode::Game16K);
+        c.write_io2(0xFF, 0x72);
+        assert_eq!((c.mode, c.peek_io1(0x10, 0), c.peek_io2(0x10), c.nmi), (Mode::Off, Some(5), Some(5), false));
+        // Bit 6 at 0 pulls NMI low; bit 7 hides the register
+        c.write_io2(0xFF, 0x33);
+        assert!(c.nmi);
+        c.write_io2(0xFF, 0xE1);
+        assert_eq!((c.mode, c.peek_romh(0), c.nmi), (Mode::Game8K, 4, false));
+        c.write_io2(0xFF, 0x70);
+        assert_eq!((c.mode, c.roml_bank), (Mode::Game8K, 1));
+        // Freeze: register visible again, same bank, Ultimax for the CPU
+        // only
+        c.freeze();
+        assert_eq!((c.mode, c.roml_bank, c.ultimax(), c.vic_ultimax()), (Mode::Ultimax, 1, true, false));
+        c.write_io2(0xFF, 0x50);
+        assert_eq!((c.roml_bank, c.vic_ultimax()), (0, true));
+        c.reset();
+        assert_eq!((c.mode, c.roml_bank, c.vic_ultimax()), (Mode::Game16K, 0, false));
     }
 
     #[test]
