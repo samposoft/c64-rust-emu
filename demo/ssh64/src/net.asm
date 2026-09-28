@@ -8,6 +8,9 @@
 ; kept, for the next hop of the last destination (the router, normally).
 ; net_poll handles one received frame; it is also called from inside the
 ; long computations of the key exchange, so it only uses its own zero page.
+;
+; Shared with ../../retrocbbs, which defines the same zero-page names
+; (net_p ... ticks) and sections (bss, bssl).
 
 ; RR-Net: the CS8900A ports with address line 3 inverted
 CS_ISQ  = $de00

@@ -9,6 +9,7 @@
 ; ring until acknowledged; if nothing is acknowledged for tcp_rto ticks,
 ; everything unacknowledged is sent again (go-back-N) and the time
 ; doubles, up to 32 s, 10 times. Sequence numbers are kept little-endian.
+; Shared with ../../retrocbbs, as net.asm.
 ;
 ;   tcp_connect   tx_dst = address, tcp_rport = port (big-endian)
 ;   tcp_poll      sends what there is to send, timers
