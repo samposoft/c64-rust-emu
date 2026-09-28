@@ -1269,6 +1269,9 @@ impl C64 {
         self.freeze_at = 0;
         let Some(cart) = self.bus.cart.as_mut() else { return };
         if self.freeze_step == 1 {
+            if !cart.freeze_allowed(self.bus.cycle) {
+                return;
+            }
             cart.nmi = true;
             self.freeze_at = self.bus.cycle + 3;
             self.freeze_step = 2;
@@ -1466,7 +1469,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 25;
+const STATE_VERSION: u32 = 26;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });

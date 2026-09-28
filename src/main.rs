@@ -47,7 +47,7 @@ const HELP: &[&str] = &[
     "F5 save state  F9 load state  TAB joystick",
     "F8 next medium  F10 fullscreen  F11 reset",
     "F12 quit  click the Datasette buttons",
-    "Shift+F11 freeze button (AR, FC3)",
+    "Shift+F11 freeze button (AR, FC3, RR)",
     "paddles: point at the screen, click = fire",
     "1351 mouse: click the screen, Cmd or middle button releases",
 ];

@@ -298,6 +298,7 @@ impl Bus {
             Mapped::Roml(off) => {
                 let now = self.cycle;
                 match self.cart.as_mut() {
+                    Some(c) if c.roml_open() => open,
                     // Action Replay in its broken mode: C64 RAM and
                     // cartridge RAM together on the bus
                     Some(c) if c.ram_contention() => c.read_roml(off, now) | self.ram[0x8000 + off as usize],
@@ -309,7 +310,10 @@ impl Bus {
                 let now = self.cycle;
                 self.cart.as_mut().map_or(open, |c| c.read_romh(off, now))
             }
-            Mapped::Io1(off) => self.cart.as_mut().and_then(|c| c.read_io1(off, open)).unwrap_or(open),
+            Mapped::Io1(off) => {
+                let now = self.cycle;
+                self.cart.as_mut().and_then(|c| c.read_io1(off, open, now)).unwrap_or(open)
+            }
             Mapped::Io2(off) => match self.reu.as_mut() {
                 Some(reu) => reu.read(off),
                 None => self.cart.as_mut().and_then(|c| c.read_io2(off)).unwrap_or(open),
@@ -333,12 +337,13 @@ impl Bus {
             Mapped::Sid2(reg) => self.sid2.as_ref().map_or(open, |s| s.read(reg)),
             Mapped::Eth(addr) => self.eth.as_ref().map_or(open, |e| e.peek(addr)),
             Mapped::Roml(off) => match self.cart.as_ref() {
+                Some(c) if c.roml_open() => open,
                 Some(c) if c.ram_contention() => c.peek_roml(off) | self.ram[0x8000 + off as usize],
                 Some(c) => c.peek_roml(off),
                 None => open,
             },
             Mapped::Romh(off) => self.cart.as_ref().map_or(open, |c| c.peek_romh(off)),
-            Mapped::Io1(off) => self.cart.as_ref().and_then(|c| c.peek_io1(off, open)).unwrap_or(open),
+            Mapped::Io1(off) => self.cart.as_ref().and_then(|c| c.peek_io1(off, open, self.cycle)).unwrap_or(open),
             Mapped::Io2(off) => match self.reu.as_ref() {
                 Some(reu) => reu.peek(off),
                 None => self.cart.as_ref().and_then(|c| c.peek_io2(off)).unwrap_or(open),
@@ -393,6 +398,7 @@ impl Bus {
                 0x0001 => self.cpu_port_read(),
                 0x0002..=0x0FFF => self.ram[addr as usize],
                 0x8000..=0x9FFF => return Mapped::Roml(addr - 0x8000),
+                0xA000..=0xBFFF => self.cart.as_ref().and_then(|c| c.ultimax_a000(addr - 0xA000)).unwrap_or(self.open_bus()),
                 0xD000..=0xDFFF => return self.map_io(addr),
                 0xE000..=0xFFFF => return Mapped::Romh(addr - 0xE000),
                 _ => self.open_bus(),
@@ -646,6 +652,7 @@ impl Bus {
                 0x0000 | 0x0001 => self.write_cpu_port(addr, val),
                 0x0002..=0x0FFF => self.ram[addr as usize] = val,
                 0x8000..=0x9FFF => self.cart.as_mut().unwrap().write_roml(addr - 0x8000, val, now),
+                0xA000..=0xBFFF => self.cart.as_mut().unwrap().write_ultimax_a000(addr - 0xA000, val),
                 0xD000..=0xDFFF => self.write_io(addr, val),
                 0xE000..=0xFFFF => self.cart.as_mut().unwrap().write_romh(addr - 0xE000, val, now),
                 _ => {}
@@ -657,15 +664,23 @@ impl Bus {
 
             0x0002..=0x7FFF => self.ram[addr as usize] = val,
             0x8000..=0x9FFF => {
-                // With ROML visible the cartridge sees the write too (the
-                // Action Replay RAM); the C64 RAM is written anyway
-                let roml = self.loram() && self.hiram();
-                if let Some(c) = self.cart.as_mut().filter(|c| roml && matches!(c.mode, Mode::Game8K | Mode::Game16K)) {
+                // The cartridge sees the write too, in every mode (the
+                // Action Replay RAM, as in VICE); the C64 RAM gets it anyway
+                if let Some(c) = self.cart.as_mut() {
                     c.write_roml_game(addr - 0x8000, val);
                 }
                 self.ram[addr as usize] = val;
             }
-            0xA000..=0xBFFF => self.ram[addr as usize] = val,
+            0xA000..=0xBFFF => {
+                // With ROMH visible the Nordic Replay can take it
+                let romh = self.hiram();
+                if let Some(c) = self.cart.as_mut().filter(|c| romh && c.mode == Mode::Game16K) {
+                    if c.write_romh_game(addr - 0xA000, val) {
+                        return;
+                    }
+                }
+                self.ram[addr as usize] = val;
+            }
             0xC000..=0xCFFF => self.ram[addr as usize] = val,
 
             0xD000..=0xDFFF => {
@@ -731,10 +746,17 @@ impl Bus {
         self.sid2.is_some() && addr & 0xFFE0 == self.sid2_base
     }
 
-    /// The address falls within the 16 bytes of the Ethernet cartridge.
+    /// The address belongs to the Ethernet cartridge (its 16 bytes, or the
+    /// clock port of a Retro Replay).
     #[inline]
     fn is_eth(&self, addr: u16) -> bool {
-        self.eth.as_ref().is_some_and(|e| e.contains(addr))
+        let Some(e) = self.eth.as_ref().filter(|e| e.contains(addr)) else { return false };
+        // At $DE00 with a Retro Replay the cartridge is plugged into its
+        // clock port: $DE02-$DE0F, while the clock port is enabled
+        match self.cart.as_ref().filter(|c| c.kind == crate::cart::Kind::RetroReplay && e.base == 0xDE00) {
+            Some(c) => addr & 0x0F >= 2 && c.clockport(),
+            None => true,
+        }
     }
 
     /// Direct RAM read (used by the VIC, which bypasses CPU banking).

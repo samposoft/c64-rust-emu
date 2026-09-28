@@ -148,6 +148,42 @@ mod tests {
     }
 
     #[test]
+    fn rrnet_on_the_retro_replay_clock_port() {
+        // Retro Replay, 4 empty 8K banks
+        let mut crt = b"C64 CARTRIDGE   ".to_vec();
+        crt.extend(0x40u32.to_be_bytes());
+        crt.extend([1, 0, 0, 36, 0, 1, 0]);
+        crt.resize(0x40, 0);
+        for bank in 0..4u16 {
+            crt.extend(b"CHIP");
+            crt.extend((16u32 + 0x2000).to_be_bytes());
+            crt.extend([0, 0]);
+            crt.extend(bank.to_be_bytes());
+            crt.extend([0x80, 0x00, 0x20, 0x00]);
+            crt.extend([0u8; 0x2000]);
+        }
+        let mut c64 = crate::c64::C64::new();
+        c64.set_ethernet(Some((EthMode::RrNet, 0xDE00))).unwrap();
+        c64.load_cartridge(&crt).unwrap();
+        let id = |c64: &mut crate::c64::C64| {
+            c64.bus.write(0xDE02, 0x00);
+            c64.bus.write(0xDE03, 0x00);
+            (c64.bus.read(0xDE04), c64.bus.read(0xDE05))
+        };
+        // $DE00 is the Retro Replay's status; with the clock port off the
+        // RR-Net does not answer
+        assert_ne!(id(&mut c64), (0x0E, 0x63));
+        c64.bus.write(0xDE00, 0x98);
+        assert_eq!(c64.bus.read(0xDE00), 0x98);
+        c64.bus.write(0xDE01, 0x01);
+        assert_eq!(id(&mut c64), (0x0E, 0x63));
+        assert_eq!(c64.bus.read(0xDE00), 0x00);
+        // Registers disabled: the clock port stays
+        c64.bus.write(0xDE00, 0x06);
+        assert_eq!(id(&mut c64), (0x0E, 0x63));
+    }
+
+    #[test]
     fn parse() {
         assert_eq!(parse_ethernet("rrnet"), Ok((EthMode::RrNet, 0xDE00)));
         assert_eq!(parse_ethernet("TFE@df10"), Ok((EthMode::Tfe, 0xDF10)));

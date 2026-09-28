@@ -89,8 +89,9 @@ impl MachineOptions {
                roms/ next to the executable or in a directory above it, else ./roms)
   --reu KB     attach a REU (128, 256, 512 ... 16384 KB)
   --eth DEV    Ethernet cartridge with the CS8900A: rrnet (RR-Net) or tfe (The Final
-               Ethernet), at $DE00 or at DEV@ADDR (de00-dff0, in steps of 10). It is
-               plugged into a virtual network with a router at 10.0.2.2 (DHCP, DNS at
+               Ethernet), at $DE00 or at DEV@ADDR (de00-dff0, in steps of 10); with a
+               Retro Replay .crt the RR-Net sits on its clock port. It is plugged
+               into a virtual network with a router at 10.0.2.2 (DHCP, DNS at
                10.0.2.3), which turns the C64's connections into sockets of this
                program: no privileges, any host connection; 10.0.2.2 is the host itself
   --eth-forward HOST:C64  with --eth, forward TCP port HOST of this machine (127.0.0.1

@@ -198,7 +198,7 @@ F11, or until Claude's connection closes. `c64mcp` works on macOS and Linux
 | F8 | next medium (side B, disk 2) among the files on the command line; with a single file, disk directory |
 | F10 | fullscreen |
 | F11 | reset (it also ends a pause of the remote monitor) |
-| Shift+F11 | freeze button of the cartridge (Action Replay, Final Cartridge III) |
+| Shift+F11 | freeze button of the cartridge (Action Replay, Final Cartridge III, Retro Replay) |
 | F12 | quit |
 | Click on the status bar | Datasette buttons (RECORD, PLAY, REW, FF, STOP); on the counter: reset it |
 | Pointer over the C64 screen, left/right click | with paddles in a control port: position of the knobs, fire of paddle X / Y |
@@ -677,10 +677,10 @@ mirrors of the first outside its 32 bytes) and the same output. See
 `.crt` files of the types used by games, verified against VICE with test cartridges: Normal (8K, 16K, Ultimax), Ocean, Fun Play / Power
 Play, Super Games, C64 Game System / System 3, Dinamic, Zaxxon, Magic Desk /
 Domark / HES Australia, Ross, EasyFlash, RGCD / Hucky, GMod2, Drean, Magic
-Desk 16K, Megabyter, Magic Desk Plus, and the Action Replay and Final
-Cartridge III freezers. Other freezers (Retro Replay, Super Snapshot…) and
-utility and language cartridges are missing; an unsupported type is
-rejected with its name.
+Desk 16K, Megabyter, Magic Desk Plus, and the Action Replay, Final
+Cartridge III and Retro Replay freezers. Other freezers (Super Snapshot,
+Atomic Power…) and utility and language cartridges are missing; an
+unsupported type is rejected with its name.
 
 The Action Replay (versions 4.2, 5 and 6, the same hardware: 32K of ROM in
 four banks and 8K of RAM) is emulated as in VICE: the `$DE00` register
@@ -696,7 +696,9 @@ releases it. A reset (F11) gives the cartridge back its start-up state,
 enabled even if the program had turned it off. Checked against VICE: a
 test cartridge that goes through banks, modes, RAM (including the mode
 that selects both RAMs at once) and the disable, and one whose NMI handler
-records the cartridge RAM, the ROM and the stack after a freeze.
+records the cartridge RAM, the ROM and the stack after a freeze. As in
+VICE, a write to `$8000-$9FFF` outside Ultimax reaches the cartridge RAM
+whatever the mode and `$01` (the C64 RAM gets it too).
 
 The Final Cartridge III (4 16K banks, or 16 in the III+) is emulated as in
 VICE too: it starts in 16K mode, the register at `$DFFF` selects bank,
@@ -709,6 +711,24 @@ was. Checked against VICE like the Action Replay: a test cartridge for
 banks, modes and the hidden register, and one whose NMI handler, after a
 freeze, records ROML, ROMH and the stack, then pulls NMI low with the
 register and gets it through the KERNAL.
+
+The Retro Replay (Individual Computers), and the Nordic Replay with CRT
+revision 1, is emulated as in VICE: 64K of ROM in eight banks (4, 8 or 16
+8K banks in the CRT; the second half of the 128K flash needs the bank
+jumper), 32K of RAM in four banks, `$DE00` compatible with the Action
+Replay, `$DE01` with its bits written once after reset (AllowBank for the
+RAM bank in I/O, NoFreeze, the REU compatible map that moves the I/O
+window to `$DE00`) and the status in `$DE00/$DE01`, with the freeze button.
+After a freeze the cartridge stays in Ultimax until its software
+acknowledges with bit 6; in 16K mode without RAM nothing answers at
+`$8000`; `$22` turns it off with its RAM at `$DF00`, while on the Nordic
+Replay it selects the Nordic Power map (ROM at `$8000`, RAM at `$A000`).
+The clock port at `$DE02-$DE0F`, enabled with `$DE01` bit 0, takes the
+RR-Net: with `--eth rrnet` and a Retro Replay inserted, the Ethernet chip
+answers there only while the clock port is on, as on the real module. The
+flash is never written (flashing needs the flash jumper, not emulated).
+Checked against VICE with four test cartridges: registers, banks and RAM;
+REU map and clock port; the Nordic Power map; the freeze.
 
 The flash chips of EasyFlash (two Am29F040B), GMod2 (Am29F040) and Megabyter
 (MX29F800CB) can be written: programming, sector or chip erase with their
@@ -746,7 +766,9 @@ real chip gives it (RxStatus and RxLength high byte first), the address
 filter (individual address, broadcast, multicast hash, promiscuous) and the
 RR-Net's mapping, with address line A3 inverted and the first two bytes left
 to the Retro Replay. Programs for the RR-Net (ip65, Contiki and the ones
-built on them) find it where they expect it.
+built on them) find it where they expect it. With a Retro Replay inserted
+(`c64 --eth rrnet rr.crt`) the RR-Net at `$DE00` is plugged into its clock
+port, and answers only while the program has enabled it (`$DE01` bit 0).
 
 The cartridge is not bridged to the host's LAN, which on macOS would need
 root privileges and, over Wi-Fi, a cloned MAC address: it is plugged into a
@@ -905,8 +927,9 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 - SID: at most two chips (VICE 3.10 handles up to eight). Control ports:
   joystick, paddles and 1351 mouse in both modes only (no light pen, Neos
   mouse, Koalapad), and the mouse is not available in `c64term`.
-- Freezer cartridges other than the Action Replay and the Final Cartridge
-  III, and utility cartridges (see above).
+- Freezer cartridges other than the Action Replay, the Final Cartridge III
+  and the Retro Replay (whose flash cannot be rewritten), and utility
+  cartridges (see above).
 - Ethernet: only the CS8900A cartridges (no ETH64 with the LAN91C96, no
   RR-Net MK3 flash ROM, no network of the Ultimate 64 and 1541 Ultimate);
   the virtual network carries IPv4 TCP, UDP and ping, no IPv6, and the C64

@@ -51,7 +51,7 @@ their comments and checked against VICE by the tests:
 | `src/net/mod.rs` (Ethernet cartridge mapping: TFE, RR-Net with A3 inverted) | `src/c64/cart/ethernetcart.c`, `src/c64/cart/clockport-rrnet.c` | Marco van den Heuvel |
 | `src/cart/flash.rs` (Am29F040 and compatible flash) | `src/core/flash040core.c` | Hannu Nuotio, Marko Mäkelä |
 | `src/cart/eeprom.rs` (M93C86 EEPROM of GMod2) | `src/core/m93c86.c`, `src/c64/cart/gmod2.c` | Groepaz |
-| `src/cart/mod.rs` (cartridge types) | `src/c64/cart/*.c` (e.g. `easyflash.c`: ALeX Kazik, Marco van den Heuvel; `actionreplay.c`: Andreas Boose; `final3.c`: Andreas Boose, Groepaz) | the VICE Team |
+| `src/cart/mod.rs` (cartridge types) | `src/c64/cart/*.c` (e.g. `easyflash.c`: ALeX Kazik, Marco van den Heuvel; `actionreplay.c`: Andreas Boose; `final3.c` and `retroreplay.c`: Andreas Boose, Groepaz) | the VICE Team |
 | `src/c64.rs` (freeze button: delay and NMI) | `src/c64/cart/c64cart.c` | the VICE Team |
 
 ## reSID
