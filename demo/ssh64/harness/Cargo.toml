@@ -1,0 +1,12 @@
+[package]
+name = "ssh64-harness"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+publish = false
+
+[dependencies]
+c64 = { path = "../../..", default-features = false }
+
+# Standalone: not a member of the emulator's package.
+[workspace]
