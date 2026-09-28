@@ -518,6 +518,9 @@ impl Debugger {
             Some(c) => {
                 let _ = writeln!(s, "  cart: \"{}\" type {} ({}), mode {}, bank ROML {} ROMH {}, registers {:02X?}",
                     c.name, c.kind.crt_type(), c.kind.name(), c.mode.name(), c.roml_bank, c.romh_bank, c.regs);
+                if let Some(f) = c.freezer_state() {
+                    let _ = writeln!(s, "        {f}");
+                }
             }
         }
         s
@@ -842,6 +845,7 @@ impl Debugger {
   mouse left|right down|up|press   mouse button (1351: left = fire, right = up, in joystick mode POTX; paddles: fire of X / Y)
   paddle 1|2 x y     paddle readings of a port (0-255)
   load file          load .prg/.d64/.g64/.tap/.t64/.crt      savestate file | loadstate file   reset
+  freeze             freeze button of the cartridge (Action Replay), like Shift+F11 in the window
   speed [auto|real|max]  auto: real speed, maximum while loading from disk and tape (default with --window); real: always 50 frames/s; max: maximum
   info | echo text | help | quit"
     }
@@ -1519,6 +1523,10 @@ impl Debugger {
             "reset" => {
                 c64.reset();
                 writeln!(out, "{}", reg_line(c64)).map_err(io)?;
+            }
+            "freeze" => {
+                c64.freeze()?;
+                writeln!(out, "freeze button pressed: the cartridge takes over within a frame").map_err(io)?;
             }
             _ => return Err(format!("unknown command: {cmd} (help for the list)")),
         }

@@ -88,6 +88,14 @@ pub struct C64 {
     /// Address to start with SYS instead of RUN after the autoload (0:
     /// RUN), for T64 programs that are not BASIC.
     autoload_sys: u16,
+    /// Freeze button of the cartridge: cycle of the next step (0: none) and
+    /// the step, 1 = the cartridge pulls the NMI line low, 2 = it takes over
+    /// the machine (VICE's cart_freeze_alarm and cart_nmi_alarm).
+    freeze_at: u64,
+    freeze_step: u8,
+    /// Delay between the button and the NMI: VICE's generator, from a fixed
+    /// state.
+    freeze_rng: crate::random::Pcg,
 
     /// Audio of the last frame at the rate chosen with `set_audio`: mono,
     /// or interleaved stereo (SID 1 left, SID 2 right) with the second
@@ -133,6 +141,9 @@ impl C64 {
             tape_cbm_key: 0,
             autoload_run: 0,
             autoload_sys: 0,
+            freeze_at: 0,
+            freeze_step: 0,
+            freeze_rng: crate::random::Pcg::new(),
             audio_buf: Vec::new(),
             audio_buf2: Vec::new(),
             frame_elapsed: 0,
@@ -313,6 +324,9 @@ impl C64 {
         }
         // The Datasette stops and rewinds (VICE's DatasetteResetWithCPU)
         self.bus.tape.reset();
+        // A freeze still pending is lost (the cartridge releases NMI in its
+        // own reset)
+        self.freeze_at = 0;
         if let Some(t64) = &mut self.t64 {
             t64.rewind();
         }
@@ -1058,6 +1072,9 @@ impl C64 {
         let mut elapsed = 0u32;
         let mut cycles = 0u8;
         loop {
+            if self.freeze_at != 0 && self.bus.cycle >= self.freeze_at {
+                self.freeze_next_step();
+            }
             let crate::vic::Tick { ba_low, aec_low, .. } = self.tick_all();
             // REU DMA: takes the bus at the first CPU read after the
             // command and keeps it until the end of the transfer
@@ -1068,7 +1085,7 @@ impl C64 {
                         self.cpu.dma_stall();
                         self.tick_drive();
                         let irq = self.irq_line();
-                        let nmi = self.bus.cia2.irq_active();
+                        let nmi = self.bus.cia2.irq_active() || self.bus.cart_nmi();
                         self.cpu.sample_lines(irq, nmi, true);
                         self.cpu.total_cycles += 1;
                         elapsed += 1;
@@ -1081,7 +1098,7 @@ impl C64 {
             let r = self.cpu.cycle(&mut self.bus, ba_low, aec_low);
             self.tick_drive();
             let irq = self.irq_line();
-            let nmi = self.bus.cia2.irq_active();
+            let nmi = self.bus.cia2.irq_active() || self.bus.cart_nmi();
             self.cpu.sample_lines(irq, nmi, r.stalled);
             self.cpu.total_cycles += 1;
             elapsed += 1;
@@ -1230,6 +1247,33 @@ impl C64 {
             self.bus.keyboard.press(CBM_KEY.0, CBM_KEY.1);
             self.tape_cbm_key = 3;
             self.tape_found_wait = 0;
+        }
+    }
+
+    /// Presses the cartridge's freeze button. As in VICE the press lands
+    /// at a random point within the next frame (a person does not press it
+    /// in step with the raster): there the cartridge pulls NMI low, and
+    /// three cycles later it takes over the machine, in time for the NMI
+    /// vector.
+    pub fn freeze(&mut self) -> Result<(), String> {
+        if !self.bus.cart.as_ref().is_some_and(|c| c.can_freeze()) {
+            return Err("no cartridge with a freeze button".into());
+        }
+        let frame = self.standard().frame_cycles() as u64;
+        self.freeze_at = self.bus.cycle + 1 + ((self.freeze_rng.next_u32() as u64 * frame) >> 32);
+        self.freeze_step = 1;
+        Ok(())
+    }
+
+    fn freeze_next_step(&mut self) {
+        self.freeze_at = 0;
+        let Some(cart) = self.bus.cart.as_mut() else { return };
+        if self.freeze_step == 1 {
+            cart.nmi = true;
+            self.freeze_at = self.bus.cycle + 3;
+            self.freeze_step = 2;
+        } else {
+            cart.freeze();
         }
     }
 
@@ -1422,7 +1466,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 24;
+const STATE_VERSION: u32 = 25;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });
@@ -1459,6 +1503,6 @@ fn blend_frames(out: &mut [u32], a: &[u32], b: &[u32]) {
 impl_state!(C64 {
     chip, cpu, bus, framebuffer, work_fb, pending_prg, prg_kind, injected, inject_countdown,
     disk, disk_path, disk_autoload, tape_path, t64, tape_autoload, tape_auto_buttons, tape_found_wait, tape_cbm_key,
-    autoload_run, autoload_sys,
+    autoload_run, autoload_sys, freeze_at, freeze_step, freeze_rng,
     frame_elapsed, frame_count,
 } skip { audio_buf, audio_buf2, dbg, blend, hdr, crt, net });

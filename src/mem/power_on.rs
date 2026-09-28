@@ -21,17 +21,24 @@ use crate::random::Pcg;
 /// RAMInitRandomChance, 0.1%).
 const RANDOM_CHANCE: f64 = 10.0 / 10_000.0;
 
-/// The pattern without the random bits (VICE with
-/// `-raminitrandomchance 0`).
+/// A power-on pattern as VICE's ram_init_with_pattern builds it, without
+/// the random part: from `start`, inverted every `value_invert` bytes
+/// (shifted by `value_offset`) and XORed with `pattern_value` every
+/// `pattern_invert` bytes.
+pub fn pattern(size: usize, start: u8, value_invert: usize, value_offset: usize,
+               pattern_invert: usize, pattern_value: u8) -> Vec<u8> {
+    (0..size).map(|offset| {
+        let j = if ((offset + value_offset) / value_invert) & 1 != 0 { 0xFF } else { 0x00 };
+        let k = if (offset / pattern_invert) & 1 != 0 { pattern_value } else { 0x00 };
+        start ^ j ^ k
+    }).collect()
+}
+
+/// The C64 RAM pattern without the random bits (VICE with
+/// `-raminitrandomchance 0`): RAMInitStartValue 0, RAMInitValueInvert 4,
+/// RAMInitValueOffset 2, RAMInitPatternInvert 16384 with $FF.
 pub fn ram_pattern() -> Box<[u8; 0x10000]> {
-    let mut ram = Box::new([0u8; 0x10000]);
-    for (offset, b) in ram.iter_mut().enumerate() {
-        // RAMInitValueOffset 2, RAMInitValueInvert 4, RAMInitStartValue 0
-        let value = if ((offset + 2) / 4) & 1 != 0 { 0xFF } else { 0x00 };
-        // RAMInitPatternInvert 16384 with RAMInitPatternInvertValue $FF
-        *b = value ^ if (offset / 16384) & 1 != 0 { 0xFF } else { 0x00 };
-    }
-    ram
+    pattern(0x10000, 0x00, 4, 2, 16384, 0xFF).into_boxed_slice().try_into().unwrap()
 }
 
 /// RAM at power-on: the pattern with the random bits, flipped as in

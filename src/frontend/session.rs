@@ -384,6 +384,9 @@ pub struct Session {
     audio: Option<AudioOut>,
     gamepad: Gamepad,
     joy_port: JoyPort,
+    /// Host SHIFT keys held down (left, right): Shift+F11 is the freeze
+    /// button.
+    shift: [bool; 2],
     /// Media from the command line and the one inserted now (F8 switches to
     /// the next).
     media: Vec<String>,
@@ -447,6 +450,7 @@ impl Session {
             audio,
             gamepad: Gamepad::new(),
             joy_port: JoyPort::Two,
+            shift: [false; 2],
             media: opts.input_files.clone(),
             media_pos: 0,
             turbo: turbo.then(LoadDetector::new),
@@ -532,15 +536,28 @@ impl Session {
     pub fn restart_clock(&mut self) { self.next_frame = Instant::now(); }
 
     /// Host key pressed or released. Auto-repeats are ignored. Handles F5/F9
-    /// (state), F8 (next medium, or disk directory), F11 (reset) and TAB
-    /// (joystick port) by itself; returns the keys that belong to the
-    /// frontend.
+    /// (state), F8 (next medium, or disk directory), F11 (reset), Shift+F11
+    /// (the cartridge's freeze button) and TAB (joystick port) by itself;
+    /// returns the keys that belong to the frontend.
     pub fn host_key(&mut self, hk: HostKey, pressed: bool, repeat: bool) -> Option<Hotkey> {
         if pressed && repeat { return None; }
+        match hk {
+            HostKey::LShift => self.shift[0] = pressed,
+            HostKey::RShift => self.shift[1] = pressed,
+            _ => {}
+        }
         if pressed {
             match hk {
                 HostKey::F12 => return Some(Hotkey::Quit),
                 HostKey::F10 => return Some(Hotkey::Fullscreen),
+                HostKey::F11 if self.shift.contains(&true) => {
+                    match self.c64.freeze() {
+                        Ok(()) => crate::notice!("Freeze."),
+                        Err(e) => crate::notice!("Freeze: {e}"),
+                    }
+                    if let Some(r) = &mut self.remote { r.resume(); }
+                    return None;
+                }
                 HostKey::F11 => {
                     self.c64.reset();
                     if let Some(r) = &mut self.remote { r.resume(); }

@@ -297,7 +297,13 @@ impl Bus {
             Mapped::Eth(addr) => self.eth.as_mut().map_or(open, |e| e.read(addr)),
             Mapped::Roml(off) => {
                 let now = self.cycle;
-                self.cart.as_mut().map_or(open, |c| c.read_roml(off, now))
+                match self.cart.as_mut() {
+                    // Action Replay in its broken mode: C64 RAM and
+                    // cartridge RAM together on the bus
+                    Some(c) if c.ram_contention() => c.read_roml(off, now) | self.ram[0x8000 + off as usize],
+                    Some(c) => c.read_roml(off, now),
+                    None => open,
+                }
             }
             Mapped::Romh(off) => {
                 let now = self.cycle;
@@ -326,7 +332,11 @@ impl Bus {
             Mapped::Sid(reg) => self.sid.read(reg),
             Mapped::Sid2(reg) => self.sid2.as_ref().map_or(open, |s| s.read(reg)),
             Mapped::Eth(addr) => self.eth.as_ref().map_or(open, |e| e.peek(addr)),
-            Mapped::Roml(off) => self.cart.as_ref().map_or(open, |c| c.peek_roml(off)),
+            Mapped::Roml(off) => match self.cart.as_ref() {
+                Some(c) if c.ram_contention() => c.peek_roml(off) | self.ram[0x8000 + off as usize],
+                Some(c) => c.peek_roml(off),
+                None => open,
+            },
             Mapped::Romh(off) => self.cart.as_ref().map_or(open, |c| c.peek_romh(off)),
             Mapped::Io1(off) => self.cart.as_ref().and_then(|c| c.peek_io1(off, open)).unwrap_or(open),
             Mapped::Io2(off) => match self.reu.as_ref() {
@@ -339,6 +349,12 @@ impl Bus {
     /// True if the cartridge forces Ultimax mode.
     pub fn ultimax(&self) -> bool {
         self.cart_mode() == Mode::Ultimax
+    }
+
+    /// NMI line pulled low by the cartridge (freeze button).
+    #[inline]
+    pub fn cart_nmi(&self) -> bool {
+        self.cart.as_ref().is_some_and(|c| c.nmi)
     }
 
     /// Cartridge mode (/EXROM and /GAME lines); `Off` without a cartridge.
@@ -639,7 +655,16 @@ impl Bus {
         match addr {
             0x0000 | 0x0001 => self.write_cpu_port(addr, val),
 
-            0x0002..=0x9FFF => self.ram[addr as usize] = val,
+            0x0002..=0x7FFF => self.ram[addr as usize] = val,
+            0x8000..=0x9FFF => {
+                // With ROML visible the cartridge sees the write too (the
+                // Action Replay RAM); the C64 RAM is written anyway
+                let roml = self.loram() && self.hiram();
+                if let Some(c) = self.cart.as_mut().filter(|c| roml && matches!(c.mode, Mode::Game8K | Mode::Game16K)) {
+                    c.write_roml_game(addr - 0x8000, val);
+                }
+                self.ram[addr as usize] = val;
+            }
             0xA000..=0xBFFF => self.ram[addr as usize] = val,
             0xC000..=0xCFFF => self.ram[addr as usize] = val,
 
