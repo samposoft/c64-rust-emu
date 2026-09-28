@@ -20,7 +20,7 @@ python3 gen_data.py                       # writes data.asm
 ../../target/release/c64 robo_nine.prg
 ```
 
-At the `READY.` prompt type `RUN`. The PRG (7.4 KB, from `$0801`) also runs in
+The emulator types `RUN` after boot. The PRG (7.4 KB, from `$0801`) also runs in
 VICE (`x64sc -autostart robo_nine.prg`). At the end it goes back to the
 `READY.` prompt with the program still in memory: `RUN` starts it again.
 

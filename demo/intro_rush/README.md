@@ -15,7 +15,7 @@ e fanno tremare lo schermo, pioggia di sprite e scroller. La musica è
 ./target/release/c64 demo/intro_rush/intro_rush.prg
 ```
 
-Al prompt `READY.` scrivere `RUN`. Il PRG (17 KB, da `$0801`) gira anche su
+L'emulatore scrive `RUN` dopo l'avvio. Il PRG (17 KB, da `$0801`) gira anche su
 un C64 vero o in VICE (`x64sc -autostart intro_rush.prg`). Non si esce: serve
 un reset.
 

@@ -59,7 +59,8 @@ changes of the serial bus lines and DOS jobs queued with the motor on
 (spinning up the motor takes almost a second without disk accesses); not
 from the motor alone, which the DOS leaves running for about 3 seconds after
 the end. A PRG given on the command line is injected once the KERNAL has
-booted, and the boot runs at maximum speed as well. With `--no-turbo` loads
+booted and started (`RUN` for BASIC at `$0801`, otherwise `SYS` to its first
+byte), and the boot runs at maximum speed as well. With `--no-turbo` loads
 run at real speed.
 
 The application icon (Dock on macOS, window on Windows and X11) is in

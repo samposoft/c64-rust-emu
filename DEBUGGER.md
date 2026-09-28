@@ -8,7 +8,7 @@ deterministic output on stdout, meant for pipes, `grep` and scripts. With
 
 ```bash
 cargo build --release
-./target/release/c64dbg prg/Commando.prg -e "run 200; keys RUN\n; run 100; screen; quit"
+./target/release/c64dbg prg/Commando.prg -e "run 300; screen; quit"
 printf 'break 0810\nrun\ndis\nquit\n' | ./target/release/c64dbg prg/game.prg
 ./target/release/c64dbg                       # interactive: license notice, then the dbg> prompt
 ```
@@ -84,7 +84,7 @@ decimal.
 
 | Files and state | |
 |---|---|
-| `load file` | .prg (queued, injected after boot), .d64/.g64 (autoload), .tap (autoload: LOAD, PLAY, C= after FOUND, RUN), .t64 (autoload as a tape: LOAD, then RUN, or SYS for a first program that is not at `$0801`; the KERNAL tape routines read its programs in order), .crt |
+| `load file` | .prg (queued, injected after boot and started with `RUN`, or `SYS` if it is not at `$0801`), .d64/.g64 (autoload), .tap (autoload: LOAD, PLAY, C= after FOUND, RUN), .t64 (autoload as a tape: LOAD, then RUN, or SYS for a first program that is not at `$0801`; the KERNAL tape routines read its programs in order), .crt |
 | `swap` | next medium among the command-line files, like F8 in the window: a tape is inserted rewound with PLAY pressed, a disk replaces the one in the drive after saving its changes |
 | `tape [play\|record\|stop\|ff\|rew]` | Datasette: button, motor, counter, position on the tape, pulses read (with a T64: its programs, `>` on the one found last); without arguments it shows the state, otherwise it presses the button (RECORD only with a tape; FF and REW move the tape with the motor on, which the KERNAL turns on when it sees a button pressed) |
 | `tape insert file\|eject\|save` | `insert` inserts a TAP or a T64 without autoloading it (a missing .tap is a blank tape); `eject` removes it and `save` writes the recordings to the file right away (otherwise on exit or when the tape is changed) |
@@ -107,11 +107,11 @@ decimal.
 | `audio raw file` | captures the first SID's filter output every cycle, before the C64 output stage and resampling: 16-bit little endian, like VICE's `-residrawoutput`; saved by `audio off` |
 | `speed [auto\|real\|max]` | `auto`: 50 frames/s but maximum while loading from disk and tape (default with `--window`); `real`: always 50 frames/s; `max`: maximum (default headless) |
 
-A PRG with load address `$0801` is BASIC: after boot (about 150 frames, at
-maximum speed with `speed auto`, like a load) it must be started with
-`keys "RUN\n"`. A machine-language PRG is started with
-`SYS` automatically. A D64 or G64 is loaded and started by itself; on exit
-the changes the drive made to the disk are written to the file.
+A PRG is injected after boot (about 150 frames, at maximum speed with
+`speed auto`, like a load) and started as VICE's autostart does: `RUN` if
+its load address is `$0801` (BASIC), otherwise `SYS` to its first byte. A
+D64 or G64 is loaded and started by itself; on exit the changes the drive
+made to the disk are written to the file.
 
 ## Window
 

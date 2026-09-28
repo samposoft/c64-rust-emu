@@ -35,7 +35,7 @@ python3 music.py                        # music.asm (already in the repository)
 ../../target/release/c64 --blend build/ifli.prg
 ```
 
-At the `READY.` prompt type `RUN`. SPACE goes back to BASIC, and `RUN`
+The emulator types `RUN` after boot. SPACE goes back to BASIC, and `RUN`
 shows the picture again. The PRGs also run in VICE
 (`x64sc -autostart build/ifli.prg`).
 

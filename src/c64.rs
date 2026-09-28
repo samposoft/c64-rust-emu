@@ -11,8 +11,8 @@ use crate::vic::Chip;
 /// Kind of queued PRG.
 #[derive(Clone, Copy, PartialEq)]
 enum PrgKind {
-    Basic,   // loads at $0801, the user types RUN
-    Machine, // ML load, auto-run via SYS
+    Basic,   // loads at $0801, started with RUN
+    Machine, // ML load, started with SYS
 }
 
 /// Hooks used by the headless debugger. All off by default: no cost
@@ -689,7 +689,7 @@ impl C64 {
         !self.injected && self.pending_prg.is_some()
     }
 
-    /// Loads the PRG into RAM and updates the pointers / auto-run.
+    /// Loads the PRG into RAM, updates the BASIC pointers and starts it.
     fn inject_prg(&mut self) {
         let data = match self.pending_prg.take() {
             Some(d) => d,
@@ -707,27 +707,24 @@ impl C64 {
         }
         let end_addr = (start + to_copy).min(0x10000) as u16;
 
-        match self.prg_kind {
+        // Started as VICE's autostart does: RUN for BASIC (after setting
+        // its pointers), SYS to the first byte for machine code, typed into
+        // the KERNAL keyboard buffer
+        let cmd = match self.prg_kind {
             PrgKind::Basic => {
-                let lo = (load_addr & 0xFF) as u8;
-                let hi = (load_addr >> 8) as u8;
-                let elo = (end_addr & 0xFF) as u8;
-                let ehi = (end_addr >> 8) as u8;
+                let [lo, hi] = load_addr.to_le_bytes();
+                let [elo, ehi] = end_addr.to_le_bytes();
                 self.bus.ram[0x2B] = lo;  self.bus.ram[0x2C] = hi;
                 self.bus.ram[0x2D] = elo; self.bus.ram[0x2E] = ehi;
                 self.bus.ram[0x2F] = elo; self.bus.ram[0x30] = ehi;
                 self.bus.ram[0x31] = elo; self.bus.ram[0x32] = ehi;
+                "RUN\r".to_string()
             }
-            PrgKind::Machine => {
-                let cmd = format!("SYS{}\r", load_addr);
-                let bytes: Vec<u8> = cmd.bytes().take(10).collect();
-                for (i, &b) in bytes.iter().enumerate() {
-                    self.bus.ram[0x0277 + i] = b;
-                }
-                self.bus.ram[0x00C6] = bytes.len() as u8;
-                eprintln!("Auto-run: {}", cmd.trim_end_matches('\r'));
-            }
-        }
+            PrgKind::Machine => format!("SYS{load_addr}\r"),
+        };
+        self.bus.ram[0x0277..0x0277 + cmd.len()].copy_from_slice(cmd.as_bytes());
+        self.bus.ram[0x00C6] = cmd.len() as u8;
+        eprintln!("Auto-run: {}", cmd.trim_end_matches('\r'));
 
         self.injected = true;
     }

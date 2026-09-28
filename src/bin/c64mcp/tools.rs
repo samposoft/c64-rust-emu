@@ -275,8 +275,8 @@ impl Tools {
     }
 
     /// Reset, load the PRG (injected once the KERNAL is ready, at full
-    /// speed), RUN for BASIC (a machine-code PRG gets its SYS typed by the
-    /// loader), then `frames` frames of the program.
+    /// speed, and started by the loader: RUN for BASIC, SYS for machine
+    /// code), then `frames` frames of the program.
     fn load_and_run(&mut self, prg: &Path, frames: u64) -> Result<Vec<Json>, String> {
         let data = std::fs::read(prg).map_err(|e| format!("{}: {e}", prg.display()))?;
         if data.len() < 3 {
@@ -296,9 +296,6 @@ impl Tools {
         }
         if !loaded {
             return Err("the program was not loaded: the KERNAL did not reach READY".into());
-        }
-        if start == 0x0801 {
-            self.machine.cmd("keys \"RUN{return}\"")?;
         }
         self.machine.cmd(&format!("frames {frames}"))?;
         let mut content = vec![text_block(format!(
