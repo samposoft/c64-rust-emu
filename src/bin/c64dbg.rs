@@ -80,7 +80,7 @@ fn main() {
     }
 
     if !o.window {
-        run_debugger(o, Debugger::new());
+        run_debugger(o, Debugger::new(), Commands::new());
         return;
     }
 
@@ -92,10 +92,11 @@ fn main() {
         font: Mutex::new(Vec::new()),
         pause: AtomicBool::new(false),
         quit: AtomicBool::new(false),
-        running: AtomicBool::new(false),
     });
     let (input_tx, input_rx) = mpsc::channel();
     let proxy = event_loop.create_proxy();
+    let commands = Commands::new();
+    let quit = commands.tx.clone();
 
     let worker_shared = shared.clone();
     let worker = std::thread::spawn(move || {
@@ -104,47 +105,73 @@ fn main() {
         dbg.load_turbo = true;
         let audio = o.audio;
         dbg.hook = Some(Box::new(WindowLink::new(worker_shared, proxy.clone(), input_rx, audio)));
-        run_debugger(o, dbg);
+        run_debugger(o, dbg, commands);
         let _ = proxy.send_event(UiEvent::Quit);
     });
 
     let mut app = DbgWindow {
-        window: None, display: None, shared: shared.clone(), input: input_tx,
+        window: None, display: None, shared: shared.clone(), input: input_tx, quit,
         bar: None, cursor: (0.0, 0.0), placement: Placement::default(), capture: MouseCapture::default(),
     };
     event_loop.run_app(&mut app).expect("event loop");
 
-    // Window closed (or `quit`). If emulation is running, the debugger stops
-    // at the next frame, finishes the command and exits by itself: wait for it.
-    // If instead it is idle at the prompt, blocked on stdin, it has nothing to
-    // save (the trace is flushed after every command) and the process exits.
-    // No stdout flush from here: the lock belongs to the debugger thread.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !worker.is_finished()
-        && shared.running.load(Ordering::Relaxed)
-        && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    if worker.is_finished() {
-        let _ = worker.join();
-    } else {
-        std::process::exit(0);
-    }
+    // Window closed (or `quit`). The debugger ends by itself: a command that
+    // runs the machine stops at the next frame, one waiting for a command
+    // gets `Source::Quit`; then it writes what the drives, the Datasette and
+    // the cartridge saved (`save_on_exit`). Wait for it, however long the
+    // writing takes: exiting before would lose it.
+    let _ = worker.join();
 }
 
-/// Loads ROMs and files, then runs the commands from -e, -x and stdin. On
-/// exit it writes the cartridge's saves (EEPROM), if changed.
-fn run_debugger(o: Options, dbg: Debugger) {
+/// Loads ROMs and files, then runs the commands from -e, -x, stdin and the
+/// remote monitor. On exit it writes the changes of disks, tapes and the
+/// cartridge's saves (EEPROM), if any.
+fn run_debugger(o: Options, dbg: Debugger, commands: Commands) {
     let mut c64 = match o.machine.build() {
         Ok(c64) => c64,
         Err(e) => { eprintln!("ERROR: {e}"); std::process::exit(2); }
     };
-    run_commands(o, dbg, &mut c64);
+    run_commands(o, dbg, &mut c64, commands);
     save_on_exit(&mut c64);
 }
 
-fn run_commands(o: Options, mut dbg: Debugger, c64: &mut C64) {
+/// Where a command comes from.
+enum Source {
+    Stdin(String),
+    StdinClosed,
+    /// With `--remote`.
+    Remote(Event),
+    /// The window was closed: the session ends.
+    Quit,
+}
+
+/// The commands after -e and -x, on one channel: stdin is read by a thread
+/// of its own, so that the debugger never blocks on it and a closed window
+/// (`Source::Quit`) always reaches it.
+struct Commands {
+    tx: Sender<Source>,
+    rx: Receiver<Source>,
+}
+
+impl Commands {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self { tx, rx }
+    }
+}
+
+/// Sends the lines of stdin to `tx`, then `StdinClosed` at its end.
+fn read_stdin(tx: Sender<Source>) {
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(Source::Stdin(line)).is_err() { return; }
+        }
+        let _ = tx.send(Source::StdinClosed);
+    });
+}
+
+fn run_commands(o: Options, mut dbg: Debugger, c64: &mut C64, commands: Commands) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
@@ -196,50 +223,44 @@ fn run_commands(o: Options, mut dbg: Debugger, c64: &mut C64) {
     if let Some(listener) = remote {
         let _ = out.flush();
         drop(out);
-        serve_remote(dbg, c64, listener, !o.no_stdin);
+        serve_remote(dbg, c64, listener, !o.no_stdin, commands);
         return;
     }
     if o.no_stdin { let _ = out.flush(); return; }
 
-    let stdin = std::io::stdin();
-    let interactive = stdin.is_terminal();
+    let interactive = std::io::stdin().is_terminal();
     if interactive {
         let _ = writeln!(out, "{}", c64::frontend::session::NOTICE);
         let _ = writeln!(out, "c64dbg — 'help' for the commands, 'quit' to exit");
     }
-    let mut lines = stdin.lock().lines();
+    read_stdin(commands.tx.clone());
+    command_loop(&mut dbg, c64, &commands.rx, &mut out, interactive);
+}
+
+/// Runs the lines from stdin until `quit`, the end of stdin or the window
+/// closing (`Source::Quit`).
+fn command_loop(dbg: &mut Debugger, c64: &mut C64, rx: &Receiver<Source>, out: &mut dyn Write, interactive: bool) {
     loop {
         if interactive { let _ = write!(out, "dbg> "); }
         let _ = out.flush();
-        let line = match lines.next() { Some(Ok(l)) => l, _ => break };
-        let _ = dbg.exec(c64, &line, &mut out);
+        let line = match rx.recv() {
+            Ok(Source::Stdin(line)) => line,
+            _ => break,     // end of stdin, window closed
+        };
+        let _ = dbg.exec(c64, &line, out);
         if dbg.quit { break; }
     }
     let _ = out.flush();
 }
 
-/// Where a command comes from, with `--remote`.
-enum Source {
-    Stdin(String),
-    StdinClosed,
-    Remote(Event),
-}
-
 /// Commands from stdin (if `stdin`) and from the remote monitor, in the
 /// order they arrive. The output of the remote ones goes back to their
 /// client; the session ends with `quit` from stdin or when the window closes.
-fn serve_remote(mut dbg: Debugger, c64: &mut C64, listener: Listener, stdin: bool) {
-    let (tx, rx) = mpsc::channel();
+fn serve_remote(mut dbg: Debugger, c64: &mut C64, listener: Listener, stdin: bool, commands: Commands) {
+    let Commands { tx, rx } = commands;
     let interactive = stdin && std::io::stdin().is_terminal();
     if stdin {
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            for line in std::io::stdin().lock().lines() {
-                let Ok(line) = line else { break };
-                if tx.send(Source::Stdin(line)).is_err() { return; }
-            }
-            let _ = tx.send(Source::StdinClosed);
-        });
+        read_stdin(tx.clone());
     }
     std::thread::spawn(move || {
         while let Some(ev) = listener.recv() {
@@ -293,7 +314,7 @@ fn serve_remote(mut dbg: Debugger, c64: &mut C64, listener: Listener, stdin: boo
                 }
             }
             Ok(Source::Remote(Event::Closed(_))) => {}
-            Err(_) => break,
+            Ok(Source::Quit) | Err(_) => break,
         }
     }
     let _ = stdout.lock().flush();
@@ -315,8 +336,6 @@ struct Shared {
     pause: AtomicBool,
     /// Window closed: the debugger must quit.
     quit: AtomicBool,
-    /// Emulation is running (not idle at the prompt).
-    running: AtomicBool,
 }
 
 /// Debugger → window.
@@ -451,7 +470,6 @@ impl FrameHook for WindowLink {
         if !self.running || realtime != self.realtime {
             self.running = true;
             self.realtime = realtime;
-            self.shared.running.store(true, Ordering::Relaxed);
             let title = if realtime {
                 "c64dbg — running (F12 = pause)"
             } else {
@@ -480,7 +498,6 @@ impl FrameHook for WindowLink {
 
     fn idle(&mut self, c64: &mut C64) {
         self.running = false;
-        self.shared.running.store(false, Ordering::Relaxed);
         self.apply_input(c64);
         // A pause requested while emulation is already stopped does not apply to the next run
         self.shared.pause.store(false, Ordering::Relaxed);
@@ -505,6 +522,8 @@ struct DbgWindow {
     display: Option<Display>,
     shared: Arc<Shared>,
     input: Sender<Input>,
+    /// To the debugger's commands: `Source::Quit` when the window closes.
+    quit: Sender<Source>,
     /// Status bar, created when the character ROM arrives.
     bar: Option<Bar>,
     /// Mouse and image position in the window, for clicks.
@@ -665,7 +684,10 @@ impl ApplicationHandler<UiEvent> for DbgWindow {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                // A running command stops at the next frame, a wait for
+                // the next command ends
                 self.shared.quit.store(true, Ordering::Relaxed);
+                let _ = self.quit.send(Source::Quit);
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(&event),
@@ -692,5 +714,37 @@ impl ApplicationHandler<UiEvent> for DbgWindow {
         if (dx, dy) != (0, 0) {
             let _ = self.input.send(Input::MouseMove(dx, dy));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lines of stdin run through `command_loop`, with `last` after
+    /// them; what they printed.
+    fn session(lines: &[&str], last: Source) -> String {
+        let commands = Commands::new();
+        for l in lines {
+            commands.tx.send(Source::Stdin(l.to_string())).unwrap();
+        }
+        commands.tx.send(last).unwrap();
+        commands.tx.send(Source::Stdin("echo after".into())).unwrap();
+        let mut out = Vec::new();
+        command_loop(&mut Debugger::new(), &mut C64::new(), &commands.rx, &mut out, false);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn a_closed_window_ends_the_wait_for_commands() {
+        // stdin still open, nothing more on it: the window's Quit must end
+        // the loop (the caller then saves the disks), and nothing runs after
+        assert_eq!(session(&["echo one", "echo two"], Source::Quit), "one\ntwo\n");
+    }
+
+    #[test]
+    fn the_end_of_stdin_and_quit_end_the_session() {
+        assert_eq!(session(&["echo one"], Source::StdinClosed), "one\n");
+        assert_eq!(session(&["echo one", "quit"], Source::Quit), "one\n");
     }
 }

@@ -130,7 +130,11 @@ switches port, gamepad on port 2).
   removes the turbo, `speed max` goes back to maximum speed (the window is
   still refreshed every 20 ms, the audio is silent).
 - **F12** pauses: `run` stops with `STOP: paused from the window` and the
-  prompt returns. **F10** full screen. Closing the window quits.
+  prompt returns. **F10** full screen. Closing the window quits, whatever
+  the debugger is doing (a command that runs the machine stops at the next
+  frame, a wait for the next command ends), and first writes what was
+  saved, as `quit` does: disks back into their D64/G64, Datasette
+  recordings, the cartridge's EEPROM.
 - When paused the window shows the frame being built: the current frame up
   to the VIC's beam, the previous one below it, as in VICE. The title shows
   PC, raster line, cycle and frame.
