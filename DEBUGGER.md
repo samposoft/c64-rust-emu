@@ -76,10 +76,11 @@ decimal.
 | `keys "text"` | queues characters on the keyboard, one per frame; `\n` = RETURN, `{name}` = a key named as for `key` (`{return}`, `{f1}`, `{runstop}`, `{clr}`, `{left}`...), queued in order with the characters. One pair of quotes around the text is removed |
 | `key name down\|up\|press` | single key: `return space runstop f1..f8 home clr del inst left right up down lshift rshift ctrl commodore restore` or a character. `press` holds it for 4 frames |
 | `joy1\|joy2 [+\|-]up\|down\|left\|right\|fire ...`, `joy2 none` | joystick state (stays until you change it) |
-| `port [1\|2 joystick\|paddles\|mouse\|joymouse]` | control ports: devices, paddle readings, mouse position or last direction pulses, which port the SID POT pins are on (CIA1 PA6/PA7) and `$D419`/`$D41A`; with arguments it plugs a device |
+| `port [1\|2 joystick\|paddles\|mouse\|joymouse \| 1 lightpen\|lightpen-left\|datel\|inkwell\|magnum\|stack]` | control ports: devices, paddle readings, mouse position or last direction pulses, light pen pointer, which port the SID POT pins are on (CIA1 PA6/PA7) and `$D419`/`$D41A`; with arguments it plugs a device (light pens and guns only into port 1) |
 | `mouse dx dy` | moves the host mouse by dx, dy C64 pixels (y downwards): 1351 mouse (2 POT units per pixel, at most 63 per call), 1351 in joystick mode (a direction pulse every pixel) and paddles (one step per pixel, X horizontally, Y vertically) |
 | `mouse left\|right down\|up\|press` | mouse button: 1351 left = fire, right = up (in joystick mode POTX to 0); paddles: fire of paddle X (left line) and Y (right line). `press` holds it for 4 frames |
 | `paddle 1\|2 x y` | paddle readings of a port, 0-255 (what `$D419`/`$D41A` give after the next measurement) |
+| `pen X Y`, `pen off` | light pen or gun in port 1: the pointer at VIC X coordinate X (as for sprites) and raster line Y, or off the screen; it prints where the beam will pass under it (a pen sees only while the right mouse button is down: `mouse right down`). The latched position is in `$D013`/`$D014` (`vic`) |
 
 | Files and state | |
 |---|---|

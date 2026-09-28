@@ -104,7 +104,10 @@ impl MachineOptions {
                amount up to CYCLES (0.001-10, as VICE's -dstapeerror in thousandths)
   --port1 DEV, --port2 DEV  device in control port 1 or 2: joystick (default),
                paddles (follow the pointer), mouse (1351, captured with a click) or
-               joymouse (1351 in joystick mode, as the 1350), in the window only
+               joymouse (1351 in joystick mode, as the 1350); in port 1 only, a light
+               pen that follows the pointer and sees the screen while the right button
+               is held (lightpen: button on UP, lightpen-left, datel, inkwell) or a
+               light gun, trigger = left button (magnum, stack); in the window only
   --blend      show every frame mixed with the previous one, as the eye sees a 50 Hz
                CRT: for pictures that alternate two frames (interlace, IFLI)
   --crt SET    show the screen as a real set does, on the GPU: the signal of the VIC-II
@@ -203,8 +206,14 @@ impl MachineOptions {
                 None => { eprintln!("--remote-socket needs the path of the socket"); std::process::exit(2); }
             },
             "--port1" | "--port2" => match rest.next().as_deref().and_then(Device::parse) {
+                Some(d) if !d.fits(if arg == "--port1" { 0 } else { 1 }) => {
+                    eprintln!("{arg}: light pens and guns go into control port 1"); std::process::exit(2);
+                }
                 Some(d) => self.ports[if arg == "--port1" { 0 } else { 1 }] = d,
-                None => { eprintln!("{arg} needs the device: joystick, paddles, mouse or joymouse"); std::process::exit(2); }
+                None => {
+                    eprintln!("{arg} needs the device: joystick, paddles, mouse, joymouse, or in port 1 lightpen, lightpen-left, datel, inkwell, magnum, stack");
+                    std::process::exit(2);
+                }
             },
             "--tape-azimuth" => match rest.next().as_deref().and_then(parse_azimuth) {
                 Some(e) => self.tape_azimuth = Some(e),
@@ -401,7 +410,7 @@ pub struct Session {
     /// Host mouse movement for the next frame, in C64 pixels.
     mouse: (i32, i32),
     /// Host pointer over the screen for the paddles, for the next frame.
-    pointer: Option<(i32, i32)>,
+    pointer: Option<Option<(i32, i32)>>,
     /// Remote monitor (`--remote`).
     remote: Option<RemoteMonitor>,
 }
@@ -603,15 +612,16 @@ impl Session {
         None
     }
 
-    /// Paddles and 1351 mouse in the control ports.
+    /// Paddles, light pens and 1351 mouse in the control ports.
     pub fn analog(&self) -> super::window::Analog {
-        super::window::Analog { paddles: self.c64.bus.ctrl.has_paddles(), mouse: self.c64.bus.ctrl.has_mouse() }
+        super::window::Analog { pointed: self.c64.bus.ctrl.has_pointed(), mouse: self.c64.bus.ctrl.has_mouse() }
     }
 
-    /// Host pointer at `(x, y)` in the framebuffer, for the paddles: applied
-    /// at the start of the next frame.
-    pub fn point_paddles(&mut self, x: i32, y: i32) {
-        self.pointer = Some((x, y));
+    /// Host pointer at `(x, y)` in the framebuffer (`None`: off the C64
+    /// screen), for the paddles and the light pens: applied at the start of
+    /// the next frame.
+    pub fn point_at(&mut self, at: Option<(i32, i32)>) {
+        self.pointer = Some(at);
     }
 
     /// Host mouse movement in C64 pixels (Y downwards), applied at the start
@@ -711,8 +721,8 @@ impl Session {
             self.c64.mouse_move(self.mouse.0, self.mouse.1);
             self.mouse = (0, 0);
         }
-        if let Some((x, y)) = self.pointer.take() {
-            self.c64.point_paddles(x, y);
+        if let Some(at) = self.pointer.take() {
+            self.c64.point_at(at);
         }
         let done = match &mut self.remote {
             Some(r) => r.run_frame(&mut self.c64),

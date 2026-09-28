@@ -53,6 +53,8 @@ their comments and checked against VICE by the tests:
 | `src/cart/eeprom.rs` (M93C86 EEPROM of GMod2) | `src/core/m93c86.c`, `src/c64/cart/gmod2.c` | Groepaz |
 | `src/cart/mod.rs` (cartridge types) | `src/c64/cart/*.c` (e.g. `easyflash.c`: ALeX Kazik, Marco van den Heuvel; `actionreplay.c`: Andreas Boose; `final3.c` and `retroreplay.c`: Andreas Boose, Groepaz) | the VICE Team |
 | `src/c64.rs` (freeze button: delay and NMI) | `src/c64/cart/c64cart.c` | the VICE Team |
+| `src/vic/mod.rs` (light pen latch) | `src/viciisc/vicii-lightpen.c` | Hannu Nuotio |
+| `src/ctrlport.rs`, `src/c64.rs` (light pens and guns: types, offsets, beam timing) | `src/joyport/lightpen.c` | Hannu Nuotio, Marco van den Heuvel |
 
 ## reSID
 

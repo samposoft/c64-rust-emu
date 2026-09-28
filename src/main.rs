@@ -48,7 +48,7 @@ const HELP: &[&str] = &[
     "F8 next medium  F10 fullscreen  F11 reset",
     "F12 quit  click the Datasette buttons",
     "Shift+F11 freeze button (AR, FC3, RR)",
-    "paddles: point at the screen, click = fire",
+    "paddles, light pen: point at the screen, click = buttons",
     "1351 mouse: click the screen, Cmd or middle button releases",
 ];
 
@@ -156,12 +156,13 @@ impl App {
         }
     }
 
-    /// Pointer moved: the paddles follow it over the C64 screen.
+    /// Pointer moved: the paddles and the light pens follow it over the C64
+    /// screen.
     fn pointer_moved(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
         let at = self.placement.to_image_signed(x, y);
-        if let Some((x, y)) = self.capture.paddles_at(at, self.session.analog(), self.placement.rows) {
-            self.session.point_paddles(x, y);
+        if let Some(at) = self.capture.pointed_at(at, self.session.analog(), self.placement.rows) {
+            self.session.point_at(at);
         }
     }
 
@@ -206,6 +207,11 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event, event_loop),
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::CursorMoved { position, .. } => self.pointer_moved(position.x, position.y),
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(at) = self.capture.pointed_at(None, self.session.analog(), self.placement.rows) {
+                    self.session.point_at(at);
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => self.mouse_button(button, state == ElementState::Pressed),
             WindowEvent::Focused(false) => {
                 self.release_mouse();

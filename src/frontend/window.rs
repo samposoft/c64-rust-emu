@@ -291,7 +291,8 @@ impl Display {
 /// Devices in the control ports that the window drives with the host mouse.
 #[derive(Clone, Copy, Default)]
 pub struct Analog {
-    pub paddles: bool,
+    /// Paddles, light pen or gun: they follow the pointer over the screen.
+    pub pointed: bool,
     pub mouse: bool,
 }
 
@@ -370,7 +371,7 @@ impl MouseCapture {
         if on_screen && analog.mouse {
             return if b == Button::Left { Pointer::Capture } else { Pointer::Nothing };
         }
-        if on_screen && analog.paddles {
+        if on_screen && analog.pointed {
             self.held |= bit;
             return Pointer::Button(b, true);
         }
@@ -381,11 +382,14 @@ impl MouseCapture {
         Pointer::Nothing
     }
 
-    /// Pointer moved to `at`: the position for the paddles, when they are
-    /// driven by the pointer (not captured) and it is not over the bar.
-    pub fn paddles_at(&self, at: Option<(i32, i32)>, analog: Analog, rows: usize) -> Option<(i32, i32)> {
-        let (x, y) = at?;
-        (analog.paddles && !self.captured && y < rows as i32).then_some((x, y))
+    /// Pointer moved to `at`, for the devices that follow it (not while the
+    /// mouse is captured): `Some(None)` when it is off the C64 screen (over
+    /// the bar, outside the window), where a light pen sees nothing.
+    pub fn pointed_at(&self, at: Option<(i32, i32)>, analog: Analog, rows: usize) -> Option<Option<(i32, i32)>> {
+        if !analog.pointed || self.captured {
+            return None;
+        }
+        Some(at.filter(|&(x, y)| (0..WIDTH as i32).contains(&x) && (0..rows as i32).contains(&y)))
     }
 
     /// Hides and locks the cursor; false if the system does not allow it.

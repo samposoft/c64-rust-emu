@@ -840,10 +840,11 @@ impl Debugger {
   keys text          type text on the keyboard (\\n = RETURN, {name} = a key named as for key: {f1} {clr} {left}...)
   key name down|up|press   (return space runstop f1..f8 home clr del inst left right up down lshift rshift ctrl commodore restore, or a character)
   joy1|joy2 [+|-]up|down|left|right|fire ... | none
-  port [1|2 joystick|paddles|mouse|joymouse]   control ports: devices, paddles, mouse, SID POT registers; plugs a device
+  port [1|2 joystick|paddles|mouse|joymouse | 1 lightpen|lightpen-left|datel|inkwell|magnum|stack]   control ports: devices, paddles, mouse, light pen, SID POT registers; plugs a device
   mouse dx dy        move the host mouse by dx, dy C64 pixels (y down): 1351 mouse (both modes) and paddles
   mouse left|right down|up|press   mouse button (1351: left = fire, right = up, in joystick mode POTX; paddles: fire of X / Y)
   paddle 1|2 x y     paddle readings of a port (0-255)
+  pen X Y | pen off  light pen or gun in port 1: pointer at VIC X (sprite coordinates) and raster line Y; a pen sees only with the right button (mouse right down)
   load file          load .prg/.d64/.g64/.tap/.t64/.crt      savestate file | loadstate file   reset
   freeze             freeze button of the cartridge (Action Replay, Final Cartridge III, Retro Replay), like Shift+F11 in the window
   speed [auto|real|max]  auto: real speed, maximum while loading from disk and tape (default with --window); real: always 50 frames/s; max: maximum
@@ -1456,10 +1457,13 @@ impl Debugger {
                 if let [n, dev] = args[..] {
                     let port = parse_port(n)?;
                     let dev = crate::ctrlport::Device::parse(dev)
-                        .ok_or("usage: port 1|2 joystick|paddles|mouse|joymouse")?;
+                        .ok_or("usage: port 1|2 joystick|paddles|mouse|joymouse, port 1 lightpen|lightpen-left|datel|inkwell|magnum|stack")?;
+                    if !dev.fits(port - 1) {
+                        return Err("light pens and guns go into control port 1".into());
+                    }
                     c64.set_control_port(port, dev);
                 } else if !args.is_empty() {
-                    return Err("usage: port [1|2 joystick|paddles|mouse|joymouse]".into());
+                    return Err("usage: port [1|2 joystick|paddles|mouse|joymouse | 1 lightpen|lightpen-left|datel|inkwell|magnum|stack]".into());
                 }
                 let now = c64.bus.cycle;
                 c64.bus.ctrl.sync(now);
@@ -1493,6 +1497,24 @@ impl Debugger {
                     writeln!(out, "(no paddles or mouse in the control ports: see port)").map_err(io)?;
                 }
                 writeln!(out, "ok").map_err(io)?;
+            }
+            "pen" => {
+                // Pointer at VIC X (sprite coordinates) and raster line Y
+                const USAGE: &str = "usage: pen X Y (VIC X coordinate and raster line) | pen off";
+                match args[..] {
+                    ["off"] => c64.point_at(None),
+                    [x, y] => {
+                        let parse = |v: &str| v.parse::<i32>().map_err(|_| USAGE.to_string());
+                        let (x, y) = (parse(x)?, parse(y)?);
+                        let std = c64.standard();
+                        let fy = (y - std.first_fb_line() as i32).rem_euclid(std.raster_lines() as i32);
+                        c64.point_at(Some((x - 24 + crate::vic::DISPLAY_X as i32, fy)));
+                    }
+                    _ => return Err(USAGE.into()),
+                }
+                c64.light_pen_frame();
+                writeln!(out, "light pen: {}", c64.bus.vic.lp_pulse.map_or("sees nothing".to_string(),
+                    |(line, cycle, _)| format!("the beam passes under it at line {line}, cycle {cycle}"))).map_err(io)?;
             }
             "paddle" => {
                 const USAGE: &str = "usage: paddle 1|2 x y (0-255)";

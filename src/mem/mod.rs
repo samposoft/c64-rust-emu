@@ -509,6 +509,33 @@ impl Bus {
         (self.joy1 & self.ctrl.lines(0, self.cycle), self.joy2 & self.ctrl.lines(1, self.cycle))
     }
 
+    /// LP line of the VIC, wired to CIA1 PB4 and to FIRE of control port 1:
+    /// low when the keyboard, the CIA1 port B output or port 1 pull PB4
+    /// low (VICE's cia1_internal_lightpen_check).
+    pub fn light_pen_line_low(&self) -> bool {
+        let (joy1, joy2) = self.joy_lines();
+        let pa = self.cia1.regs[0] | !self.cia1.regs[2];
+        let pb = self.cia1.regs[1] | !self.cia1.regs[3];
+        let mut val = 0xFF;
+        if self.keyboard.any_pressed() {
+            let columns = pa & joy2;
+            for i in (0..8).filter(|i| columns & (1 << i) == 0) {
+                val &= !self.keyboard.connected(1 << i, 0).1;
+            }
+        }
+        val & pb & joy1 & 0x10 == 0
+    }
+
+    /// Brings the VIC's LP line up to date. `force` (a write to the CIA1
+    /// ports) schedules a trigger even if the line was already low, as in
+    /// VICE; otherwise only a change counts.
+    pub fn update_light_pen(&mut self, force: bool) {
+        let low = self.light_pen_line_low();
+        if force || low != self.vic.light_pen_low() {
+            self.vic.set_light_pen(low, self.cycle);
+        }
+    }
+
     /// CIA1 Port A ($DC00), as VICE's read_ciapa: pins of the port pulled
     /// low by joystick 2 and by the keyboard. A PB line held low (an output
     /// at 0, or joystick 1) pulls low the PA lines of its keys, which lets
@@ -714,6 +741,9 @@ impl Bus {
                 self.cia1.write(reg, val);
                 if reg == 0 || reg == 2 {
                     self.pot_mask_changed();
+                }
+                if reg < 4 {
+                    self.update_light_pen(true);
                 }
             }
             0xDD00..=0xDDFF => self.cia2.write((addr & 0x0F) as u8, val),

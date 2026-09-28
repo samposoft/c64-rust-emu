@@ -3,8 +3,9 @@
 // The 1351 reading, the movement limit and the port selection follow VICE 3.10
 // (joyport/mouse_1351.c, mouse.c, joyport.c), Copyright (C) Marco van den
 // Heuvel, Andreas Boose, Hannu Nuotio; the joystick mode follows
-// joyport/mouse_digital.c, Copyright (C) the VICE Team; the SID measurement
-// model is new.
+// joyport/mouse_digital.c, Copyright (C) the VICE Team; the light pens and
+// guns follow joyport/lightpen.c, Copyright (C) Hannu Nuotio, Marco van den
+// Heuvel; the SID measurement model is new.
 // Ported to Rust and modified by SampoSoft in 2026; see CREDITS.md.
 
 //! Control ports: what is plugged into the two joystick ports besides a
@@ -37,6 +38,12 @@
 //! (`(pos & $7F) + $40`, as VICE), the left button on FIRE and the right on
 //! UP. VICE also adds random noise to the readings; here they are exact, so
 //! runs stay reproducible.
+//!
+//! Light pens and light guns go into port 1, whose FIRE line is the VIC's
+//! LP input: their sensor fires when the beam passes under the host
+//! pointer (`C64::light_pen_frame`), a pen only while it touches the screen
+//! (host right button held), a gun always. Their buttons are joystick
+//! lines, or POTY pulled to ground (VICE's lightpen.c types).
 
 use crate::snapshot::{impl_state, impl_state_enum};
 
@@ -49,6 +56,32 @@ pub enum Device {
     Mouse,
     /// 1351 in joystick mode (1350).
     JoyMouse,
+    /// Light pen with its button on UP (Atari CX75 type).
+    PenUp,
+    /// Light pen with its button on LEFT.
+    PenLeft,
+    /// Datel light pen (button on LEFT).
+    PenDatel,
+    /// Magnum Light Phaser, Cheetah Defender (trigger on POTY).
+    GunMagnum,
+    /// Stack Light Rifle (trigger on LEFT).
+    GunStack,
+    /// Inkwell light pen (buttons on LEFT and POTY).
+    PenInkwell,
+}
+
+/// How a light pen or gun works (VICE's lp_type).
+#[derive(Clone, Copy, Debug)]
+pub struct Pen {
+    /// A pen sees the screen only while it touches it (host right button
+    /// held); a gun always.
+    pub touch: bool,
+    /// Lines of the host left and right buttons: joystick bits, or 0x20 =
+    /// POTY to ground.
+    pub buttons: [u8; 2],
+    /// Position of the sensor relative to the pointer, in pixels (VICE's
+    /// offsets, tuned on the real devices and games).
+    pub offset: (i32, i32),
 }
 
 impl Device {
@@ -58,8 +91,37 @@ impl Device {
             "paddles" | "paddle" => Some(Device::Paddles),
             "mouse" | "1351" => Some(Device::Mouse),
             "joymouse" | "1350" => Some(Device::JoyMouse),
+            "lightpen" | "pen" => Some(Device::PenUp),
+            "lightpen-left" | "pen-left" => Some(Device::PenLeft),
+            "datel" => Some(Device::PenDatel),
+            "magnum" => Some(Device::GunMagnum),
+            "stack" => Some(Device::GunStack),
+            "inkwell" => Some(Device::PenInkwell),
             _ => None,
         }
+    }
+
+    /// Light pen or gun: how it works.
+    pub fn pen(self) -> Option<Pen> {
+        const UP: u8 = 0x01;
+        const LEFT: u8 = 0x04;
+        const POTY: u8 = 0x20;
+        let (touch, buttons, offset) = match self {
+            Device::PenUp => (true, [UP, 0], (0, 0)),
+            Device::PenLeft => (true, [LEFT, 0], (0, 0)),
+            Device::PenDatel => (true, [LEFT, 0], (20, -5)),
+            Device::GunMagnum => (false, [POTY, 0], (30, -10)),
+            Device::GunStack => (false, [LEFT, 0], (20, 0)),
+            Device::PenInkwell => (false, [LEFT, POTY], (20, 0)),
+            _ => return None,
+        };
+        Some(Pen { touch, buttons, offset })
+    }
+
+    /// Can go into control port `port` (0 or 1): pens and guns only into
+    /// port 1, where the LP input of the VIC is.
+    pub fn fits(self, port: usize) -> bool {
+        port == 0 || self.pen().is_none()
     }
 
     pub fn name(self) -> &'static str {
@@ -68,6 +130,12 @@ impl Device {
             Device::Paddles => "paddles",
             Device::Mouse => "1351 mouse",
             Device::JoyMouse => "1351 mouse in joystick mode",
+            Device::PenUp => "light pen (button up)",
+            Device::PenLeft => "light pen (button left)",
+            Device::PenDatel => "Datel light pen",
+            Device::GunMagnum => "Magnum Light Phaser",
+            Device::GunStack => "Stack Light Rifle",
+            Device::PenInkwell => "Inkwell light pen",
         }
     }
 
@@ -80,6 +148,12 @@ impl Device {
     /// captures the host mouse for it.
     pub fn is_mouse(self) -> bool {
         matches!(self, Device::Mouse | Device::JoyMouse)
+    }
+
+    /// Pointed at the screen with the host pointer, without capturing it:
+    /// paddles, light pens and guns.
+    pub fn is_pointed(self) -> bool {
+        self == Device::Paddles || self.pen().is_some()
     }
 }
 
@@ -130,6 +204,9 @@ pub struct ControlPorts {
     joy_until: [u64; 2],
     /// Ports selected by CIA1 PA6/PA7 (bit 0 = port 1, bit 1 = port 2).
     mask: u8,
+    /// Host pointer over the framebuffer, for a light pen or gun (`None`:
+    /// off the screen).
+    pub pointer: Option<(i32, i32)>,
     /// Cycle up to which the measurement has been computed.
     pos: u64,
     pins: [Pin; 2],
@@ -147,6 +224,7 @@ impl ControlPorts {
             joy_until: [0; 2],
             // CIA1 after reset: PA all inputs, read as 1 (both ports)
             mask: 3,
+            pointer: None,
             pos: 0,
             pins: [Pin { latched: OPEN, ..Pin::default() }; 2],
         }
@@ -162,6 +240,10 @@ impl ControlPorts {
             _ if self.buttons == 0 => return 0xFF,
             Device::Mouse => (0x10, 0x01),   // FIRE, UP
             Device::Paddles => (0x04, 0x08), // LEFT, RIGHT
+            d => {
+                let b = d.pen().unwrap().buttons;
+                (b[0] & 0x1F, b[1] & 0x1F)
+            }
         };
         let mut v = 0xFF;
         if self.buttons & 1 != 0 { v &= !left; }
@@ -192,6 +274,12 @@ impl ControlPorts {
             Device::JoyMouse => if axis == 0 && self.buttons & 2 != 0 { 0 } else { OPEN },
             Device::Paddles => self.paddles[port][axis],
             Device::Mouse => ((self.mouse[axis] & 0x7F) + 0x40) as u8,
+            // A pen or gun button on POTY pulls it to ground
+            d => {
+                let b = d.pen().unwrap().buttons;
+                let pressed = (self.buttons & 1 != 0 && b[0] & 0x20 != 0) || (self.buttons & 2 != 0 && b[1] & 0x20 != 0);
+                if axis == 1 && pressed { 0 } else { OPEN }
+            }
         }
     }
 
@@ -291,7 +379,7 @@ impl ControlPorts {
                     p[0] = (p[0] as i32 - dx).clamp(0, 255) as u8;
                     p[1] = (p[1] as i32 + dy).clamp(0, 255) as u8;
                 }
-                Device::Mouse | Device::JoyMouse => {}
+                _ => {}
             }
         }
         if self.devices.contains(&Device::JoyMouse) && !typing {
@@ -326,6 +414,7 @@ impl ControlPorts {
     pub fn point_at(&mut self, x: i32, y: i32, now: u64) {
         use crate::vic::{DISPLAY_X, DISPLAY_Y};
         self.sync(now);
+        self.pointer = Some((x, y));
         let px = ((x - DISPLAY_X as i32) * 255 / 319).clamp(0, 255) as u8;
         let py = ((y - DISPLAY_Y as i32) * 255 / 199).clamp(0, 255) as u8;
         for port in 0..2 {
@@ -371,6 +460,10 @@ impl ControlPorts {
                     let dir = |b: u8| match b { 0x01 => "up", 0x02 => "down", 0x04 => "left", 0x08 => "right", _ => "-" };
                     s += &format!("  last pulses {} {}", dir(self.joy_dir[0]), dir(self.joy_dir[1]));
                 }
+                _ => match self.pointer {
+                    Some((x, y)) => s += &format!("  pointer at framebuffer {x},{y} (VIC X {})", x - crate::vic::DISPLAY_X as i32 + 24),
+                    None => s += "  pointer off the screen",
+                },
             }
             s.push('\n');
         }
@@ -387,9 +480,10 @@ impl ControlPorts {
         self.devices.iter().any(|d| d.is_analog())
     }
 
-    /// Some port has paddles.
-    pub fn has_paddles(&self) -> bool {
-        self.devices.contains(&Device::Paddles)
+    /// Some port has a device pointed with the host pointer (paddles, light
+    /// pen or gun).
+    pub fn has_pointed(&self) -> bool {
+        self.devices.iter().any(|d| d.is_pointed())
     }
 
     /// Some port has a mouse (either mode), which needs the host mouse
@@ -405,9 +499,9 @@ impl Default for ControlPorts {
     }
 }
 
-impl_state_enum!(Device { Joystick, Paddles, Mouse, JoyMouse });
+impl_state_enum!(Device { Joystick, Paddles, Mouse, JoyMouse, PenUp, PenLeft, PenDatel, GunMagnum, GunStack, PenInkwell });
 impl_state!(Pin { charge, reached, latched });
-impl_state!(ControlPorts { devices, paddles, mouse, buttons, joy_acc, joy_dir, joy_until, mask, pos, pins });
+impl_state!(ControlPorts { devices, paddles, mouse, buttons, joy_acc, joy_dir, joy_until, mask, pointer, pos, pins });
 
 #[cfg(test)]
 mod tests {
@@ -418,6 +512,25 @@ mod tests {
         c.set_device(0, dev, 0);
         c.set_mask(1, 0);
         c
+    }
+
+    #[test]
+    fn light_pens_and_guns() {
+        assert!(Device::GunMagnum.fits(0) && !Device::GunMagnum.fits(1) && Device::Paddles.fits(1));
+        assert_eq!(Device::parse("datel"), Some(Device::PenDatel));
+        // Buttons: LEFT for the Stack rifle, POTY to ground for the Magnum
+        let mut c = ports(Device::GunStack);
+        assert_eq!(c.lines(0, 0), 0xFF);
+        c.set_button(Button::Left, true, 0);
+        assert_eq!(c.lines(0, 0), 0xFB);
+        let mut c = ports(Device::GunMagnum);
+        c.set_button(Button::Left, true, 0);
+        assert_eq!((c.lines(0, 0), c.read(0x19, 1024), c.read(0x1A, 1024)), (0xFF, 0xFF, 0));
+        // Inkwell: the right button on POTY, the left one on LEFT
+        let mut c = ports(Device::PenInkwell);
+        c.set_button(Button::Right, true, 0);
+        assert_eq!((c.lines(0, 0), c.read(0x1A, 1024)), (0xFF, 0));
+        assert!(Device::PenUp.pen().unwrap().touch && !Device::GunStack.pen().unwrap().touch);
     }
 
     #[test]

@@ -201,7 +201,7 @@ F11, or until Claude's connection closes. `c64mcp` works on macOS and Linux
 | Shift+F11 | freeze button of the cartridge (Action Replay, Final Cartridge III, Retro Replay) |
 | F12 | quit |
 | Click on the status bar | Datasette buttons (RECORD, PLAY, REW, FF, STOP); on the counter: reset it |
-| Pointer over the C64 screen, left/right click | with paddles in a control port: position of the knobs, fire of paddle X / Y |
+| Pointer over the C64 screen, left/right click | with paddles in a control port: position of the knobs, fire of paddle X / Y; with a light pen in port 1: where it looks, its button (left) and the touch on the screen (right; a gun: left = trigger) |
 | Click on the C64 screen | with a 1351 mouse in a control port: captures the host mouse for it |
 | Cmd (Windows/Super key on Windows and Linux), middle mouse button | releases the captured mouse (so does switching to another window) |
 
@@ -221,11 +221,12 @@ lowercase mode, a graphic character in BASIC's uppercase mode, as on the
 real keyboard. Pasted text and the debugger's `keys` type letters without
 SHIFT instead, so that BASIC commands come out whatever their case. A gamepad, if connected, acts on port 2.
 
-### Paddles and 1351 mouse
+### Paddles, 1351 mouse and light pen
 
 `--port1 DEV` and `--port2 DEV` plug a device into a control port:
-`joystick` (default), `paddles`, `mouse` (a 1351 in proportional mode) or
-`joymouse` (a 1351 in joystick mode, as the older 1350).
+`joystick` (default), `paddles`, `mouse` (a 1351 in proportional mode),
+`joymouse` (a 1351 in joystick mode, as the older 1350), and in port 1 only
+a light pen or gun (see below).
 They are driven by the host mouse, in the window of `c64` and of
 `c64dbg --window` (not in `c64term`).
 
@@ -256,12 +257,37 @@ They are driven by the host mouse, in the window of `c64` and of
   So while a key is held on the computer, and for half a second after the
   last one, the host mouse movement is ignored in this mode (releasing the
   mouse with Cmd before typing works too).
+- **Light pen and light gun** (port 1, whose fire line is the VIC-II's LP
+  input): the pointer, which stays visible, is where the device looks at
+  the screen. When the beam passes under it the sensor fires and the VIC
+  latches the beam position into `$D013`/`$D014` and raises the light pen
+  interrupt. A pen sees only while it touches the screen, that is while
+  the right button is held; a gun always. The types are VICE's:
+  `lightpen` (button on the up line, as the Atari CX75), `lightpen-left`,
+  `datel`, `inkwell` (second button on POTY), `magnum` (Magnum Light
+  Phaser and Cheetah Defender, trigger on POTY) and `stack` (Stack Light
+  Rifle, trigger on the left line); the left button is the button or the
+  trigger. As in VICE, each type sees a few pixels away from the pointer
+  (the Datel pen 20 to the right and 5 up, the guns 20-30 to the right),
+  as the real devices do with the games made for them.
 
 As on the C64, CIA1 PA6/PA7 (`$DC00` bits 6-7) choose which port reaches the
 SID, and the SID measures every 512 cycles: after switching port the
 registers hold the old measurement until the next one, and a switch during a
 measurement gives a mixed value. The KERNAL keyboard scan leaves port 1
-selected. In the debugger: `port`, `mouse`, `paddle` (see DEBUGGER.md).
+selected. In the debugger: `port`, `mouse`, `paddle`, `pen` (see
+DEBUGGER.md).
+
+The VIC-II side of the light pen is VICE's: the LP input is the same line
+as CIA1 PB4, so the keyboard, a joystick in port 1 (fire) and a program
+writing `$DC01` trigger it too, as on a real C64. The VIC latches the beam
+position in the cycle after the line goes low, once per frame; X is half
+the beam's X coordinate plus 2 pixels on the NMOS chips (1 on the 8565 and
+8562), Y the raster line. If the line is still low when a frame begins, it
+latches again at line 0 with X = `$D1` (`$D5` with 65 cycles per line); on
+the first revisions (6569R1, 6567R56A) only this latch raises the
+interrupt. Checked against VICE on all seven VIC-II models: a program
+pulls PB4 low one cycle later in each frame and reads the registers.
 
 
 ### Interlace pictures: `--blend`
@@ -925,8 +951,9 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
 ### What really remains
 
 - SID: at most two chips (VICE 3.10 handles up to eight). Control ports:
-  joystick, paddles and 1351 mouse in both modes only (no light pen, Neos
-  mouse, Koalapad), and the mouse is not available in `c64term`.
+  joystick, paddles, 1351 mouse in both modes and light pens and guns only
+  (no Neos mouse, Koalapad), and the mouse and the light pen are not
+  available in `c64term`.
 - Freezer cartridges other than the Action Replay, the Final Cartridge III
   and the Retro Replay (whose flash cannot be rewritten), and utility
   cartridges (see above).
@@ -937,7 +964,6 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
   through `--eth-forward`.
 - Drive: only one (number 8), no 1571/1581, parallel cables or drive RAM
   expansions; NIB/P64 images not supported.
-- VIC-II: no light pen (the registers read 0).
 - Monitor and TV: no 1701/1702 PAL (their PAL schematics are not
   available) and no 1802 (its manual gives neither tube nor pitch); the
   peaking of the PAL 1084S and of the 1901's video output stage is not

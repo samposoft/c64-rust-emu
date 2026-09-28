@@ -154,6 +154,19 @@ impl<A: State, B: State> State for (A, B) {
     }
 }
 
+impl<A: State, B: State, C: State> State for (A, B, C) {
+    fn save(&self, w: &mut Writer) {
+        self.0.save(w);
+        self.1.save(w);
+        self.2.save(w);
+    }
+    fn load(&mut self, r: &mut Reader) -> Result<()> {
+        self.0.load(r)?;
+        self.1.load(r)?;
+        self.2.load(r)
+    }
+}
+
 impl<T: State + ?Sized> State for Box<T> {
     fn save(&self, w: &mut Writer) {
         (**self).save(w);

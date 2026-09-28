@@ -97,6 +97,13 @@ impl Chip {
         matches!(self, Chip::Mos6569R1 | Chip::Mos6567R56A)
     }
 
+    /// First revisions: the light pen IRQ comes only from the trigger at
+    /// the start of the frame, with the line still low (VICE's
+    /// lightpen_old_irq_mode).
+    pub fn old_lightpen_irq(self) -> bool {
+        matches!(self, Chip::Mos6569R1 | Chip::Mos6567R56A)
+    }
+
     /// Luma levels of the 16 colors, 0-32 (Pepto's colodore model; the first
     /// revisions: his levels for them, VICE's `vicii_colors_old`).
     pub fn luma(self) -> &'static [u8; 16] {

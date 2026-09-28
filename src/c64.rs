@@ -1117,6 +1117,7 @@ impl C64 {
 
     /// End-of-frame housekeeping: PRG injection, D64 autoload, audio samples.
     fn end_of_frame(&mut self) {
+        self.light_pen_frame();
         // Virtual network: the frames the C64 sent, the answers for it
         if self.net.is_some() && self.bus.eth.is_some() {
             let now = self.micros();
@@ -1378,10 +1379,44 @@ impl C64 {
         self.bus.ctrl.set_button(b, pressed, self.bus.cycle);
     }
 
-    /// Host pointer at `(x, y)` in the framebuffer: sets the paddles from its
-    /// position over the display area (see `ControlPorts::point_at`).
-    pub fn point_paddles(&mut self, x: i32, y: i32) {
-        self.bus.ctrl.point_at(x, y, self.bus.cycle);
+    /// Host pointer at `(x, y)` in the framebuffer (`None`: off the
+    /// screen): the paddles follow its position over the display area (see
+    /// `ControlPorts::point_at`), a light pen or gun sees the screen there.
+    pub fn point_at(&mut self, at: Option<(i32, i32)>) {
+        match at {
+            Some((x, y)) => self.bus.ctrl.point_at(x, y, self.bus.cycle),
+            None => self.bus.ctrl.pointer = None,
+        }
+    }
+
+    /// Once per frame, after the host input: the LP line (keyboard, port 1),
+    /// and the light a pen or gun in port 1 sees. Its sensor fires when the
+    /// beam passes under the pointer, moved by the device's offset, as in
+    /// VICE (lightpen_update, vicii_lightpen_timing): the latched X is then
+    /// half the VIC X coordinate of that point.
+    pub fn light_pen_frame(&mut self) {
+        self.bus.update_light_pen(false);
+        let pen = self.bus.ctrl.devices[0].pen();
+        self.bus.vic.lp_pulse = pen.zip(self.bus.ctrl.pointer).and_then(|(pen, (fx, fy))| {
+            if pen.touch && self.bus.ctrl.buttons & 2 == 0 {
+                return None;
+            }
+            let std = self.standard();
+            let n = std.cycles_per_line() as i32;
+            let lines = std.raster_lines() as i32;
+            // VIC X of the point and its raster line
+            let x = fx - crate::vic::DISPLAY_X as i32 + 24 + pen.offset.0;
+            let line = fy + std.first_fb_line() as i32 + pen.offset.1;
+            if x < 0 || fy < 0 {
+                return None;
+            }
+            // Cycles from the start of the line (VICE's raster_cycle 0,
+            // our cycle 1): (X + 104) / 8, beyond the line into the next
+            let t = (x + 104) / 8;
+            let line = (line + t / n).rem_euclid(lines) as u16;
+            let cycle = ((t % n + 1) % n) as u16;
+            Some((line, cycle, (((x + 104) >> 1) & 3) as u8))
+        });
     }
 
     /// Paddle readings (0-255) of control port `port` (1 or 2).
@@ -1393,6 +1428,8 @@ impl C64 {
     /// completed rendering at least one frame during the call.
     pub fn run_frame(&mut self) -> bool {
         let before = self.frame_count;
+        // The host input of this frame is in: the light pen sees it now
+        self.light_pen_frame();
         loop {
             if self.step_instruction().frame_done {
                 break;
@@ -1469,7 +1506,7 @@ const TYPING_GUARD_FRAMES: u16 = 25;
 
 /// Snapshot file header; the version changes on every layout change.
 const STATE_MAGIC: &[u8] = b"C64SNAP\x1a";
-const STATE_VERSION: u32 = 26;
+const STATE_VERSION: u32 = 27;
 const STATE_END: &[u8] = b"END.";
 
 impl_state_enum!(PrgKind { Basic, Machine });

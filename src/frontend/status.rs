@@ -169,6 +169,7 @@ impl Status {
                 Device::Paddles => parts.push(format!("P{}", i + 1)),
                 Device::Mouse => parts.push(format!("M{}", i + 1)),
                 Device::JoyMouse => parts.push(format!("MJ{}", i + 1)),
+                _ => parts.push(format!("L{}", i + 1)),
             }
         }
         parts.push(self.speed_text());
@@ -463,6 +464,15 @@ impl Bar {
                         self.rect(cx + k + 1, ROW1, 2, 2, if joy & bit == 0 { RED } else { BUTTON });
                         self.rect(cx + k, ROW1 + 3, 4, 6, TEXT);
                     }
+                    continue;
+                }
+                d => {
+                    // Light pen or gun: the barrel, its tip green while it
+                    // sees the screen, the buttons red when pressed
+                    let sees = d.pen().is_some_and(|p| !p.touch || s.analog_buttons & 2 != 0);
+                    self.rect(cx + 3, ROW1, 3, 7, TEXT);
+                    self.rect(cx + 3, ROW1 + 7, 3, 2, if sees { GREEN } else { BUTTON });
+                    self.rect(cx + 7, ROW1 + 1, 2, 2, if s.analog_buttons & 1 != 0 { RED } else { BUTTON });
                     continue;
                 }
             }

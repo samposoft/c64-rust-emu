@@ -304,6 +304,18 @@ pub struct VicState {
     /// Framebuffer line being drawn (changes at cycle 2)
     dbuf_line: u16,
     d: Draw,
+    /// Light pen (VICE's vicii-lightpen.c): latched position ($D013,
+    /// $D014), already latched in this frame, LP line low, cycle of a
+    /// pending trigger (0: none) and the extra X bits it adds.
+    lp_x: u8,
+    lp_y: u8,
+    lp_triggered: bool,
+    lp_low: bool,
+    lp_trigger_at: u64,
+    lp_extra: u8,
+    /// Light from a pen or gun in control port 1: raster line and cycle at
+    /// which the beam passes under it, and its extra X bits.
+    pub lp_pulse: Option<(u16, u16, u8)>,
 }
 
 impl VicState {
@@ -346,6 +358,13 @@ impl VicState {
             last_color_value: 0,
             dbuf_line: 0,
             d: Draw::new(),
+            lp_x: 0,
+            lp_y: 0,
+            lp_triggered: false,
+            lp_low: false,
+            lp_trigger_at: 0,
+            lp_extra: 0,
+            lp_pulse: None,
         }
     }
 
@@ -356,7 +375,8 @@ impl VicState {
             // Bit 7 = bit 8 of the current raster
             0x11 => (self.regs[0x11] & 0x7F) | (((self.raster_line >> 1) & 0x80) as u8),
             0x12 => (self.raster_line & 0xFF) as u8,
-            0x13 | 0x14 => 0, // light pen
+            0x13 => self.lp_x,
+            0x14 => self.lp_y,
             // Unimplemented bits read as 1 (as on hardware and in VICE)
             0x16 => self.regs[r] | 0xC0,
             0x18 => self.regs[r] | 0x01,
@@ -450,6 +470,61 @@ impl VicState {
         self.vborder = true;
         self.set_vborder = true;
         self.main_border = true;
+        self.lp_x = 0;
+        self.lp_y = 0;
+        self.lp_triggered = false;
+        self.lp_low = false;
+        self.lp_trigger_at = 0;
+        self.lp_extra = 0;
+        self.lp_pulse = None;
+    }
+
+    /// LP line (CIA1 PB4) at cycle `now` (VICE's vicii_set_light_pen): while
+    /// it is low the VIC latches the beam position in the next cycle, once
+    /// per frame, 2 pixels (NMOS) or 1 (HMOS) to the right.
+    pub fn set_light_pen(&mut self, low: bool, now: u64) {
+        if low {
+            self.lp_extra = if self.chip.hmos() { 1 } else { 2 };
+            self.lp_trigger_at = now + 1;
+        }
+        self.lp_low = low;
+    }
+
+    pub fn light_pen_low(&self) -> bool {
+        self.lp_low
+    }
+
+    /// Latches the beam position (VICE's vicii_trigger_light_pen_internal).
+    /// `retrigger`: at the start of the frame with the line still low, when
+    /// X reads $D1 ($D5 with 65 cycles per line).
+    fn trigger_light_pen(&mut self, retrigger: bool) {
+        self.lp_trigger_at = 0;
+        if self.lp_triggered {
+            return;
+        }
+        self.lp_triggered = true;
+        let n = self.standard.cycles_per_line();
+        // Not on the last line, except in its first cycle (VICE's
+        // raster_cycle 0, our cycle 1)
+        if self.raster_line == self.standard.raster_lines() - 1 && self.cycle != 1 {
+            return;
+        }
+        let old_irq = self.chip.old_lightpen_irq();
+        let mut x = table(self.standard)[self.cycle as usize].xpos / 2 + self.lp_extra as u16;
+        if retrigger {
+            x = if n == 65 { 0xD5 } else { 0xD1 };
+            if old_irq {
+                self.regs[0x19] |= 0x08;
+                self.update_irq_flag();
+            }
+        }
+        self.lp_x = x as u8;
+        self.lp_y = self.raster_line as u8;
+        self.lp_extra = 0;
+        if !old_irq {
+            self.regs[0x19] |= 0x08;
+            self.update_irq_flag();
+        }
     }
 
     pub(crate) fn update_irq_flag(&mut self) {
@@ -661,6 +736,7 @@ fn sprite_dma_1(bus: &mut Bus, n: usize) -> u8 {
 /// `cpu_pc` is used for the c-access in the first three BA cycles, when the
 /// bus still belongs to the CPU (the VIC reads $FF and color nibble RAM[PC]).
 pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
+    let now = bus.cycle;
     let standard = bus.vic.standard;
     let tab = table(standard);
     let n = standard.cycles_per_line();
@@ -748,6 +824,12 @@ pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
             v.allow_bad_lines = false;
             v.vcbase = 0;
             v.vc = 0;
+            // Light pen: a new frame, and a new trigger if the line is
+            // still held low
+            v.lp_triggered = false;
+            if v.lp_low {
+                v.trigger_light_pen(true);
+            }
         }
     } else if k == 1 {
         v.raster_line += 1;
@@ -840,6 +922,19 @@ pub fn cycle(bus: &mut Bus, fb: &mut [u32], cpu_pc: u16) -> Tick {
 
     v.last_bus_phi2 = 0xFF;
     v.reg11_delay = v.regs[0x11];
+
+    // Light pen: the trigger scheduled by the LP line, or the light of a
+    // pen when the beam passes under it
+    if v.lp_trigger_at == now {
+        v.trigger_light_pen(false);
+    }
+    if let Some((line, cycle, extra)) = v.lp_pulse {
+        if v.raster_line == line && k == cycle {
+            v.lp_pulse = None;
+            v.lp_extra = extra;
+            v.trigger_light_pen(false);
+        }
+    }
     Tick { ba_low, aec_low, frame_done }
 }
 
@@ -1343,4 +1438,5 @@ impl_state!(VicState {
     reg11_delay, main_border, vborder, set_vborder, sprites, sprite_dma,
     sprite_display_bits, sprite_sprite_collisions, sprite_background_collisions,
     clear_collisions, last_color_reg, last_color_value, dbuf_line, d,
+    lp_x, lp_y, lp_triggered, lp_low, lp_trigger_at, lp_extra, lp_pulse,
 });

@@ -29,7 +29,7 @@ use c64::c64::C64;
 use c64::debugger::{Debugger, FrameHook};
 use c64::frontend::session::{save_on_exit, MachineOptions};
 use c64::frontend::status::{self, Bar, Click, SpeedMeter, Status};
-use c64::ctrlport::{Button, Device};
+use c64::ctrlport::Button;
 use c64::frontend::window::{Analog, CrtView, Display, MouseCapture, Placement, Pointer};
 use c64::frontend::remote::{self, Event, Listener};
 use c64::frontend::{self, AudioOut, Gamepad, JoyPort};
@@ -344,7 +344,9 @@ enum Input {
     MouseMove(i32, i32),
     MouseButton(Button, bool),
     /// Pointer over the screen (framebuffer coordinates), for the paddles.
-    PaddlePointer(i32, i32),
+    /// Host pointer over the framebuffer (`None`: off the screen), for
+    /// paddles and light pens.
+    Pointer(Option<(i32, i32)>),
 }
 
 /// Key reminders in the status bar, in pages.
@@ -408,7 +410,7 @@ impl WindowLink {
                 Input::Click(click) => status::apply_click(c64, click),
                 Input::MouseMove(dx, dy) => c64.mouse_move(dx, dy),
                 Input::MouseButton(b, pressed) => c64.mouse_button(b, pressed),
-                Input::PaddlePointer(x, y) => c64.point_paddles(x, y),
+                Input::Pointer(at) => c64.point_at(at),
             }
         }
         self.gamepad.poll(&mut c64.bus.joy2);
@@ -537,11 +539,12 @@ impl DbgWindow {
         }
     }
 
-    /// Paddles and mouse in the control ports, from the last published state.
+    /// Paddles, light pens and mouse in the control ports, from the last
+    /// published state.
     fn analog(&self) -> Analog {
         let status = self.shared.status.lock().unwrap();
         let ports = status.as_ref().map(|s| s.ports).unwrap_or_default();
-        Analog { paddles: ports.contains(&Device::Paddles), mouse: ports.iter().any(|d| d.is_mouse()) }
+        Analog { pointed: ports.iter().any(|d| d.is_pointed()), mouse: ports.iter().any(|d| d.is_mouse()) }
     }
 
     /// Mouse button: paddle fire, 1351 buttons, capture and release, clicks
@@ -564,12 +567,13 @@ impl DbgWindow {
         }
     }
 
-    /// Pointer moved: the paddles follow it over the C64 screen.
+    /// Pointer moved: the paddles and the light pens follow it over the C64
+    /// screen.
     fn pointer_moved(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
         let at = self.placement.to_image_signed(x, y);
-        if let Some((x, y)) = self.capture.paddles_at(at, self.analog(), self.placement.rows) {
-            let _ = self.input.send(Input::PaddlePointer(x, y));
+        if let Some(at) = self.capture.pointed_at(at, self.analog(), self.placement.rows) {
+            let _ = self.input.send(Input::Pointer(at));
         }
     }
 
@@ -667,6 +671,11 @@ impl ApplicationHandler<UiEvent> for DbgWindow {
             WindowEvent::KeyboardInput { event, .. } => self.key(&event),
             WindowEvent::RedrawRequested => self.draw(),
             WindowEvent::CursorMoved { position, .. } => self.pointer_moved(position.x, position.y),
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(at) = self.capture.pointed_at(None, self.analog(), self.placement.rows) {
+                    let _ = self.input.send(Input::Pointer(at));
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => self.mouse_button(button, state == ElementState::Pressed),
             WindowEvent::Focused(false) => {
                 self.release_mouse();
