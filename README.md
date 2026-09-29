@@ -179,7 +179,7 @@ The tools Claude sees:
 |---|---|
 | `run_basic` | resets the C64, tokenizes the BASIC program with petcat, loads it at `$0801`, types `RUN`; returns the screen as text and a screenshot. The program is written in uppercase as on the C64 (the case is swapped for petcat), with petcat's codes such as `{clr}` in strings |
 | `run_asm` | resets the C64, assembles with 64tass, loads the program and starts it (`RUN` for a program at `$0801` with a BASIC SYS line, otherwise `SYS` to its first byte); returns the assembler's errors, or screen, screenshot and labels |
-| `screenshot`, `screen_text` | the screen as an image (PNG) or as 40×25 text |
+| `screenshot`, `screen_text` | the screen as an image (PNG) or as 40×25 text; `screenshot` with `crt` shows it through the [CRT emulation](#monitor-and-tv---crt) (the set chosen with the debugger's `crt` command, otherwise the usual one for the machine), `height` pixels high (284-2272, default 568) |
 | `type_text` | types on the keyboard, with `{return}`, `{f1}`, `{runstop}`... |
 | `joystick` | holds directions and fire for a number of frames |
 | `wait` | lets a number of frames pass, then returns the screen |
@@ -394,21 +394,21 @@ below).
 `--crt 1084s` (in the debugger `crt 1084s`, `crt off`) shows the screen as
 a real monitor does, emulating on the GPU the analog path from the VIC-II
 to the picture tube; `--rf` (`crt tv`) shows it on a home TV connected to
-the C64's antenna socket. Nine sets, from their service manuals and data
+the C64's antenna socket. Twelve sets, from their service manuals and data
 books. For the PAL C64:
 
-| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `cp90` (or `tv`) |
-|---|---|---|---|---|
-| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) |
-| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna, channel 36), composite (SCART) |
-| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm |
-| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed); with RF the IF filter |
-| Luma peaking | none documented | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | none documented |
-| Luma trap (composite, RF) | full | full | none | shallow: -6 dB |
-| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | band-pass, Q about 3 |
-| Color decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | TDA3561A, 64 µs delay line |
-| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) |
-| Overscan | none (monitor) | none | none | 7% (assumed) |
+| | `1084s-p1` (or `1084s`) | `1084s-d1` | `1901` | `1701` (or `1702`) | `1802` | `cp90` (or `tv`) | `ctxe` |
+|---|---|---|---|---|---|---|---|
+| Set | Commodore monitor, Philips chassis | Commodore monitor, Daewoo chassis | Commodore monitor, Thomson (1986, for the C128) | Commodore 1701/1702 for PAL countries, JVC chassis | Commodore 1802 for PAL countries, Daewoo CM-146 chassis (1987) | Philips 15CE1510 TV, CP90 chassis (Philips Italy, 1987-90) | Philips 16CT2216 TV, CTX-E chassis (1983) |
+| Inputs | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | luma/chroma, composite | RF (antenna, channel 36), composite (SCART) | RF only |
+| Picture tube | M34EAQ10X, 14", slot mask, 0.42 mm | 13" visible, slot mask, 0.41 mm, black stripes | M34JGT60, 14", in-line guns, 0.43 mm | 370FVB22, 13", vertical stripes, 0.64 mm | 370GGB22, 13", vertical stripes, 0.62 mm | A36EAM, 36 cm flat square, slot mask, 0.52 mm | A42-570X, 42 cm, slot mask, 0.70 mm |
+| Luma bandwidth | 8 MHz | 5.2 MHz luma/chroma, 4.4 MHz composite | not given (8 MHz assumed) | not given (5 MHz assumed) | 4.2 MHz luma/chroma, 3.5 MHz composite | not given (5 MHz assumed); with RF the IF filter | the IF filter (LC, its curve drawn in the manual); amplifier not given (5 MHz assumed) |
+| Luma peaking | none (schematic: trap, 330 ns delay line, straight into the TDA3505) | none documented | +6 dB above about 1.2 MHz (560 Ω ∥ 470 pF into 560 Ω) | "video tone" of the decoder, response not given | none documented | none documented | at the detector (12 µH, 180 Ω + 82 pF): about +3 dB at 3-4 MHz, the chroma lifted back |
+| Luma trap (composite, RF) | full | full | none | 27 µH with 42 pF: at 4.73 MHz, the subcarrier 13 dB down | 33 µH with 37 pF: at 4.55 MHz | shallow: -6 dB | full |
+| Chroma | PAL low-pass, 1.3 MHz | PAL low-pass, 1.3 MHz | LC band-pass, Q about 3.6: ±0.6 MHz | double-tuned band-pass (Q about 3 assumed), also for the chroma input | band-pass (Q about 3 assumed) | band-pass, Q about 3 | 15 pF into 120 pF and a coil in series: peak at the subcarrier, zero at 1.6 MHz |
+| Color decoder | TDA4510, 64 µs delay line | TDA4510, 64 µs delay line | AN5620X, 64 µs delay line | M51393AP, 1H delay line | TA7698AP, 1H delay line | TDA3561A, 64 µs delay line | TDA3560, 64 µs delay line |
+| White point | not given (D65 assumed) | not given (D65 assumed) | 7500 K | not given (D65 assumed) | not given (D65 assumed) | not given (D65 assumed) | not given (D65 assumed) |
+| Overscan | none (monitor) | none | none | none | 14% (40 × 25 characters: 247 × 160 mm) | 7% (assumed) | 7% (assumed) |
 
 For the NTSC C64 (`--ntsc`, also the old 6567R56A), the Drean (PAL-N) and
 any of them:
@@ -429,7 +429,8 @@ any of them:
 | Controls | brightness, contrast, color, tint | brightness, contrast, color, tint, sharpness | picture, bright, color, hue | brightness, contrast, color | brightness, contrast |
 
 A color set decodes one standard, as the real ones: the PAL sets go with the
-PAL C64, the NTSC ones with the NTSC C64 (`--ntsc --crt 1702`, or just
+PAL C64 (`1702` on a PAL C64 is the PAL 1701/1702), the NTSC ones with
+the NTSC C64 (`--ntsc --crt 1702`, or just
 `--ntsc --crt lc`), the Sontec with the Drean (`--vic 6572 --rf`); the
 other pairs are refused (the picture would be in black and white). `1084s`
 and `tv` are the sets of the machine's standard. The monochrome 1900 shows
@@ -468,10 +469,21 @@ light steps; its narrow chroma band-pass makes colors bleed more and fades
 the color of thin details; its white is colder (bluish next to a D65
 display). Its composite input needs an internal jumper, and having no luma
 trap it keeps the subcarrier in the luma, as a fine dot pattern over the
-colored areas, which also look brighter. The CP90 TV is the softest
+colored areas, which also look brighter. The 1701 (the PAL 1702) has the
+coarsest mask of the monitors, stripes of 0.64 mm, and its trap sits at
+4.73 MHz, above the subcarrier: in composite a faint dot pattern stays on
+colored areas. The 1802, a Daewoo design of 1987, is set up like a TV:
+its manual gives the 40 × 25 characters a size of 247 × 160 mm, which puts
+most of the border beyond the edges of its 13" screen; its luma is the
+narrowest of the PAL monitors, 3.5 MHz in composite. The CP90 TV is the softest
 picture: RF limits the luma to about 3.5 MHz, its shallow trap leaves a dot
 pattern in colored areas and color fringes on fine detail (yellow text on
-blue turns whitish), and its mask is coarser.
+blue turns whitish), and its mask is coarser. The CTX-E, a TV of a few
+years earlier with an LC IF filter instead of a SAW, is sharper through RF:
+the network after its video detector lifts 3-4 MHz by about 3 dB, which
+brings the chroma back to full strength and makes edges a little crisper;
+its full trap leaves no dot pattern, its chroma band-pass rejects the low
+luma frequencies, and its 16" tube has the coarsest mask, 0.70 mm.
 
 The NTSC 1084S and the Sony TV separate luma and chroma of a composite
 signal with a comb filter: the chroma is half the difference between the
@@ -499,10 +511,23 @@ left towards red, to the right towards green), sharpness (NTSC 1084S) the
 peaking from none to twice: the manuals give only the direction of each
 knob, so the ranges are estimates.
 
+The picture tubes are perfect by default: a straight raster and the three
+beams landing together. `crt geometry=N` (`--crt 1084s,geometry=N`) gives
+the tube N% (0-100) of the errors its data book allows: the raster bowed as
+a pincushion (the corners pulled out, the middle of the edges in) and the
+red and blue beams landing apart horizontally, more towards the edges,
+which fringes white text with red and blue. The limits are those of two
+Philips tube assemblies (data handbook T08): the M34EAQ of the 1084S
+(misconvergence 0.3 mm at the centre, 0.5 mm in the middle area, 0.8 mm
+beyond; pattern distortion 3.0 mm east-west and 2.1 mm north-south),
+taken for all the monitors, and a 37 cm TV one (0.3, 0.7 and 0.9 mm; 3 and
+2.3 mm), taken for the TVs. They are maxima: a real tube had less, how much
+less the books do not say, and the direction of the errors is a choice.
+
 The TVs overscan: they scan the picture about 7% beyond the edges of the
 screen (Sony's "normal scan"; the service manuals only say "slight
 overscan"), so part of the border does not show. The monitors are set to
-show all of it.
+show all of it, except the 1802 (see above).
 
 The model is in `src/crt.rs`, the shaders in `src/frontend/crt.wgsl`; it was
 built from published measurements, schematics and service manuals, not by
@@ -534,7 +559,9 @@ comparison with VICE:
   B/G: an EPCOS K2966M SAW, Nyquist slope at 38.9 MHz, color carrier 3 dB
   down, sound shelf 20 dB down; NTSC and N: an EPCOS M1967M, 45.75 MHz,
   color carrier 1 dB down, sound 19 dB down: the TVs' own SAWs are known
-  only by the makers' part numbers). With correct tuning the sound carrier
+  only by the makers' part numbers; the CTX-E's LC filter as its service
+  manual draws it, with 38.9 MHz at half the top, and the network after its
+  detector). With correct tuning the sound carrier
   stays about 45 dB below the picture and the noise of a short cable about
   50-60 dB: neither would show, and they are not modelled.
 - **Set**: the luma goes through the IF filter (RF), the comb filter or the
@@ -998,14 +1025,20 @@ it reads back the ROM instead of the RAM and gives `?LOAD ERROR`.
   RAM expansions; NIB/P64 images not supported. The 1571's fast serial bus
   needs a C128 and the burst modifications for the C64 are not emulated;
   the WD1770 has no MFM disk to read (as in VICE with D71s and G71s).
-- Monitor and TV: no 1701/1702 PAL (their PAL schematics are not
-  available) and no 1802 (its manual gives neither tube nor pitch); the
-  peaking of the PAL 1084S and of the 1901's video output stage is not
-  modelled (the manuals give no values for it); on the TVs no sound
+- Monitor and TV: no NTSC 1802 (its manual gives neither tube nor pitch;
+  the PAL one is emulated); the Tint control of the PAL 1701 and 1802
+  (burst phase, which the delay line turns into a small loss of
+  saturation) and the 1701 decoder's "video tone" are not modelled; the
+  video output stages are taken as flat up to the luma bandwidth: the
+  1084S-P1's have shunt-peaking coils for its 8 MHz, the 1901's are
+  shunt-feedback amplifiers whose 68 pF across the 1.8 kΩ input resistor
+  compensates the 47 kΩ feedback one, and how flat that comes out depends
+  on stray capacitances the manual does not give; on the TVs no sound
   carrier, noise or fine tuning (with a good signal they would not show),
   no color killer or burst processing (the decoders lock to the burst
-  ideally); the picture tubes are flat, without geometry or convergence
-  errors.
+  ideally); the picture tubes are flat, and their geometry and
+  convergence errors (`geometry`, off by default) follow the tolerances of
+  two Philips tube assemblies in size, not the measured errors of a set.
 - Tape: no fine speed adjustment (in VICE it is 0 by default); buttons are
   pressed automatically only on KERNAL messages (otherwise there is the
   debugger's `tape` command).

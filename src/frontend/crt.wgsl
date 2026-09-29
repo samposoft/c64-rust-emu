@@ -33,6 +33,9 @@
 //     PAL delay line, monochrome (white point R, G, B = the phosphor)
 //  32 phase of the chroma path at the subcarrier (the decoder locks to the
 //     burst, which it turns as well)
+//  33 tube errors: half the useful screen, window pixels (0: none), pincushion
+//     east-west and north-south, misconvergence at the centre, the middle of
+//     the edges and the corners (window pixels)
 //  then the tables at U_PAL_Y, U_PAL_UV, U_LUMA, U_CHROMA, U_LUMA_LPF (FIR_HALF
 //  taps each side), U_MOD, U_LUMA_IN, U_CHROMA_IN, U_IF, U_COMB (SEP_HALF taps
 //  each side) and U_BARS (jail bars, 8 pixels)
@@ -404,22 +407,52 @@ fn mask(px: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(m, peak);
 }
 
+// Light of the lines at `p` (window pixels from the picture's corner), of
+// the frame in `t`
+fn lines(t: texture_2d<f32>, p: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
+    let yl = p.y / size.y * f32(H);
+    let half = 0.5 * f32(H) / size.y;
+    return beam(t, p.x / size.x * f32(NS), yl - half, yl + half);
+}
+
+// The same, with the frame blending: the eye averages the light of the
+// two frames
+fn light(p: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
+    let c = lines(lin_tex, p, size);
+    if (pf(1u) > 0.5) {
+        return 0.5 * (c + lines(prev_tex, p, size));
+    }
+    return c;
+}
+
 @fragment
 fn crt(v: VOut) -> @location(0) vec4<f32> {
     let origin = P[1].xy;
     let size = P[1].zw;
     let rel = v.pos.xy - origin;
-    let q = rel / size;
-    let xs = q.x * f32(NS);
-    let yl = q.y * f32(H);
-    let half = 0.5 * f32(H) / size.y;
-    var c = beam(lin_tex, xs, yl - half, yl + half);
-    if (pf(1u) > 0.5) {
-        // Frame blending: the eye averages the light of the two frames
-        c = 0.5 * (c + beam(prev_tex, xs, yl - half, yl + half));
+    // Tube errors: the raster bowed as a pincushion (the point of the
+    // raster that lands here), and the red and blue beams landing apart,
+    // more towards the edges and the corners
+    var src = rel;
+    var apart = 0.0;
+    if (pf(33u) > 0.0) {
+        let hs = vec2<f32>(pf(33u), pf(34u));
+        let n = (rel - 0.5 * size) / hs;
+        let r = vec2<f32>(n.x / (1.0 + pf(35u) * n.y * n.y), n.y / (1.0 + pf(36u) * n.x * n.x));
+        src = 0.5 * size + r * hs;
+        let rho = dot(n, n);
+        apart = select(mix(pf(38u), pf(39u), clamp(rho - 1.0, 0.0, 1.0)), mix(pf(37u), pf(38u), rho), rho < 1.0);
     }
-    let g = pf(3u);
-    c = (1.0 - g) * c + g * textureSampleLevel(glow_tex, lin_samp, q, 0.0).rgb;
+    var c = vec3<f32>(0.0);
+    if (all(src >= vec2<f32>(0.0)) && all(src <= size)) {
+        c = light(src, size);
+        if (apart > 0.0) {
+            c.r = light(src - vec2<f32>(0.5 * apart, 0.0), size).r;
+            c.b = light(src + vec2<f32>(0.5 * apart, 0.0), size).b;
+        }
+        let g = pf(3u);
+        c = (1.0 - g) * c + g * textureSampleLevel(glow_tex, lin_samp, src / size, 0.0).rgb;
+    }
     // The mask, as deep as the display allows: where its brightest
     // stripes would go beyond the brightest value of the display (white, or
     // the HDR headroom pf(26u)) it is made shallower, so that the average

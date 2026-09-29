@@ -10,6 +10,13 @@ use std::process::Command;
 use crate::json::Json;
 use crate::machine::{find_program, Machine};
 
+/// Heights of a screenshot through the CRT emulation (the debugger's
+/// limits), and the default: twice the framebuffer, enough for the
+/// scanlines and the mask while the PNG stays small (the noise of a
+/// composite signal makes larger ones megabytes).
+const CRT_HEIGHTS: (usize, usize) = (284, 2272);
+const CRT_HEIGHT: usize = 568;
+
 /// Frames a tool can run the emulation for: one minute, within the
 /// clients' time limits for a tool call.
 const MAX_FRAMES: u64 = 3000;
@@ -20,7 +27,8 @@ pub const INSTRUCTIONS: &str = "\
 Drives a Commodore 64 emulator (PAL: 6510 at 985 kHz, VIC-II, SID, 1541 drive) that the user watches in its window.
 Write programs with run_basic (BASIC V2) or run_asm (6502 assembly for 64tass); both reset the machine, load the program, \
 start it and return the screen as text plus a screenshot. Check the result, fix and run again.
-Interact with type_text (keyboard) and joystick; let time pass with wait; look with screenshot and screen_text.
+Interact with type_text (keyboard) and joystick; let time pass with wait; look with screenshot and screen_text \
+(screenshot with crt shows the picture as on a real monitor: color bleeding, scanlines, the shadow mask).
 Debug with monitor, the emulator's debugger: regs, mem a b, poke a v, dis a n, break a, until a, step, next, \
 watch a b, vic, sprites, sid, cia1, bank, info; addresses in hex. After a breakpoint or step the machine stays paused: \
 'resume' restarts it (run_basic, run_asm and reset do too).
@@ -116,7 +124,26 @@ and the labels with their addresses (useful with the monitor tool: break, until,
             vec![("source", string_prop("The assembly source for 64tass.")), ("frames", frames_after())],
             &["source"]),
         tool("screenshot", "Screenshot",
-            "The C64 screen as an image, 403x284 pixels with the border.", vec![], &[]),
+            "The C64 screen as an image, 403x284 pixels with the border. With crt, the screen as a real set shows it, \
+through the emulation of its analog video path on the GPU (color bleeding and cross-color, scanlines, shadow mask, \
+halation): the set chosen with the debugger's crt command (monitor tool: `crt 1901`, `crt 1084s composite`, `crt tv`; \
+it changes the user's window too), otherwise the usual one for the machine (on PAL a Commodore 1084S through \
+luma/chroma). Useful to judge what artists made for a CRT: dithering, colors mixed by the blur, interlace.",
+            vec![
+                ("crt", Json::obj([
+                    ("type", Json::from("boolean")), ("default", Json::Bool(false)),
+                    ("description", Json::from("Through the monitor emulation instead of the raw pixels.")),
+                ])),
+                ("height", Json::obj([
+                    ("type", Json::from("integer")),
+                    ("description", Json::from("With crt: height of the image in pixels (the width follows the \
+pixel aspect of the set).")),
+                    ("minimum", Json::from(CRT_HEIGHTS.0 as u64)),
+                    ("maximum", Json::from(CRT_HEIGHTS.1 as u64)),
+                    ("default", Json::from(CRT_HEIGHT as u64)),
+                ])),
+            ],
+            &[]),
         tool("screen_text", "Screen text",
             "The 40x25 text screen as characters (from screen RAM, following the VIC bank and $D018): exact and \
 cheap for text output, program listings and error messages. Graphics and colors are only in the screenshot.",
@@ -171,7 +198,9 @@ impl Tools {
         let r = match name {
             "run_basic" => self.run_basic(args),
             "run_asm" => self.run_asm(args),
-            "screenshot" => self.screenshot().map(|png| vec![image_block(&png)]),
+            "screenshot" => screenshot_command(args)
+                .and_then(|c| self.machine.cmd_bytes(&c))
+                .map(|png| vec![image_block(&png)]),
             "screen_text" => self.machine.cmd("screen").map(|t| vec![text_block(t)]),
             "type_text" => self.type_text(args),
             "joystick" => self.joystick(args),
@@ -375,6 +404,26 @@ impl Tools {
     }
 }
 
+/// The debugger command for the screenshot tool: the PNG on the output, of
+/// the framebuffer or through the CRT emulation.
+fn screenshot_command(args: &Json) -> Result<String, String> {
+    let crt = match args.get("crt") {
+        None | Some(Json::Null) => false,
+        Some(Json::Bool(b)) => *b,
+        Some(_) => return Err("crt: true or false".into()),
+    };
+    let height = match args.get("height") {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(v.as_u64().map(|h| h as usize).filter(|h| (CRT_HEIGHTS.0..=CRT_HEIGHTS.1).contains(h))
+            .ok_or_else(|| format!("height: an integer from {} to {}", CRT_HEIGHTS.0, CRT_HEIGHTS.1))?),
+    };
+    match (crt, height) {
+        (false, None) => Ok("screenshot -".into()),
+        (false, Some(_)) => Err("height is for the screenshot through the CRT emulation (crt: true)".into()),
+        (true, h) => Ok(format!("screenshot - crt {}", h.unwrap_or(CRT_HEIGHT))),
+    }
+}
+
 fn source_arg(args: &Json) -> Result<String, String> {
     let s = args.get("source").and_then(Json::as_str).ok_or("missing source")?;
     if s.trim().is_empty() {
@@ -451,6 +500,18 @@ mod tests {
     #[test]
     fn petcat_case() {
         assert_eq!(petcat_text("10 PRINT \"{CLR}HI there\""), "10 print \"{clr}hi THERE\"\n");
+    }
+
+    #[test]
+    fn screenshot_arguments() {
+        let args = |text: &str| Json::parse(text).unwrap();
+        assert_eq!(screenshot_command(&args("{}")).unwrap(), "screenshot -");
+        assert_eq!(screenshot_command(&args(r#"{"crt": false}"#)).unwrap(), "screenshot -");
+        assert_eq!(screenshot_command(&args(r#"{"crt": true}"#)).unwrap(), "screenshot - crt 568");
+        assert_eq!(screenshot_command(&args(r#"{"crt": true, "height": 1136}"#)).unwrap(), "screenshot - crt 1136");
+        assert!(screenshot_command(&args(r#"{"crt": true, "height": 100}"#)).is_err());
+        assert!(screenshot_command(&args(r#"{"height": 568}"#)).is_err());
+        assert!(screenshot_command(&args(r#"{"crt": "yes"}"#)).is_err());
     }
 
     #[test]

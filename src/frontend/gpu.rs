@@ -20,7 +20,7 @@ const SHADER: &str = include_str!("crt.wgsl");
 
 /// Layout of the parameters (floats): the values that change with the
 /// window, then the tables of the model.
-const U_PAL_Y: usize = 36;
+const U_PAL_Y: usize = 40;
 const U_PAL_UV: usize = U_PAL_Y + 16;
 const U_LUMA: usize = U_PAL_UV + 64;
 const U_CHROMA: usize = U_LUMA + crt::LUMA_PHASES * crt::LUMA_TAPS;
@@ -347,6 +347,23 @@ impl Renderer {
         v[30] = crt::delay_offset(&sig, m) as f32;
         v[31] = mono.is_some() as u8 as f32;
         v[32] = crt::chroma_phase(&sig, &view.crt) as f32;
+        // Tube errors: half the useful screen (window pixels; 0 = none),
+        // pincushion coefficients over it, misconvergence (window pixels)
+        // at the centre, the middle of the edges and the corners
+        let share = view.crt.geometry as f64 / 100.0;
+        let t = m.tolerance;
+        let (sw, sh) = (m.screen_width, m.screen_height);
+        let (rw, rh) = t.reference;
+        let a = 2.0 * t.pattern.0 / rw * (sh / rh).powi(2) * share;
+        let b = 2.0 * t.pattern.1 / rh * (sw / rw).powi(2) * share;
+        let beams = if mono.is_some() { 0.0 } else { px_mm * share };
+        let geometry = [
+            if share > 0.0 { sw / 2.0 * px_mm } else { 0.0 }, sh / 2.0 * px_mm, a, b,
+            t.converge[0] * beams, t.converge[1] * beams, t.converge[2] * beams,
+        ];
+        for (i, x) in geometry.iter().enumerate() {
+            v[33 + i] = *x as f32;
+        }
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.queue.write_buffer(&self.params, 0, &bytes);
     }

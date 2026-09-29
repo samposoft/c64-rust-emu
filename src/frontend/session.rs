@@ -125,13 +125,16 @@ impl MachineOptions {
                CRT: for pictures that alternate two frames (interlace, IFLI)
   --crt SET    show the screen as a real set does, on the GPU: the signal of the VIC-II
                and the picture tube of SET, with its default input: for PAL 1084s (Commodore
-               1084S-P1), 1084s-d1, 1901 or the TV cp90 (Philips, RF); for NTSC 1702, 1084s
-               (the NTSC 1084S-P, comb filter) or the TV kv1311 (Sony Trinitron, RF, comb
-               filter); for PAL-N the TV cnt4442 (Sontec, RF); 1900 (green monochrome) for
-               all; tv is the TV of the machine's standard. Also its controls and switches,
-               comma-separated: brightness=N, contrast=N, color=N, tint=N (NTSC), sharpness=N
-               (NTSC 1084S), from -100 to 100 (0 the centre), comb=off, bars=off (no VIC-II
-               jail bars); e.g. --crt 1702,tint=-20. Off by default, window only
+               1084S-P1), 1084s-d1, 1901, 1701 (the PAL 1702), 1802 or the TVs cp90
+               (Philips, RF) and ctxe (Philips, RF only); for NTSC 1702, 1084s (the NTSC
+               1084S-P, comb filter) or the TV kv1311 (Sony Trinitron, RF, comb filter);
+               for PAL-N the TV cnt4442 (Sontec, RF); 1900 (green monochrome) for all; tv
+               is the TV of the machine's standard. Also its controls and switches,
+               comma-separated: brightness=N, contrast=N, color=N, tint=N (NTSC),
+               sharpness=N (NTSC 1084S), from -100 to 100 (0 the centre), comb=off,
+               bars=off (no VIC-II jail bars), geometry=N (pincushion and misconvergence
+               of the tube, N% of its tolerances, 0-100); e.g. --crt 1702,tint=-20. Off by
+               default, window only
   --composite  connect the set through composite video (implies --crt 1084s, or 1702)
   --rf         connect a TV to the RF output (implies --crt tv)
   --hdr        with --crt, on a display with HDR headroom (Apple EDR): the slot mask at

@@ -843,7 +843,7 @@ impl Debugger {
   drive [8|9] trace on file | off   trace of the drive's instructions (PC, registers, cycle)
   blend [on|off]     frame blending: each frame mixed with the previous one, as on a 50 Hz CRT (interlace pictures)
   hdr [on|off]       HDR output of the CRT emulation, on a display with headroom above white (Apple EDR): the slot mask at full depth
-  crt [off | SET | lc | composite | rf | knob=N | comb=on|off | bars=on|off]...  CRT emulation in the window (GPU): sets 1084s, 1084s-p1, 1084s-d1, 1901, cp90 (PAL), 1702, 1084s-p, kv1311 (NTSC), cnt4442 (PAL-N), tv (the TV of the standard), 1900 (monochrome); inputs; knobs brightness, contrast, color, tint, sharpness (-100..100); comb filter and VIC-II jail bars
+  crt [off | SET | lc | composite | rf | knob=N | comb=on|off | bars=on|off | geometry=N]...  CRT emulation in the window (GPU): sets 1084s, 1084s-p1, 1084s-d1, 1901, 1701, 1802, cp90, ctxe (PAL), 1702, 1084s-p, kv1311 (NTSC), cnt4442 (PAL-N), tv (the TV of the standard), 1900 (monochrome); inputs; knobs brightness, contrast, color, tint, sharpness (-100..100); comb filter, VIC-II jail bars, tube errors (geometry=0-100% of the tolerances)
   screenshot file [bar | crt [height]]  save the framebuffer as PNG (bar: with the window's status bar; crt: through the CRT emulation, default 1136 pixels high; file - = the PNG on the output)
   trace on [file] [from to] | trace off
   keys text          type text on the keyboard (\\n = RETURN, {name} = a key named as for key: {f1} {clr} {left}...)
